@@ -48,8 +48,11 @@ from astropy.wcs import WCS
 import warnings
 warnings.filterwarnings('ignore')
 
-# Gaia Rp Vega-to-AB offset (Casagrande & VandenBerg 2018, MNRAS 479, L102)
-GAIA_RP_AB_OFFSET = 0.152
+# Gaia DR3 Rp Vega -> AB offset, from synthetic photometry (pysynphot Vega
+# spectrum through the actual Gaia3 Rp passband, via calibrimbore's
+# get_pb_zpt): zp_AB - zp_Vega = 0.379. The previous literature value of
+# 0.152 (Casagrande & VandenBerg 2018) was ~0.23 mag too small.
+GAIA_RP_AB_OFFSET = 0.379
 
 
 def _zp_to_scale(zp):

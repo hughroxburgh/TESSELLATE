@@ -2554,7 +2554,7 @@ python {script_py}'
 
             if reduction_status != False and len(calibrating_status.keys()) > 0:
                 print('Waiting for Reductions' + i*'.', end='\r')
-                sleep(600)
+                sleep(120)
                 i += 1
 
     def _cut_transient_search(self,cam,ccd,cut):
@@ -2742,7 +2742,7 @@ python {self.working_path}/detection_scripts/S{self.sector}C{cam}C{ccd}C{cut}_sc
 
             if len(searching_status.keys()) > 0:
                 print('Waiting for Reductions' + i*'.', end='\r')
-                sleep(600)
+                sleep(120)
                 i += 1
 
         

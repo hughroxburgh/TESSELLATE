@@ -66,7 +66,7 @@ def _bazin_fit_worker(stamp_cube, sub_time, x_sub, y_sub, ccd_x, ccd_y,
 
 class Navigator():
 
-    def __init__(self,sector,cam,ccd,data_path='/fred/oz335/TESSdata',n=8,injection=False):
+    def __init__(self,sector,cam,ccd,data_path='/fred/oz335/TESSdata',n=8,injection=False,injection_dir='source_injection'):
 
         self.sector = sector
         self.cam = cam
@@ -75,7 +75,7 @@ class Navigator():
         self.n = n
 
         self.path = f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}'
-        self._inj_path = f'source_injection' if injection else ''
+        self._inj_path = injection_dir if injection else '.'
 
         self.cut = None
 

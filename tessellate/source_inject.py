@@ -154,7 +154,7 @@ def _Shift_One(frame, s):
 class SourceInjector():
 
     def __init__(self,sector,cam,ccd,n=8,job_output_path='.',working_path='.',num_cores=None,
-                 data_path='/fred/oz335/TESSdata',prf_path='/fred/oz335/_local_TESS_PRFs'):
+                 data_path='/fred/oz335/TESSdata',prf_path='/fred/oz335/_local_TESS_PRFs',injection_dir='source_injection'):
 
         self.sector = sector
         self.cam = cam
@@ -167,11 +167,12 @@ class SourceInjector():
         self.working_path = working_path
         self.data_path = data_path
         self.prf_path = prf_path
+        self.injection_dir = injection_dir
 
         self.num_cores = multiprocessing.cpu_count() if num_cores is None else num_cores
 
         self.path = f'{self.data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}'
-        self.nav = Navigator(sector,cam,ccd,data_path,n)
+        self.nav = Navigator(sector,cam,ccd,data_path,n,injection=True,injection_dir=injection_dir)
 
 
 
@@ -633,7 +634,7 @@ class SourceInjector():
 
         return raw_cube,processed
 
-    def run(self,cut,n_events,overwrite=False,injection_dir='source_injection',cube_mode='cutfits',
+    def run(self,cut,n_events,overwrite=False,cube_mode='cutfits',
             min_sep=5,edge_buffer=5,grid_step=1,big_size=15,small_size=5,
             duration_range_min=(10, 1440), duration_skew=(1.0, 2.5),
             K_range=(-1, 1), K_skew=(1.0, 1.0), p_negative_K=0.05,
@@ -653,10 +654,10 @@ class SourceInjector():
         base_name = f'sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{cut}_of{self.n**2}'      
 
         inject = False
-        if not os.path.exists(f'{directory}/{injection_dir}/{base_name}_RawFlux.npy'): 
+        if not os.path.exists(f'{directory}/{self.injection_dir}/{base_name}_RawFlux.npy'): 
             inject = True
         elif overwrite:
-            os.system(f'rm -r {directory}/{injection_dir}')
+            os.system(f'rm -r {directory}/{self.injection_dir}')
             inject = True
 
         if inject:
@@ -696,10 +697,10 @@ class SourceInjector():
             for i, lc in enumerate(lcs):
                 lcs_arr[i] = lc
 
-            os.makedirs(f'{directory}/{injection_dir}',exist_ok=True)
-            np.savez(f'{directory}/{injection_dir}/lightcurves.npz', lcs=lcs_arr)
-            injections.to_csv(f'{directory}/{injection_dir}/injected_events.csv',index=False)
-            np.save(f'{directory}/{injection_dir}/{base_name}_RawFlux.npy',raw_cube)
+            os.makedirs(f'{directory}/{self.injection_dir}',exist_ok=True)
+            np.savez(f'{directory}/{self.injection_dir}/lightcurves.npz', lcs=lcs_arr)
+            injections.to_csv(f'{directory}/{self.injection_dir}/injected_events.csv',index=False)
+            np.save(f'{directory}/{self.injection_dir}/{base_name}_RawFlux.npy',raw_cube)
 
         run = Tessellate(data_path=self.data_path,working_path=self.working_path,job_output_path=self.job_output_path,
                             sector=self.sector,cam=self.cam,ccd=self.ccd,n=self.n,cuts=cut,
@@ -1119,19 +1120,18 @@ class SourceInjector():
 
         
 
-    def gather_results(self,cut,injection_dir='source_injection',centroid_match_radius=1.0, 
+    def gather_results(self,cut,centroid_match_radius=1.0, 
                        min_temporal_iou=0.0, spatial_weight=0.5,overlap_weight=2.0,
                        duration_weight=0.5,peak_weight=0.1):
 
         if cut != self.cut:
-            self.nav = Navigator(self.sector,self.cam,self.ccd,self.data_path,self.n,injection=True)
             self.nav.gather_data(cut=cut)
             self.nav.gather_results(cut=cut,isolated=True)
             self.cut = cut
 
         directory = f'{self.path}/Cut{cut}of{self.n**2}'
 
-        self.injections = pd.read_csv(f'{directory}/{injection_dir}/injected_events.csv')
+        self.injections = pd.read_csv(f'{directory}/{self.injection_dir}/injected_events.csv')
 
         # TEMPORARY #
         try:
@@ -1177,7 +1177,7 @@ class SourceInjector():
         return transients
             
 
-    def plot_lc(self,injid,injection_dir='source_injection',cut=None,frame_buffer=10):
+    def plot_lc(self,injid,cut=None,frame_buffer=10):
 
         if cut is None:
             cut = self.cut
@@ -1185,7 +1185,7 @@ class SourceInjector():
             raise ValueError('Please specify a cut!')
 
         inj = self.transients[self.transients.injid==injid].iloc[0]
-        lc = np.load(f'{self.path}/Cut{cut}of{self.n**2}/{injection_dir}/lightcurves.npz',allow_pickle=True)['lcs'][injid]
+        lc = np.load(f'{self.path}/Cut{cut}of{self.n**2}/{self.injection_dir}/lightcurves.npz',allow_pickle=True)['lcs'][injid]
 
         plt.figure()
         plt.plot(self.nav.time[lc[0].astype(int)],lc[1],'d-',c='r',label='Injected Flux')

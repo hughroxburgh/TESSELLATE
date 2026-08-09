@@ -622,13 +622,17 @@ class SourceInjector():
         directory = f'{self.path}/Cut{cut}of{self.n**2}'
         base_name = f'sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{cut}_of{self.n**2}'  
 
-        if os.path.exists(f'{directory}/{base_name}.fits') and (cube_mode == 'cutfits'):
-            print('Loading raw lightkurve TPF')
-            import lightkurve as lk
-            tpf = lk.TessTargetPixelFile(f'{directory}/{base_name}.fits',quality_bitmask='hard')
-            raw_cube = tpf.flux.value
-            processed = False
-
+        if cube_mode == 'cutfits':
+            if os.path.exists(f'{directory}/{base_name}.fits'):
+                print('Loading raw lightkurve TPF')
+                import lightkurve as lk
+                tpf = lk.TessTargetPixelFile(f'{directory}/{base_name}.fits',quality_bitmask='hard')
+                raw_cube = tpf.flux.value
+                processed = False
+            else:
+                print('No cut fits file located, switching to recreation from processed files.')
+                raw_cube = self._true_nav.flux
+                processed = True
         else:
             raw_cube = self._true_nav.flux
             processed = True

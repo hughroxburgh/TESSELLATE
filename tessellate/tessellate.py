@@ -2224,7 +2224,7 @@ import os\n\
 \n\
 part={self.part}\n\
 processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=2)\n\
-processor.reduce(cam={cam},ccd={ccd},n={self.n},cut={cut},part=part,injection={self.injection},injection_dir={self._inj_dir})\n\
+processor.reduce(cam={cam},ccd={ccd},n={self.n},cut={cut},part=part,injection={self.injection},injection_dir='{self._inj_dir}')\n\
 if not part:\n\
     if os.path.exists('{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/{self._inj_dir}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{self.n**2}_Shifts.npy'):\n\
         with open(f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/{self._inj_dir}/reduced.txt', 'w') as file:\n\

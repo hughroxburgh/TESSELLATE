@@ -173,6 +173,7 @@ class SourceInjector():
 
         self.path = f'{self.data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}'
         self.nav = Navigator(sector,cam,ccd,data_path,n,injection=True,injection_dir=injection_dir)
+        self._true_nav = Navigator(sector,cam,ccd,data_path,n)#,injection=True,injection_dir=injection_dir)
 
 
 
@@ -198,14 +199,14 @@ class SourceInjector():
 
         print('    finding injection sites')
 
-        ny, nx = self.nav.flux.shape[-2], self.nav.flux.shape[-1]
+        ny, nx = self._true_nav.flux.shape[-2], self._true_nav.flux.shape[-1]
 
         xs = np.arange(edge_buffer, nx - edge_buffer, grid_step)
         ys = np.arange(edge_buffer, ny - edge_buffer, grid_step)
         xx, yy = np.meshgrid(xs, ys)
         candidates = np.stack([xx.ravel(), yy.ravel()], axis=1).astype(float)
 
-        obj_xy = self.nav.objects[['xcentroid', 'ycentroid']].dropna().values
+        obj_xy = self._true_nav.objects[['xcentroid', 'ycentroid']].dropna().values
         if len(obj_xy) == 0:
             return candidates.astype(int)
 
@@ -217,7 +218,7 @@ class SourceInjector():
 
     def _frame_window_with_gap_cutoff(self, frame_start, max_duration_days, cadence_min, gap_factor=10.0):
         """
-        Walks forward from frame_start through the real self.nav.time array
+        Walks forward from frame_start through the real self._true_nav.time array
         and returns frame_end (exclusive) such that:
           - elapsed real time from frame_start doesn't exceed max_duration_days
           - no gap between consecutive included frames exceeds
@@ -225,7 +226,7 @@ class SourceInjector():
         i.e. the window is cut short - not padded or rejected - the moment
         it runs into a big gap or the end of the baseline.
         """
-        time = self.nav.time
+        time = self._true_nav.time
         n_frames = len(time)
         if frame_start >= n_frames - 1:
             return min(frame_start + 1, n_frames)
@@ -332,7 +333,7 @@ class SourceInjector():
 
         assert abs(sum(type_probs) - 1.0) < 1e-6, "type_probs must sum to 1"
 
-        n_frames, ny, nx = self.nav.flux.shape
+        n_frames, ny, nx = self._true_nav.flux.shape
         frame_area = valid_sites.shape[0]
         max_occupied_px = max_frame_fill_frac * frame_area
 
@@ -340,10 +341,10 @@ class SourceInjector():
         log_dur_min = np.log10(duration_range_min[0] * min_to_day)
         log_dur_max = np.log10(duration_range_min[1] * min_to_day)
 
-        t_min, t_max = self.nav.time.min(), self.nav.time.max()
+        t_min, t_max = self._true_nav.time.min(), self._true_nav.time.max()
         baseline_days = t_max - t_min
         baseline_min = baseline_days * 1440.0
-        cadence_min = np.nanmedian(np.diff(self.nav.time)) * 1440
+        cadence_min = np.nanmedian(np.diff(self._true_nav.time)) * 1440
 
         period_lo, period_hi = period_range_min
         if period_hi is None:
@@ -422,7 +423,7 @@ class SourceInjector():
                     event_time_min = event_time_days * 1440.0
 
                     mjd_start_raw = t_min + rng.uniform(0, 1) * (t_max - t_min)
-                    frame_start = int(np.searchsorted(self.nav.time, mjd_start_raw, side='left'))
+                    frame_start = int(np.searchsorted(self._true_nav.time, mjd_start_raw, side='left'))
                     if frame_start >= n_frames:
                         continue
 
@@ -430,8 +431,8 @@ class SourceInjector():
                         frame_start, event_time_days, cadence_min, gap_factor=gap_factor
                     )
 
-                    mjd_start = self.nav.time[frame_start]
-                    mjd_end = self.nav.time[frame_end - 1]
+                    mjd_start = self._true_nav.time[frame_start]
+                    mjd_end = self._true_nav.time[frame_end - 1]
 
                 projected = occupancy[frame_start:frame_end] + stamp_area
                 if np.any(projected > max_occupied_px):
@@ -533,12 +534,12 @@ class SourceInjector():
 
         injections['frame_max'] = 0
         injections['mjd_max'] = 0
-        cadence_min = np.nanmedian(np.diff(self.nav.time)) * 1440
+        cadence_min = np.nanmedian(np.diff(self._true_nav.time)) * 1440
         lcs = []
         for i in tqdm(range(n_events), desc='    injecting events into cube', position=0, leave=True, dynamic_ncols=False, ascii=True):
             source = injections.iloc[i]
 
-            time_days = self.nav.time[source.frame_start:source.frame_end]
+            time_days = self._true_nav.time[source.frame_start:source.frame_end]
             if len(time_days) == 0:
                 continue
 
@@ -553,13 +554,13 @@ class SourceInjector():
             ref_idx = np.argmax(np.abs(flux))
             max_frame = frames[ref_idx]
             injections.iloc[i, injections.columns.get_loc('frame_max')] = max_frame
-            injections.iloc[i, injections.columns.get_loc('mjd_max')] = self.nav.time[max_frame]
+            injections.iloc[i, injections.columns.get_loc('mjd_max')] = self._true_nav.time[max_frame]
             
             xint = RoundToInt(source.xcentroid)
             yint = RoundToInt(source.ycentroid)
 
             half_big = big_size // 2
-            h, w = self.nav.flux.shape[1], self.nav.flux.shape[2]
+            h, w = self._true_nav.flux.shape[1], self._true_nav.flux.shape[2]
 
             y1 = yint - half_big        # Desired bounds in full image
             y2 = yint + half_big + 1
@@ -576,7 +577,7 @@ class SourceInjector():
             cx1 = xx1 - x1
             cx2 = cx1 + (xx2 - xx1)
     
-            cut[cy1:cy2, cx1:cx2] = self.nav.flux[max_frame, yy1:yy2, xx1:xx2] 
+            cut[cy1:cy2, cx1:cx2] = self._true_nav.flux[max_frame, yy1:yy2, xx1:xx2] 
         
             valid = cut[~np.isnan(cut)]     # Compute noise only on valid pixels
             if valid.size == 0:
@@ -629,7 +630,7 @@ class SourceInjector():
             processed = False
 
         else:
-            raw_cube = self.nav.flux
+            raw_cube = self._true_nav.flux
             processed = True
 
         return raw_cube,processed
@@ -662,8 +663,8 @@ class SourceInjector():
 
         if inject:
             
-            self.nav.gather_results(cut=cut,sources=False,events=True,objects=True)
-            self.nav.gather_data(cut=cut,flux=True,time=True,bkg=True,verbose=False)
+            self._true_nav.gather_results(cut=cut,sources=False,events=True,objects=True)
+            self._true_nav.gather_data(cut=cut,flux=True,time=True,bkg=True,verbose=False)
             raw_cube,processed = self.load_raw_cube(cut,cube_mode) 
 
             raw_cube,injections,lcs = self.inject_sources(cut,raw_cube,n_events,
@@ -705,7 +706,7 @@ class SourceInjector():
         run = Tessellate(data_path=self.data_path,working_path=self.working_path,job_output_path=self.job_output_path,
                             sector=self.sector,cam=self.cam,ccd=self.ccd,n=self.n,cuts=cut,
                             download=False,make_cube=False,fix_wcs=False,make_cuts=False,calibrate=False,
-                            reduce=True,search=True,injection=True,plot=False,delete=False,injection_dir=injection_dir,
+                            reduce=True,search=True,injection=True,plot=False,delete=False,injection_dir=self.injection_dir,
                             reset_logs=False,overwrite=False,ask_config=False,save_config=False,use_suggestions=True)
 
 
@@ -1125,6 +1126,7 @@ class SourceInjector():
                        duration_weight=0.5,peak_weight=0.1):
 
         if cut != self.cut:
+            self.nav = Navigator(self.sector,self.cam,self.ccd,self.data_path,self.n,injection=True,injection_dir=self.injection_dir)
             self.nav.gather_data(cut=cut)
             self.nav.gather_results(cut=cut,isolated=True)
             self.cut = cut

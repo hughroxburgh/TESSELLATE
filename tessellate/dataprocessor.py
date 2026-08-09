@@ -510,7 +510,7 @@ class DataProcessor():
                     file.write(f'Reduced with TESSreduce version {tr.__version__}.')
 
 
-    def reduce(self,cam,ccd,n,cut,part=False,injection=False):
+    def reduce(self,cam,ccd,n,cut,part=False,injection=False,injection_dir='source_injection'):
         """
         Reduces a cut on a ccd using TESSreduce. bkg correlation 
         correction and final calibration are disabled due to time constraints.
@@ -536,7 +536,7 @@ class DataProcessor():
         from .localisation import CutWCS
         
         filepath = f'{self.path}/Cam{cam}/Ccd{ccd}'
-        injection_dir = 'source_injection' if injection else '.'
+        injection_dir = injection_dir if injection else '.'
 
         if part:
             self._reduce_part_cuts(cam,ccd,n,cut,filepath)

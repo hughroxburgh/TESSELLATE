@@ -628,6 +628,19 @@ class SourceInjector():
                 import lightkurve as lk
                 tpf = lk.TessTargetPixelFile(f'{directory}/{base_name}.fits',quality_bitmask='hard')
                 raw_cube = tpf.flux.value
+                time = tpf.time.mjd
+                if len(self.nav.time) - len(time) == 1:
+                    idx = np.where(self.nav.time[:-1]-time != 0)[0][0]
+                    raw_cube = np.insert(raw_cube,idx,np.zeros_like(raw_cube[0]), axis=0)
+                    print('Size mismatch between cut.fits time and saved Times.npy. Adding a zeros frame')
+                elif len(self.nav.time) - len(time) == -1:
+                    idx = np.where(self.nav.time-time[:-1] != 0)[0][0]
+                    raw_cube = np.delete(raw_cube,idx,axis=0)
+                    print('Size mismatch between cut.fits time and saved Times.npy. Removing a frame')
+                elif len(self.nav.time) - len(time) != 0:
+                    e = 'Cut time length does not match Times.npy length!'
+                    raise ValueError(e)
+                    
                 processed = False
             else:
                 print('No cut fits file located, switching to recreation from processed files.')

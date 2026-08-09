@@ -615,12 +615,12 @@ class SourceInjector():
 
         return np.array(result)
 
-    def load_raw_cube(self,cut):
+    def load_raw_cube(self,cut,cube_mode):
 
         directory = f'{self.path}/Cut{cut}of{self.n**2}'
         base_name = f'sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{cut}_of{self.n**2}'  
 
-        if os.path.exists(f'{directory}/{base_name}.fits'):
+        if os.path.exists(f'{directory}/{base_name}.fits') and (cube_mode == 'cutfits'):
             print('Loading raw lightkurve TPF')
             import lightkurve as lk
             tpf = lk.TessTargetPixelFile(f'{directory}/{base_name}.fits',quality_bitmask='hard')
@@ -633,7 +633,7 @@ class SourceInjector():
 
         return raw_cube,processed
 
-    def run(self,cut,n_events,overwrite=False,
+    def run(self,cut,n_events,overwrite=False,injection_dir='source_injection',cube_mode='cutfits',
             min_sep=5,edge_buffer=5,grid_step=1,big_size=15,small_size=5,
             duration_range_min=(10, 1440), duration_skew=(1.0, 2.5),
             K_range=(-1, 1), K_skew=(1.0, 1.0), p_negative_K=0.05,
@@ -653,17 +653,17 @@ class SourceInjector():
         base_name = f'sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{cut}_of{self.n**2}'      
 
         inject = False
-        if not os.path.exists(f'{directory}/source_injection/{base_name}_RawFlux.npy'): 
+        if not os.path.exists(f'{directory}/{injection_dir}/{base_name}_RawFlux.npy'): 
             inject = True
         elif overwrite:
-            os.system(f'rm -r {directory}/source_injection')
+            os.system(f'rm -r {directory}/{injection_dir}')
             inject = True
 
         if inject:
 
             self.nav.gather_results(cut=cut,sources=False,events=True,objects=True)
             self.nav.gather_data(cut=cut,flux=True,time=True,bkg=True,verbose=False)
-            raw_cube,processed = self.load_raw_cube(cut) 
+            raw_cube,processed = self.load_raw_cube(cut,cube_mode) 
 
             raw_cube,injections,lcs = self.inject_sources(cut,raw_cube,n_events,
                         min_sep,edge_buffer,grid_step,big_size,small_size,
@@ -1119,8 +1119,9 @@ class SourceInjector():
 
         
 
-    def gather_results(self,cut,centroid_match_radius=1.0, min_temporal_iou=0.0, spatial_weight=0.5,
-                                    overlap_weight=2.0,duration_weight=0.5,peak_weight=0.1):
+    def gather_results(self,cut,injection_dir='source_injection',centroid_match_radius=1.0, 
+                       min_temporal_iou=0.0, spatial_weight=0.5,overlap_weight=2.0,
+                       duration_weight=0.5,peak_weight=0.1):
 
         if cut != self.cut:
             self.nav = Navigator(self.sector,self.cam,self.ccd,self.data_path,self.n,injection=True)
@@ -1130,7 +1131,7 @@ class SourceInjector():
 
         directory = f'{self.path}/Cut{cut}of{self.n**2}'
 
-        self.injections = pd.read_csv(f'{directory}/source_injection/injected_events.csv')
+        self.injections = pd.read_csv(f'{directory}/{injection_dir}/injected_events.csv')
 
         # TEMPORARY #
         try:
@@ -1176,7 +1177,7 @@ class SourceInjector():
         return transients
             
 
-    def plot_lc(self,injid,cut=None,frame_buffer=10):
+    def plot_lc(self,injid,injection_dir='source_injection',cut=None,frame_buffer=10):
 
         if cut is None:
             cut = self.cut
@@ -1184,7 +1185,7 @@ class SourceInjector():
             raise ValueError('Please specify a cut!')
 
         inj = self.transients[self.transients.injid==injid].iloc[0]
-        lc = np.load(f'{self.path}/Cut{cut}of{self.n**2}/source_injection/lightcurves.npz',allow_pickle=True)['lcs'][injid]
+        lc = np.load(f'{self.path}/Cut{cut}of{self.n**2}/{injection_dir}/lightcurves.npz',allow_pickle=True)['lcs'][injid]
 
         plt.figure()
         plt.plot(self.nav.time[lc[0].astype(int)],lc[1],'d-',c='r',label='Injected Flux')

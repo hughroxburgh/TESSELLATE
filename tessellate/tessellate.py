@@ -23,7 +23,7 @@ class Tessellate():
 
     def __init__(self,data_path,sector=None,cam=None,ccd=None,n=None,
                  verbose=2,ask_config=True,save_config=True,
-                 job_output_path=None,working_path=None,
+                 job_output_path=None,working_path=None,injection_dir='source_injection',
                  download_number=None,cube_time=None,cube_mem=None,cube_cpu=None,
                  cuts=None,cut_time=None,cut_mem=None,cut_cpu=None,
                  reduce_time=None,reduce_cpu=None,reduce_mem=None,
@@ -144,7 +144,7 @@ class Tessellate():
         self.cut_cpu = cut_cpu
 
         self.injection = injection
-        self._inj_dir = 'source_injection' if injection else '.'
+        self._inj_dir = injection_dir if injection else '.'
 
         self.reduce_time = reduce_time
         self.reduce_cpu = reduce_cpu

@@ -660,7 +660,7 @@ class SourceInjector():
             inject = True
 
         if inject:
-
+            
             self.nav.gather_results(cut=cut,sources=False,events=True,objects=True)
             self.nav.gather_data(cut=cut,flux=True,time=True,bkg=True,verbose=False)
             raw_cube,processed = self.load_raw_cube(cut,cube_mode) 
@@ -696,15 +696,15 @@ class SourceInjector():
             for i, lc in enumerate(lcs):
                 lcs_arr[i] = lc
 
-            os.makedirs(f'{directory}/source_injection',exist_ok=True)
-            np.savez(f'{directory}/source_injection/lightcurves.npz', lcs=lcs_arr)
-            injections.to_csv(f'{directory}/source_injection/injected_events.csv',index=False)
-            np.save(f'{directory}/source_injection/{base_name}_RawFlux.npy',raw_cube)
+            os.makedirs(f'{directory}/{injection_dir}',exist_ok=True)
+            np.savez(f'{directory}/{injection_dir}/lightcurves.npz', lcs=lcs_arr)
+            injections.to_csv(f'{directory}/{injection_dir}/injected_events.csv',index=False)
+            np.save(f'{directory}/{injection_dir}/{base_name}_RawFlux.npy',raw_cube)
 
         run = Tessellate(data_path=self.data_path,working_path=self.working_path,job_output_path=self.job_output_path,
                             sector=self.sector,cam=self.cam,ccd=self.ccd,n=self.n,cuts=cut,
                             download=False,make_cube=False,fix_wcs=False,make_cuts=False,calibrate=False,
-                            reduce=True,search=True,injection=True,plot=False,delete=False,
+                            reduce=True,search=True,injection=True,plot=False,delete=False,injection_dir=injection_dir,
                             reset_logs=False,overwrite=False,ask_config=False,save_config=False,use_suggestions=True)
 
 

@@ -1171,7 +1171,8 @@ def _Crossbin_group_worker(asteroid_group_id, group_events):
 class Detector():
 
     def __init__(self,sector,cam,ccd,data_path='/fred/oz335/TESSdata',n=8,
-                 match_variables=True,mode='both',part=None,injection=False,cpu=multiprocessing.cpu_count()):
+                 match_variables=True,mode='both',part=None,injection=False,injection_dir='source_injection',
+                 cpu=multiprocessing.cpu_count()):
         
         """
         Tessellate Detection Class.
@@ -1197,7 +1198,7 @@ class Detector():
         self.cut = None
         self.bkg = None
 
-        self._inj_path = 'source_injection' if injection else '.'
+        self._inj_path = injection_dir if injection else '.'
 
         if part is None:
             self.path = f'{self.data_path}/Sector{self.sector}/Cam{self.cam}/Ccd{self.ccd}'

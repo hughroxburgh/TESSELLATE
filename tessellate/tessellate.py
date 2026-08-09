@@ -2577,7 +2577,7 @@ if part:\n\
         detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n},injection={self.injection},part=2)\n\
         detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.time_bins})\n\
 else:\n\
-    detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n},injection={self.injection})\n\
+    detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n},injection={self.injection},injection_dir='{self._inj_dir}')\n\
     detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.time_bins})"   
                     
         with open(f"{self.working_path}/detection_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py", "w") as python_file:

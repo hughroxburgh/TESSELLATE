@@ -670,69 +670,72 @@ class SourceInjector():
             period_range_min=(20, None), period_mode_min=240.0,
             period_concentration=3.0):
 
+        _Print_buff(60,f'Running Source Injection for Sector{self.sector} Cam{self.cam} Ccd{self.ccd}')# Cut {cut}')
 
-        _Print_buff(60,f'Running Source Injection for Sector{self.sector} Cam{self.cam} Ccd{self.ccd} Cut {cut}')
-        print('\n')
+        cuts = np.atleast_1d(cut).astype(int)
+        for cut in cuts:
+            print('\n')
+            print(f'Cut{cut}')
 
-        directory = f'{self.path}/Cut{cut}of{self.n**2}'
-        base_name = f'sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{cut}_of{self.n**2}'      
+            directory = f'{self.path}/Cut{cut}of{self.n**2}'
+            base_name = f'sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{cut}_of{self.n**2}'      
 
-        inject = False
-        if not os.path.exists(f'{directory}/{self.injection_dir}/{base_name}_RawFlux.npy'): 
-            inject = True
-        elif overwrite:
-            os.system(f'rm -r {directory}/{self.injection_dir}')
-            inject = True
+            inject = False
+            if not os.path.exists(f'{directory}/{self.injection_dir}/{base_name}_RawFlux.npy'): 
+                inject = True
+            elif overwrite:
+                os.system(f'rm -r {directory}/{self.injection_dir}')
+                inject = True
 
-        if inject:
-            
-            self._true_nav.gather_results(cut=cut,sources=False,events=True,objects=True)
-            self._true_nav.gather_data(cut=cut,flux=True,time=True,bkg=True,verbose=False)
-            raw_cube,processed = self.load_raw_cube(cut,cube_mode) 
+            if inject:
+                
+                self._true_nav.gather_results(cut=cut,sources=False,events=True,objects=True)
+                self._true_nav.gather_data(cut=cut,flux=True,time=True,bkg=True,verbose=False)
+                raw_cube,processed = self.load_raw_cube(cut,cube_mode) 
 
-            if processed:
-                shifts = np.zeros((self._true_nav.time.shape[0],2)).shape
-            else:
-                shifts = np.load(f'{directory}/{base_name}_Shifts.npy')
+                if processed:
+                    shifts = np.zeros((self._true_nav.time.shape[0],2)).shape
+                else:
+                    shifts = np.load(f'{directory}/{base_name}_Shifts.npy')
 
-            raw_cube,injections,lcs = self.inject_sources(cut,raw_cube,n_events,shifts,
-                        min_sep,edge_buffer,grid_step,big_size,small_size,
-                        duration_range_min, duration_skew,
-                        K_range, K_skew, p_negative_K,
-                        duty_frac_range, duty_frac_skew,
-                        stamp_area, max_frame_fill_frac,
-                        overlap_dist_px, max_attempts_per_event,
-                        type_probs=type_probs,
-                        K_negative_range=K_negative_range,
-                        period_range_min=period_range_min,
-                        period_mode_min=period_mode_min,
-                        period_concentration=period_concentration)
+                raw_cube,injections,lcs = self.inject_sources(cut,raw_cube,n_events,shifts,
+                            min_sep,edge_buffer,grid_step,big_size,small_size,
+                            duration_range_min, duration_skew,
+                            K_range, K_skew, p_negative_K,
+                            duty_frac_range, duty_frac_skew,
+                            stamp_area, max_frame_fill_frac,
+                            overlap_dist_px, max_attempts_per_event,
+                            type_probs=type_probs,
+                            K_negative_range=K_negative_range,
+                            period_range_min=period_range_min,
+                            period_mode_min=period_mode_min,
+                            period_concentration=period_concentration)
 
-            if processed:
+                if processed:
 
-                orbit_segments = np.load(f'{directory}/{base_name}_OrbitSegments.npy')
-                orbit_refs = np.load(f'{directory}/{base_name}_OrbitRefs.npz')
-                orbit_refs = {int(k): orbit_refs[k] for k in orbit_refs.files}
-                ref = np.load(f'{directory}/{base_name}_Ref.npy')
-                shifts = np.load(f'{directory}/{base_name}_Shifts.npy')
+                    orbit_segments = np.load(f'{directory}/{base_name}_OrbitSegments.npy')
+                    orbit_refs = np.load(f'{directory}/{base_name}_OrbitRefs.npz')
+                    orbit_refs = {int(k): orbit_refs[k] for k in orbit_refs.files}
+                    ref = np.load(f'{directory}/{base_name}_Ref.npy')
+                    shifts = np.load(f'{directory}/{base_name}_Shifts.npy')
 
-                raw_cube[orbit_segments==1] += orbit_refs[1]
-                raw_cube[orbit_segments==2] += orbit_refs[2]
-                raw_cube += ref
+                    raw_cube[orbit_segments==1] += orbit_refs[1]
+                    raw_cube[orbit_segments==2] += orbit_refs[2]
+                    raw_cube += ref
 
-                raw_cube = self.apply_shifts(shifts,raw_cube)
+                    raw_cube = self.apply_shifts(shifts,raw_cube)
 
-            lcs_arr = np.empty(len(lcs), dtype=object)
-            for i, lc in enumerate(lcs):
-                lcs_arr[i] = lc
+                lcs_arr = np.empty(len(lcs), dtype=object)
+                for i, lc in enumerate(lcs):
+                    lcs_arr[i] = lc
 
-            os.makedirs(f'{directory}/{self.injection_dir}',exist_ok=True)
-            np.savez(f'{directory}/{self.injection_dir}/lightcurves.npz', lcs=lcs_arr)
-            injections.to_csv(f'{directory}/{self.injection_dir}/injected_events.csv',index=False)
-            np.save(f'{directory}/{self.injection_dir}/{base_name}_RawFlux.npy',raw_cube)
+                os.makedirs(f'{directory}/{self.injection_dir}',exist_ok=True)
+                np.savez(f'{directory}/{self.injection_dir}/lightcurves.npz', lcs=lcs_arr)
+                injections.to_csv(f'{directory}/{self.injection_dir}/injected_events.csv',index=False)
+                np.save(f'{directory}/{self.injection_dir}/{base_name}_RawFlux.npy',raw_cube)
 
         run = Tessellate(data_path=self.data_path,working_path=self.working_path,job_output_path=self.job_output_path,
-                            sector=self.sector,cam=self.cam,ccd=self.ccd,n=self.n,cuts=cut,
+                            sector=self.sector,cam=self.cam,ccd=self.ccd,n=self.n,cuts=list(cuts),
                             download=False,make_cube=False,fix_wcs=False,make_cuts=False,calibrate=False,
                             reduce=True,search=True,injection=True,plot=False,delete=False,injection_dir=self.injection_dir,
                             reset_logs=False,overwrite=False,ask_config=False,save_config=False,use_suggestions=True)

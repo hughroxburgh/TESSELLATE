@@ -491,7 +491,7 @@ class SourceInjector():
         schedule_df = pd.DataFrame(rows)
         return schedule_df
 
-    def inject_sources(self,cut,raw_cube,n_events,
+    def inject_sources(self,cut,raw_cube,n_events,shifts,
                         min_sep=5,edge_buffer=5,grid_step=1,big_size=15,small_size=5,
                         duration_range_min=(10, 1440), duration_skew=(1.0, 2.5),
                         K_range=(-1, 1), K_skew=(1.0, 1.0), p_negative_K=0.05,
@@ -593,11 +593,17 @@ class SourceInjector():
             flux *= peak_flux
             lcs.append(np.array([frames,flux]))
 
-            image = prf.locate(2 + (source.xcentroid - RoundToInt(source.xcentroid)),
-                                2 + (source.ycentroid - RoundToInt(source.ycentroid)),
-                                (5, 5))
+            # image = prf.locate(2 + (source.xcentroid - RoundToInt(source.xcentroid)),
+            #                     2 + (source.ycentroid - RoundToInt(source.ycentroid)),
+            #                     (5, 5))
             
             for j, f in enumerate(flux):
+
+                shiftx,shifty = shifts[frames[j]]
+
+                image = prf.locate(2 + (source.xcentroid - shiftx - RoundToInt(source.xcentroid)),
+                                                2 + (source.ycentroid - shifty - RoundToInt(source.ycentroid)),
+                                                (5, 5))
 
                 image_frame = image.copy() * f / np.nansum(image[1:4, 1:4])
 
@@ -684,7 +690,12 @@ class SourceInjector():
             self._true_nav.gather_data(cut=cut,flux=True,time=True,bkg=True,verbose=False)
             raw_cube,processed = self.load_raw_cube(cut,cube_mode) 
 
-            raw_cube,injections,lcs = self.inject_sources(cut,raw_cube,n_events,
+            if processed:
+                shifts = np.zeros((self._true_nav.time.shape[0],2)).shape
+            else:
+                shifts = np.load(f'{directory}/{base_name}_Shifts.npy')
+
+            raw_cube,injections,lcs = self.inject_sources(cut,raw_cube,n_events,shifts,
                         min_sep,edge_buffer,grid_step,big_size,small_size,
                         duration_range_min, duration_skew,
                         K_range, K_skew, p_negative_K,

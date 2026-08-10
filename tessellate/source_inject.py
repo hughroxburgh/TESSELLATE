@@ -599,10 +599,10 @@ class SourceInjector():
             
             for j, f in enumerate(flux):
 
-                shiftx,shifty = shifts[frames[j]]
+                shifty,shiftx = shifts[frames[j]]
 
-                image = prf.locate(2 + (source.xcentroid + shiftx - RoundToInt(source.xcentroid)),
-                                                2 + (source.ycentroid + shifty - RoundToInt(source.ycentroid)),
+                image = prf.locate(2 + (source.xcentroid - shiftx - RoundToInt(source.xcentroid)),
+                                                2 + (source.ycentroid - shifty - RoundToInt(source.ycentroid)),
                                                 (5, 5))
 
                 image_frame = image.copy() * f / np.nansum(image[1:4, 1:4])

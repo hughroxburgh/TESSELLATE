@@ -11,6 +11,8 @@ import multiprocessing
 from joblib import Parallel, delayed
 import seaborn as sns
 import subprocess
+from scipy.spatial import cKDTree
+
 import sys
 
 VENV_PATH = sys.prefix
@@ -1015,150 +1017,140 @@ python {script_py}'
                             reset_logs=False,overwrite=False,ask_config=False,save_config=False,use_suggestions=True)
 
         
-    def match_results_to_transients(self,centroid_match_radius=1.0, min_temporal_iou=0.0, spatial_weight=0.5,
-                                    overlap_weight=2.0,duration_weight=0.5,peak_weight=0.1):
+    def match_results_to_transients(self, centroid_match_radius=1.0, min_temporal_iou=0.0,
+                                    spatial_weight=0.5, overlap_weight=2.0,
+                                    duration_weight=0.5, peak_weight=0.1):
 
-        non_vars = self.injections[self.injections.event_type != 'sinusoid']
+        non_vars = self.injections[self.injections.event_type != 'sinusoid'].reset_index(drop=True)
+        n = len(non_vars)
 
-        # Output columns
-        non_vars["detected"] = "n"
-        non_vars["ev_match"] = "-"
-        non_vars["centroid_sep"] = np.nan
-        non_vars["temporal_iou"] = np.nan
-        non_vars["duration_ratio"] = np.nan
-        non_vars["peak_offset_min"] = np.nan
-        non_vars["snr_detected"] = np.nan
-        non_vars["snr_ratio"] = np.nan
-        non_vars["match_score"] = np.nan
+        detected      = np.full(n, "n", dtype=object)
+        ev_match      = np.full(n, "-", dtype=object)
+        centroid_sep_o = np.full(n, np.nan)
+        temporal_iou_o = np.full(n, np.nan)
+        duration_rat_o = np.full(n, np.nan)
+        peak_off_o     = np.full(n, np.nan)
+        snr_det_o      = np.full(n, np.nan)
+        snr_rat_o      = np.full(n, np.nan)
+        match_score_o  = np.full(n, np.nan)
+        z_x_o          = np.full(n, np.nan)
+        z_y_o          = np.full(n, np.nan)
 
-        events_all = self.nav.events.copy()
+        events_all = self.nav.events
         frame_bins = np.sort(events_all.frame_bin.dropna().unique())
 
-        for inj_idx, inj in non_vars.iterrows():
+        # --- Build one KDTree per (frame_bin, flux_sign) group, once ---
+        trees, group_data = {}, {}
+        for frame_bin in frame_bins:
+            for sign in (1, -1):
+                sub = events_all[(events_all.frame_bin == frame_bin) & (events_all.flux_sign == sign)]
+                if len(sub) == 0:
+                    continue
+                key = (frame_bin, sign)
+                trees[key] = cKDTree(sub[['xcentroid', 'ycentroid']].to_numpy())
+                group_data[key] = sub.reset_index(drop=True)
 
-            inj_sign = 1 if inj.event_type == 'flare' else -1
-            inj_start = float(inj.mjd_start)
-            inj_end = float(inj.mjd_end)
-            inj_duration = max(inj_end - inj_start, np.finfo(float).eps)
+        # --- Pull injection columns to numpy once (avoid repeated attribute access in loop) ---
+        inj_sign   = np.where(non_vars.event_type.values == 'flare', 1, -1)
+        inj_x      = non_vars.xcentroid.values
+        inj_y      = non_vars.ycentroid.values
+        inj_start  = non_vars.mjd_start.values.astype(float)
+        inj_end    = non_vars.mjd_end.values.astype(float)
+        inj_max    = non_vars.mjd_max.values
+        inj_snr    = non_vars.snr.values
+        inj_fstart = non_vars.frame_start.values.astype(int)
+        inj_fend   = non_vars.frame_end.values.astype(int)
+        inj_dur    = np.maximum(inj_end - inj_start, np.finfo(float).eps)
 
-            event_found = False
+        # --- Pre-sort isolated table by frame for fast range queries ---
+        isolated = self.nav.isolated
+        iso_order = np.argsort(isolated.frame.values)
+        iso_frame_s = isolated.frame.values[iso_order]
+        iso_x_s = isolated.xcentroid.values[iso_order]
+        iso_y_s = isolated.ycentroid.values[iso_order]
 
-            # --  Search event catalogues from lowest to highest frame_bin -- #
+        for i in range(n):
+            sign, x0, y0 = inj_sign[i], inj_x[i], inj_y[i]
+            i_start, i_end, i_dur, i_max, i_snr = inj_start[i], inj_end[i], inj_dur[i], inj_max[i], inj_snr[i]
+            found = False
+
             for frame_bin in frame_bins:
-
-                bin_events = events_all[
-                    events_all.frame_bin == frame_bin
-                ].copy()
-
-                # Spatial pre-selection
-                bin_events["centroid_sep"] = np.hypot(
-                    bin_events.xcentroid - inj.xcentroid,
-                    bin_events.ycentroid - inj.ycentroid,
-                )
-
-                candidates = bin_events[(bin_events.centroid_sep <= centroid_match_radius) & (bin_events.flux_sign==inj_sign)].copy()
-                if len(candidates) == 0:
+                tree = trees.get((frame_bin, sign))
+                if tree is None:
                     continue
 
-                # Temporal overlap using MJD values
-                candidates["intersection"] = np.maximum(
-                    0.0,
-                    np.minimum(candidates.mjd_end, inj_end)
-                    - np.maximum(candidates.mjd_start, inj_start),
-                )
-
-                candidates = candidates[candidates.intersection > 0].copy()
-                if len(candidates) == 0:
+                idxs = tree.query_ball_point((x0, y0), r=centroid_match_radius)
+                if not idxs:
                     continue
+                cand = group_data[(frame_bin, sign)].iloc[idxs]
 
-                candidates["union"] = (
-                    np.maximum(candidates.mjd_end, inj_end)
-                    - np.minimum(candidates.mjd_start, inj_start)
-                )
-
-                candidates["temporal_iou"] = candidates.intersection / candidates.union
-
-                candidates = candidates[candidates.temporal_iou >= min_temporal_iou].copy()
-                if len(candidates) == 0:
+                csep = np.hypot(cand.xcentroid.values - x0, cand.ycentroid.values - y0)
+                intersection = np.maximum(0.0,
+                    np.minimum(cand.mjd_end.values, i_end) - np.maximum(cand.mjd_start.values, i_start))
+                m = intersection > 0
+                if not m.any():
                     continue
+                cand, csep, intersection = cand[m], csep[m], intersection[m]
 
-                candidates["det_duration"] = (
-                    candidates.mjd_end - candidates.mjd_start
-                ).clip(lower=np.finfo(float).eps)
+                union = np.maximum(cand.mjd_end.values, i_end) - np.minimum(cand.mjd_start.values, i_start)
+                tiou = intersection / union
+                m2 = tiou >= min_temporal_iou
+                if not m2.any():
+                    continue
+                cand, csep, tiou = cand[m2], csep[m2], tiou[m2]
 
-                candidates["overlap_frac_inj"] = candidates.intersection / inj_duration
-                candidates["overlap_frac_det"] = candidates.intersection / candidates.det_duration
+                det_dur = np.clip(cand.mjd_end.values - cand.mjd_start.values, np.finfo(float).eps, None)
+                dur_ratio = np.maximum(det_dur, i_dur) / np.minimum(det_dur, i_dur)
+                peak_off = np.abs(cand.mjd_max.values - i_max) * 1440.0
+                i_dur_min = max(i_dur * 1440.0, 1.0)
 
-                candidates["duration_ratio"] = np.maximum(
-                    candidates.det_duration,
-                    inj_duration,
-                ) / np.minimum(
-                    candidates.det_duration,
-                    inj_duration,
-                )
+                score = (spatial_weight * csep
+                        + overlap_weight * (1.0 - tiou)
+                        + duration_weight * np.abs(np.log(dur_ratio))
+                        + peak_weight * (peak_off / i_dur_min))
 
-                candidates["peak_offset_min"] = np.abs(candidates.mjd_max - inj.mjd_max) * 1440.0
-            
-                # Normalise peak offset by injected duration so long events are
-                # not unfairly penalised.
-                inj_duration_min = max(inj_duration * 1440.0, 1.0)
+                b = np.argmin(score)
+                best = cand.iloc[b]
 
-                candidates["match_score"] = (
-                    spatial_weight * candidates.centroid_sep
-                    + overlap_weight * (1.0 - candidates.temporal_iou)
-                    + duration_weight * np.abs(
-                        np.log(candidates.duration_ratio)
-                    )
-                    + peak_weight * (
-                        candidates.peak_offset_min / inj_duration_min
-                    )
-                )
+                detected[i]      = "y" if int(frame_bin) == 1 else str(int(frame_bin))
+                ev_match[i]      = f"{int(best.objid)}_{int(best.eventid)}"
+                centroid_sep_o[i] = csep[b]
+                temporal_iou_o[i] = tiou[b]
+                duration_rat_o[i] = dur_ratio[b]
+                peak_off_o[i]     = peak_off[b]
+                snr_det_o[i]      = best.lc_sig_max
+                snr_rat_o[i]      = best.lc_sig_max / i_snr
+                match_score_o[i]  = score[b]
+                z_x_o[i]          = (best.xcentroid - x0) / best.xcentroid_err
+                z_y_o[i]          = (best.ycentroid - y0) / best.ycentroid_err
 
-                best_idx = candidates.match_score.idxmin()
-                best = candidates.loc[best_idx]
-
-                detected_label = "y" if int(frame_bin) == 1 else str(int(frame_bin))
-
-                non_vars.loc[inj_idx, "detected"] = detected_label
-                non_vars.loc[inj_idx, "ev_match"] = f"{best.objid}_{best.eventid}"
-                non_vars.loc[inj_idx, "centroid_sep"] = best.centroid_sep
-                non_vars.loc[inj_idx, "temporal_iou"] = best.temporal_iou
-                non_vars.loc[inj_idx, "duration_ratio"] = best.duration_ratio
-                non_vars.loc[inj_idx, "peak_offset_min"] = best.peak_offset_min
-                non_vars.loc[inj_idx, "snr_detected"] = best.lc_sig_max
-                non_vars.loc[inj_idx, "snr_ratio"] = best.lc_sig_max / inj.snr
-                non_vars.loc[inj_idx, "match_score"] = best.match_score
-                non_vars.loc[inj_idx,"z_xcentroid"] = (best.xcentroid-inj.xcentroid) / best.xcentroid_err
-                non_vars.loc[inj_idx,"z_ycentroid"] = (best.ycentroid-inj.ycentroid) / best.ycentroid_err
-
-                event_found = True
+                found = True
                 break
 
-            if event_found:
+            if found:
                 continue
 
-            # -- No event found: check isolated single-frame detections -- #
-            isolated = self.nav.isolated.copy()
+            # --- isolated fallback: frame-range via searchsorted, not a full-table scan ---
+            lo = np.searchsorted(iso_frame_s, inj_fstart[i], side='left')
+            hi = np.searchsorted(iso_frame_s, inj_fend[i], side='right')
+            if hi > lo:
+                d = np.hypot(iso_x_s[lo:hi] - x0, iso_y_s[lo:hi] - y0)
+                if np.any(d <= centroid_match_radius):
+                    detected[i] = "iso"
 
-            isolated["centroid_sep"] = np.hypot(
-                isolated.xcentroid - inj.xcentroid,
-                isolated.ycentroid - inj.ycentroid,
-            )
-
-            # Injection frame_end is assumed exclusive.
-            iso_candidates = isolated[
-                (isolated.frame >= int(inj.frame_start))
-                & (isolated.frame <= int(inj.frame_end))
-                & (isolated.centroid_sep <= centroid_match_radius)
-            ].copy()
-
-            if len(iso_candidates) == 0:
-                continue
-
-            non_vars.loc[inj_idx, "detected"] = "iso"
+        non_vars["detected"]      = detected
+        non_vars["ev_match"]      = ev_match
+        non_vars["centroid_sep"]  = centroid_sep_o
+        non_vars["temporal_iou"]  = temporal_iou_o
+        non_vars["duration_ratio"] = duration_rat_o
+        non_vars["peak_offset_min"] = peak_off_o
+        non_vars["snr_detected"]  = snr_det_o
+        non_vars["snr_ratio"]     = snr_rat_o
+        non_vars["match_score"]   = match_score_o
+        non_vars["z_xcentroid"]   = z_x_o
+        non_vars["z_ycentroid"]   = z_y_o
 
         return non_vars
-
 
     # def match_vars_to_injections(self,centroid_match_radius=1.0,extremum_window_frac=0.25,min_samples_per_extremum=1):
 

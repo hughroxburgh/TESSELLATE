@@ -772,9 +772,7 @@ class SourceInjector():
         print(f'Creating Injection Script for Sector{self.sector} Cam{self.cam} Ccd{self.ccd} Cut{cut}')
 
         python_text = f"\
-import sys\n\
-sys.path.insert(0, '{os.path.dirname(os.path.abspath(__file__))}')\n\
-from tessellate.sourceinjector import SourceInjector\n\
+from tessellate import SourceInjector\n\
 \n\
 injector = SourceInjector(\n\
     sector={self.sector}, cam={self.cam}, ccd={self.ccd}, n={self.n},\n\
@@ -843,7 +841,7 @@ python {script_py}'
 
 
     def _wait_for_jobs(self, injection_status, n_events, overwrite, cube_mode,
-                        min_sep, edge_buffer, grid_step, big_size, small_size,
+                            min_sep, edge_buffer, grid_step, big_size, small_size,
                         duration_range_min, duration_skew,
                         K_range, K_skew, p_negative_K,
                         duty_frac_range, duty_frac_skew,
@@ -855,13 +853,20 @@ python {script_py}'
         Polls until every cut in `injection_status` has left the queue,
         restarting any job that TIMEOUTs with an extra 30 minutes on the
         clock. `injection_status` is a dict keyed by cut:
-            {cut: {'job_id': ..., 'job_time': ..., 'status': 'PENDING'}, ...}
+            {cut: {'job_id': ..., 'job_time': ...}, ...}
         Mutates and drains `injection_status` in place.
+
+        Returns:
+            failed_cuts: set of cuts whose injection job did not complete
+                         successfully (FAILED, or an unexpected terminal
+                         status).
         """
 
         from datetime import timedelta
         from time import sleep
         from .tools import _Check_job_status
+
+        failed_cuts = set()
 
         i = 0
         while len(injection_status.keys()) > 0:
@@ -879,6 +884,7 @@ python {script_py}'
                 elif job_status == 'FAILED':
                     print(f'Injection Failed for Cut {cut}')
                     print('\n')
+                    failed_cuts.add(cut)
                     del(injection_status[cut])
 
                 elif job_status == 'TIMEOUT':
@@ -910,17 +916,27 @@ python {script_py}'
                         period_range_min, period_mode_min, period_concentration,
                         time=result,
                     )
-                    injection_status[cut]['job_id'] = job_id
-                    injection_status[cut]['job_time'] = result
+                    if job_id is None:
+                        # resubmission itself failed - don't loop forever
+                        failed_cuts.add(cut)
+                        del(injection_status[cut])
+                    else:
+                        injection_status[cut]['job_id'] = job_id
+                        injection_status[cut]['job_time'] = result
 
                 elif job_status not in ['RUNNING','PENDING','COMPLETING','CONFIGURING','SUSPENDED']:
-                    e = f'Job {job_id} for injection of Cam {self.cam} CCD {self.ccd} Cut {cut} has unexpected status: {job_status}\n'
-                    raise ValueError(e)
+                    print(f'Job {job_id} for injection of Cam {self.cam} CCD {self.ccd} Cut {cut} '
+                          f'has unexpected status: {job_status} - treating as failed')
+                    print('\n')
+                    failed_cuts.add(cut)
+                    del(injection_status[cut])
 
             if len(injection_status.keys()) > 0:
                 print('Waiting for Injections' + i*'.', end='\r')
                 sleep(120)
                 i += 1
+
+        return failed_cuts
 
     def run(self,cut,n_events,overwrite=False,cube_mode='cutfits',
             min_sep=5,edge_buffer=5,grid_step=1,big_size=15,small_size=5,
@@ -963,10 +979,13 @@ python {script_py}'
             )
 
             if job_id is not None:
-                injection_status[cut] = {'job_id': job_id, 'job_time': self.inject_time, 'status': 'PENDING'}
+                injection_status[cut] = {'job_id': job_id, 'job_time': self.inject_time}
+            else:
+                # sbatch submission itself failed - this cut never got a job
+                cuts = cuts[cuts != cut]
 
         # -- Block until all submitted cuts finish (or fail) -- #
-        self._wait_for_jobs(
+        failed_cuts = self._wait_for_jobs(
             injection_status, n_events, overwrite, cube_mode,
             min_sep, edge_buffer, grid_step, big_size, small_size,
             duration_range_min, duration_skew,
@@ -978,9 +997,19 @@ python {script_py}'
             period_range_min, period_mode_min, period_concentration,
         )
 
-        # -- All cuts injected (or failed) - run Tessellate once across all -- #
+        successful_cuts = [c for c in cuts if c not in failed_cuts]
+
+        if len(successful_cuts) == 0:
+            print('No cuts completed injection successfully - skipping Tessellate run.')
+            return
+
+        if len(failed_cuts) > 0:
+            print(f'Skipping Tessellate for failed cuts: {sorted(failed_cuts)}')
+            print('\n')
+
+        # -- Run Tessellate only over cuts that injected successfully -- #
         run = Tessellate(data_path=self.data_path,working_path=self.working_path,job_output_path=self.job_output_path,
-                            sector=self.sector,cam=self.cam,ccd=self.ccd,n=self.n,cuts=list(cuts),
+                            sector=self.sector,cam=self.cam,ccd=self.ccd,n=self.n,cuts=successful_cuts,
                             download=False,make_cube=False,fix_wcs=False,make_cuts=False,calibrate=False,
                             reduce=True,search=True,injection=True,plot=False,delete=False,injection_dir=self.injection_dir,
                             reset_logs=False,overwrite=False,ask_config=False,save_config=False,use_suggestions=True)

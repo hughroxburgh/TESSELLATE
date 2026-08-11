@@ -10,10 +10,6 @@ from tqdm import tqdm
 import multiprocessing
 from joblib import Parallel, delayed
 import seaborn as sns
-import subprocess
-import sys
-
-VENV_PATH = sys.prefix
 
 from tessellate.tessellate import Tessellate
 from tessellate.dataprocessor import DataProcessor
@@ -157,10 +153,8 @@ def _Shift_One(frame, s):
 
 class SourceInjector():
 
-    def __init__(self, sector, cam, ccd, n=8, job_output_path='.', working_path='.', num_cores=None,
-                 data_path='/fred/oz335/TESSdata', prf_path='/fred/oz335/_local_TESS_PRFs',
-                 injection_dir='source_injection',
-                 inject_time='00:30:00', inject_cpu=4, inject_mem=8):
+    def __init__(self,sector,cam,ccd,n=8,job_output_path='.',working_path='.',num_cores=None,
+                 data_path='/fred/oz335/TESSdata',prf_path='/fred/oz335/_local_TESS_PRFs',injection_dir='source_injection'):
 
         self.sector = sector
         self.cam = cam
@@ -175,16 +169,11 @@ class SourceInjector():
         self.prf_path = prf_path
         self.injection_dir = injection_dir
 
-        # -- sbatch resourcing for per-cut injection jobs -- #
-        self.inject_time = inject_time
-        self.inject_cpu = inject_cpu
-        self.inject_mem = inject_mem
-
         self.num_cores = multiprocessing.cpu_count() if num_cores is None else num_cores
 
         self.path = f'{self.data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}'
-        self.nav = Navigator(sector, cam, ccd, data_path, n, injection=True, injection_dir=injection_dir)
-        self._true_nav = Navigator(sector, cam, ccd, data_path, n)
+        self.nav = Navigator(sector,cam,ccd,data_path,n,injection=True,injection_dir=injection_dir)
+        self._true_nav = Navigator(sector,cam,ccd,data_path,n)#,injection=True,injection_dir=injection_dir)
 
 
 
@@ -669,259 +658,6 @@ class SourceInjector():
 
         return raw_cube,processed
 
-    def _inject_cut(self, cut, n_events, overwrite=False, cube_mode='cutfits',
-                     min_sep=5, edge_buffer=5, grid_step=1, big_size=15, small_size=5,
-                     duration_range_min=(10, 1440), duration_skew=(1.0, 2.5),
-                     K_range=(-1, 1), K_skew=(1.0, 1.0), p_negative_K=0.05,
-                     duty_frac_range=(0.05, 0.95), duty_frac_skew=(1.0, 1.0),
-                     stamp_area=25, max_frame_fill_frac=0.25,
-                     overlap_dist_px=5, max_attempts_per_event=200,
-                     type_probs=(0.6, 0.2, 0.2),
-                     K_negative_range=(-0.2, 0.2),
-                     period_range_min=(20, None), period_mode_min=240.0,
-                     period_concentration=3.0):
-        """
-        Runs the full injection pipeline for a single cut (site-finding,
-        scheduling, source injection, and writing outputs to disk). This is
-        the body that used to live inline inside `run`'s `if inject:` block,
-        factored out so a single cut can be executed standalone - i.e. from
-        inside the script submitted via sbatch in `_cut_inject`.
-        """
-
-        directory = f'{self.path}/Cut{cut}of{self.n**2}'
-        base_name = f'sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{cut}_of{self.n**2}'
-
-        inject = False
-        if not os.path.exists(f'{directory}/{self.injection_dir}/{base_name}_RawFlux.npy'):
-            inject = True
-        elif overwrite:
-            os.system(f'rm -r {directory}/{self.injection_dir}')
-            inject = True
-
-        if not inject:
-            print(f'    Cut{cut}: injection outputs already exist, skipping (overwrite=False)')
-            return
-
-        self._true_nav.gather_results(cut=cut, sources=False, events=True, objects=True)
-        self._true_nav.gather_data(cut=cut, flux=True, time=True, bkg=True, verbose=False)
-        raw_cube, processed = self.load_raw_cube(cut, cube_mode)
-
-        if processed:
-            shifts = np.zeros((self._true_nav.time.shape[0], 2)).shape
-        else:
-            shifts = np.load(f'{directory}/{base_name}_Shifts.npy')
-
-        raw_cube, injections, lcs = self.inject_sources(
-            cut, raw_cube, n_events, shifts,
-            min_sep, edge_buffer, grid_step, big_size, small_size,
-            duration_range_min, duration_skew,
-            K_range, K_skew, p_negative_K,
-            duty_frac_range, duty_frac_skew,
-            stamp_area, max_frame_fill_frac,
-            overlap_dist_px, max_attempts_per_event,
-            type_probs=type_probs,
-            K_negative_range=K_negative_range,
-            period_range_min=period_range_min,
-            period_mode_min=period_mode_min,
-            period_concentration=period_concentration,
-        )
-
-        if processed:
-            orbit_segments = np.load(f'{directory}/{base_name}_OrbitSegments.npy')
-            orbit_refs = np.load(f'{directory}/{base_name}_OrbitRefs.npz')
-            orbit_refs = {int(k): orbit_refs[k] for k in orbit_refs.files}
-            ref = np.load(f'{directory}/{base_name}_Ref.npy')
-            shifts = np.load(f'{directory}/{base_name}_Shifts.npy')
-
-            raw_cube[orbit_segments == 1] += orbit_refs[1]
-            raw_cube[orbit_segments == 2] += orbit_refs[2]
-            raw_cube += ref
-
-            raw_cube = self.apply_shifts(shifts, raw_cube)
-
-        lcs_arr = np.empty(len(lcs), dtype=object)
-        for i, lc in enumerate(lcs):
-            lcs_arr[i] = lc
-
-        os.makedirs(f'{directory}/{self.injection_dir}', exist_ok=True)
-        np.savez(f'{directory}/{self.injection_dir}/lightcurves.npz', lcs=lcs_arr)
-        injections.to_csv(f'{directory}/{self.injection_dir}/injected_events.csv', index=False)
-        np.save(f'{directory}/{self.injection_dir}/{base_name}_RawFlux.npy', raw_cube)
-
-        print(f'    Cut{cut}: injection complete')
-
-    def _cut_inject(self, cut, n_events, overwrite, cube_mode,
-                     min_sep, edge_buffer, grid_step, big_size, small_size,
-                     duration_range_min, duration_skew,
-                     K_range, K_skew, p_negative_K,
-                     duty_frac_range, duty_frac_skew,
-                     stamp_area, max_frame_fill_frac,
-                     overlap_dist_px, max_attempts_per_event,
-                     type_probs, K_negative_range,
-                     period_range_min, period_mode_min, period_concentration,
-                     time=None):
-        """
-        Writes a standalone script that instantiates a fresh SourceInjector
-        and runs `_inject_cut` for this one cut, wraps it in an sbatch
-        script, and submits it. Returns the job id (or None on failure),
-        mirroring `_cut_calibrate`.
-        """
-
-        inject_time = time if time is not None else self.inject_time
-
-        print(f'Creating Injection Script for Sector{self.sector} Cam{self.cam} Ccd{self.ccd} Cut{cut}')
-
-        python_text = f"\
-import sys\n\
-sys.path.insert(0, '{os.path.dirname(os.path.abspath(__file__))}')\n\
-from tessellate.sourceinjector import SourceInjector\n\
-\n\
-injector = SourceInjector(\n\
-    sector={self.sector}, cam={self.cam}, ccd={self.ccd}, n={self.n},\n\
-    job_output_path='{self.job_output_path}', working_path='{self.working_path}',\n\
-    num_cores={self.num_cores}, data_path='{self.data_path}', prf_path='{self.prf_path}',\n\
-    injection_dir='{self.injection_dir}',\n\
-)\n\
-\n\
-injector._inject_cut(\n\
-    cut={cut}, n_events={n_events}, overwrite={overwrite}, cube_mode='{cube_mode}',\n\
-    min_sep={min_sep}, edge_buffer={edge_buffer}, grid_step={grid_step},\n\
-    big_size={big_size}, small_size={small_size},\n\
-    duration_range_min={duration_range_min}, duration_skew={duration_skew},\n\
-    K_range={K_range}, K_skew={K_skew}, p_negative_K={p_negative_K},\n\
-    duty_frac_range={duty_frac_range}, duty_frac_skew={duty_frac_skew},\n\
-    stamp_area={stamp_area}, max_frame_fill_frac={max_frame_fill_frac},\n\
-    overlap_dist_px={overlap_dist_px}, max_attempts_per_event={max_attempts_per_event},\n\
-    type_probs={type_probs}, K_negative_range={K_negative_range},\n\
-    period_range_min={period_range_min}, period_mode_min={period_mode_min},\n\
-    period_concentration={period_concentration},\n\
-)"
-
-        script_py = f'{self.working_path}/injection_scripts/S{self.sector}C{self.cam}C{self.ccd}C{cut}_script.py'
-        script_sh = script_py.replace('.py', '.sh')
-
-        os.makedirs(f'{self.working_path}/injection_scripts', exist_ok=True)
-        with open(script_py, 'w') as f:
-            f.write(python_text)
-
-        os.makedirs(f'{self.job_output_path}/tessellate_injection_logs', exist_ok=True)
-
-        batch_text = f'\
-#!/bin/bash\n\
-#\n\
-#SBATCH --job-name=TESS_S{self.sector}_Cam{self.cam}_Ccd{self.ccd}_Cut{cut}_Inject\n\
-#SBATCH --output={self.job_output_path}/tessellate_injection_logs/%A_%x_job_output.txt\n\
-#SBATCH --error={self.job_output_path}/tessellate_injection_logs/%A_%x_errors.txt\n\
-#\n\
-#SBATCH --ntasks=1\n\
-#SBATCH --time={inject_time}\n\
-#SBATCH --cpus-per-task={self.inject_cpu}\n\
-#SBATCH --mem-per-cpu={self.inject_mem}G\n\
-#SBATCH --account=oz335\n\
-\n\
-PYTHONUNBUFFERED=1\n\
-source {VENV_PATH}/bin/activate\n\
-python {script_py}'
-
-        with open(script_sh, 'w') as f:
-            f.write(batch_text)
-
-        result = subprocess.run(
-            f'sbatch {script_sh}',
-            shell=True, capture_output=True, text=True
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            print(f'sbatch failed for Cut {cut}:')
-            print(f'  stdout: {result.stdout.strip()}')
-            print(f'  stderr: {result.stderr.strip()}')
-            print('\n')
-            return None
-        job_id = result.stdout.strip().split()[-1]
-        print(f'Submitted batch job {job_id}')
-        print('\n')
-        return job_id
-
-
-    def _wait_for_jobs(self, injection_status, n_events, overwrite, cube_mode,
-                        min_sep, edge_buffer, grid_step, big_size, small_size,
-                        duration_range_min, duration_skew,
-                        K_range, K_skew, p_negative_K,
-                        duty_frac_range, duty_frac_skew,
-                        stamp_area, max_frame_fill_frac,
-                        overlap_dist_px, max_attempts_per_event,
-                        type_probs, K_negative_range,
-                        period_range_min, period_mode_min, period_concentration):
-        """
-        Polls until every cut in `injection_status` has left the queue,
-        restarting any job that TIMEOUTs with an extra 30 minutes on the
-        clock. `injection_status` is a dict keyed by cut:
-            {cut: {'job_id': ..., 'job_time': ..., 'status': 'PENDING'}, ...}
-        Mutates and drains `injection_status` in place.
-        """
-
-        from datetime import timedelta
-        from time import sleep
-        from .tools import _Check_job_status
-
-        i = 0
-        while len(injection_status.keys()) > 0:
-
-            for cut in list(injection_status.keys()):
-
-                job_id = injection_status[cut]['job_id']
-                job_status = _Check_job_status(job_id)
-
-                if job_status == 'COMPLETED':
-                    print(f'Injection Completed for Cut {cut}')
-                    print('\n')
-                    del(injection_status[cut])
-
-                elif job_status == 'FAILED':
-                    print(f'Injection Failed for Cut {cut}')
-                    print('\n')
-                    del(injection_status[cut])
-
-                elif job_status == 'TIMEOUT':
-                    parts = list(map(int, injection_status[cut]['job_time'].split(':')))
-                    if len(parts) == 3:
-                        h, m, s = parts
-                    else:
-                        h = 0
-                        m, s = parts
-
-                    td = timedelta(hours=h, minutes=m, seconds=s)
-                    td += timedelta(minutes=30)  # add 30 minutes to the job time
-                    total = int(td.total_seconds())
-                    h = total // 3600
-                    m = (total % 3600) // 60
-                    s = total % 60
-                    result = f"{h}:{m:02}:{s:02}"
-
-                    print(f'Restarting Injection for Cut {cut} with new time limit of {result}')
-                    job_id = self._cut_inject(
-                        cut, n_events, overwrite, cube_mode,
-                        min_sep, edge_buffer, grid_step, big_size, small_size,
-                        duration_range_min, duration_skew,
-                        K_range, K_skew, p_negative_K,
-                        duty_frac_range, duty_frac_skew,
-                        stamp_area, max_frame_fill_frac,
-                        overlap_dist_px, max_attempts_per_event,
-                        type_probs, K_negative_range,
-                        period_range_min, period_mode_min, period_concentration,
-                        time=result,
-                    )
-                    injection_status[cut]['job_id'] = job_id
-                    injection_status[cut]['job_time'] = result
-
-                elif job_status not in ['RUNNING','PENDING','COMPLETING','CONFIGURING','SUSPENDED']:
-                    e = f'Job {job_id} for injection of Cam {self.cam} CCD {self.ccd} Cut {cut} has unexpected status: {job_status}\n'
-                    raise ValueError(e)
-
-            if len(injection_status.keys()) > 0:
-                print('Waiting for Injections' + i*'.', end='\r')
-                sleep(120)
-                i += 1
-
     def run(self,cut,n_events,overwrite=False,cube_mode='cutfits',
             min_sep=5,edge_buffer=5,grid_step=1,big_size=15,small_size=5,
             duration_range_min=(10, 1440), duration_skew=(1.0, 2.5),
@@ -934,58 +670,86 @@ python {script_py}'
             period_range_min=(20, None), period_mode_min=240.0,
             period_concentration=3.0):
 
-        _Print_buff(60,f'Running Source Injection for Sector{self.sector} Cam{self.cam} Ccd{self.ccd}')
+        _Print_buff(60,f'Running Source Injection for Sector{self.sector} Cam{self.cam} Ccd{self.ccd}')# Cut {cut}')
 
         cuts = np.atleast_1d(cut).astype(int)
-
-        # -- Submit one injection job per cut -- #
-        injection_status = {}
         for cut in cuts:
+            print('\n')
+            print(f'Cut{cut}')
 
             directory = f'{self.path}/Cut{cut}of{self.n**2}'
-            base_name = f'sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{cut}_of{self.n**2}'
+            base_name = f'sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{cut}_of{self.n**2}'      
 
-            if os.path.exists(f'{directory}/{self.injection_dir}/{base_name}_RawFlux.npy') and not overwrite:
-                print(f'Cut {cut} already injected!')
-                print('\n')
-                continue
+            inject = False
+            if not os.path.exists(f'{directory}/{self.injection_dir}/{base_name}_RawFlux.npy'): 
+                inject = True
+            elif overwrite:
+                os.system(f'rm -r {directory}/{self.injection_dir}')
+                inject = True
 
-            job_id = self._cut_inject(
-                cut, n_events, overwrite, cube_mode,
-                min_sep, edge_buffer, grid_step, big_size, small_size,
-                duration_range_min, duration_skew,
-                K_range, K_skew, p_negative_K,
-                duty_frac_range, duty_frac_skew,
-                stamp_area, max_frame_fill_frac,
-                overlap_dist_px, max_attempts_per_event,
-                type_probs, K_negative_range,
-                period_range_min, period_mode_min, period_concentration,
-            )
+            if inject:
+                
+                self._true_nav.gather_results(cut=cut,sources=False,events=True,objects=True)
+                self._true_nav.gather_data(cut=cut,flux=True,time=True,bkg=True,verbose=False)
+                raw_cube,processed = self.load_raw_cube(cut,cube_mode) 
 
-            if job_id is not None:
-                injection_status[cut] = {'job_id': job_id, 'job_time': self.inject_time, 'status': 'PENDING'}
+                if processed:
+                    shifts = np.zeros((self._true_nav.time.shape[0],2)).shape
+                else:
+                    shifts = np.load(f'{directory}/{base_name}_Shifts.npy')
 
-        # -- Block until all submitted cuts finish (or fail) -- #
-        self._wait_for_jobs(
-            injection_status, n_events, overwrite, cube_mode,
-            min_sep, edge_buffer, grid_step, big_size, small_size,
-            duration_range_min, duration_skew,
-            K_range, K_skew, p_negative_K,
-            duty_frac_range, duty_frac_skew,
-            stamp_area, max_frame_fill_frac,
-            overlap_dist_px, max_attempts_per_event,
-            type_probs, K_negative_range,
-            period_range_min, period_mode_min, period_concentration,
-        )
+                raw_cube,injections,lcs = self.inject_sources(cut,raw_cube,n_events,shifts,
+                            min_sep,edge_buffer,grid_step,big_size,small_size,
+                            duration_range_min, duration_skew,
+                            K_range, K_skew, p_negative_K,
+                            duty_frac_range, duty_frac_skew,
+                            stamp_area, max_frame_fill_frac,
+                            overlap_dist_px, max_attempts_per_event,
+                            type_probs=type_probs,
+                            K_negative_range=K_negative_range,
+                            period_range_min=period_range_min,
+                            period_mode_min=period_mode_min,
+                            period_concentration=period_concentration)
 
-        # -- All cuts injected (or failed) - run Tessellate once across all -- #
+                if processed:
+
+                    orbit_segments = np.load(f'{directory}/{base_name}_OrbitSegments.npy')
+                    orbit_refs = np.load(f'{directory}/{base_name}_OrbitRefs.npz')
+                    orbit_refs = {int(k): orbit_refs[k] for k in orbit_refs.files}
+                    ref = np.load(f'{directory}/{base_name}_Ref.npy')
+                    shifts = np.load(f'{directory}/{base_name}_Shifts.npy')
+
+                    raw_cube[orbit_segments==1] += orbit_refs[1]
+                    raw_cube[orbit_segments==2] += orbit_refs[2]
+                    raw_cube += ref
+
+                    raw_cube = self.apply_shifts(shifts,raw_cube)
+
+                lcs_arr = np.empty(len(lcs), dtype=object)
+                for i, lc in enumerate(lcs):
+                    lcs_arr[i] = lc
+
+                os.makedirs(f'{directory}/{self.injection_dir}',exist_ok=True)
+                np.savez(f'{directory}/{self.injection_dir}/lightcurves.npz', lcs=lcs_arr)
+                injections.to_csv(f'{directory}/{self.injection_dir}/injected_events.csv',index=False)
+                np.save(f'{directory}/{self.injection_dir}/{base_name}_RawFlux.npy',raw_cube)
+
+                del self._true_nav.flux
+                del raw_cube
+                del lcs
+                del shifts
+                del orbit_refs
+                del orbit_segments
+                
+
         run = Tessellate(data_path=self.data_path,working_path=self.working_path,job_output_path=self.job_output_path,
                             sector=self.sector,cam=self.cam,ccd=self.ccd,n=self.n,cuts=list(cuts),
                             download=False,make_cube=False,fix_wcs=False,make_cuts=False,calibrate=False,
                             reduce=True,search=True,injection=True,plot=False,delete=False,injection_dir=self.injection_dir,
                             reset_logs=False,overwrite=False,ask_config=False,save_config=False,use_suggestions=True)
 
-        
+
+
     def match_results_to_transients(self,centroid_match_radius=1.0, min_temporal_iou=0.0, spatial_weight=0.5,
                                     overlap_weight=2.0,duration_weight=0.5,peak_weight=0.1):
 

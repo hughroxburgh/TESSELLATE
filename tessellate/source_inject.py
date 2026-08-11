@@ -1036,7 +1036,7 @@ python {script_py}'
 
         for inj_idx, inj in non_vars.iterrows():
 
-
+            inj_sign = 1 if inj.event_type == 'flare' else -1
             inj_start = float(inj.mjd_start)
             inj_end = float(inj.mjd_end)
             inj_duration = max(inj_end - inj_start, np.finfo(float).eps)
@@ -1056,7 +1056,7 @@ python {script_py}'
                     bin_events.ycentroid - inj.ycentroid,
                 )
 
-                candidates = bin_events[bin_events.centroid_sep <= centroid_match_radius].copy()
+                candidates = bin_events[(bin_events.centroid_sep <= centroid_match_radius) & (bin_events.flux_sign==inj_sign)].copy()
                 if len(candidates) == 0:
                     continue
 

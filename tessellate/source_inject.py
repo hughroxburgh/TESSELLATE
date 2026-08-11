@@ -1419,12 +1419,13 @@ python {script_py}'
 
     def gather_results(self,cut,centroid_match_radius=1.0, 
                        min_temporal_iou=0.0, spatial_weight=0.5,overlap_weight=2.0,
-                       duration_weight=0.5,peak_weight=0.1):
+                       duration_weight=0.5,peak_weight=0.1,load_data=True):
 
         if cut != self.cut:
             self.nav = Navigator(self.sector,self.cam,self.ccd,self.data_path,self.n,injection=True,injection_dir=self.injection_dir)
-            self.nav.gather_data(cut=cut)
             self.nav.gather_results(cut=cut,isolated=True)
+            if load_data:
+                self.nav.gather_data(cut=cut)
             self.cut = cut
 
         directory = f'{self.path}/Cut{cut}of{self.n**2}'

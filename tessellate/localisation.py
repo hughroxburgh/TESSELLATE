@@ -173,7 +173,7 @@ class PSF_Fitter():
         image = deepcopy(image)
 
         image -= np.nanmedian(image)    # ensure background is calibrated ish
-        image /= np.nansum(image)    # normalise the image
+        image /= np.nansum(image[self.mask])    # normalise the image
         
         coeff = [self.source_x,self.source_y]
         lims = [[-limx,limx],[-limy,limy]]

@@ -14,4 +14,7 @@ def __getattr__(name):
     elif name == "Navigator":
         from .navigator import Navigator
         return Navigator
+    elif name == "SourceInjector":
+        from .source_inject import SourceInjector
+        return SourceInjector
     raise AttributeError(f"module 'tessellate' has no attribute '{name}'")

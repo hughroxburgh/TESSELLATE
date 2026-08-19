@@ -167,15 +167,27 @@ class TessFixer():
             if not os.path.exists(f"{ccd_folder}/wcs/ref/corrected.fits"):
 
                 ref_idx_full, ref_idx_good = self.get_reference(f'{ccd_folder}/sector{self.sector}_cam{cam}_ccd{ccd}_cube.fits')
-                if not os.path.exists(f'{ccd_folder}/image_files/'):
-                    data_processor.download(cam=cam,ccd=ccd,single=ref_idx_full,number=None)
-                    image_path = glob(f'{ccd_folder}/image_files/*.fits')[0]
-                elif len(glob(f'{ccd_folder}/image_files/*.fits')) < 100:
-                    os.system(f'rm -r {ccd_folder}/image_files')
-                    data_processor.download(cam=cam,ccd=ccd,single=ref_idx_full,number=None)
-                    image_path = glob(f'{ccd_folder}/image_files/*.fits')[0]    
-                else:
-                    image_path = sorted(glob(f'{ccd_folder}/image_files/*.fits'))[ref_idx_full]
+
+                done = False
+                while not done:
+                    if not os.path.exists(f'{ccd_folder}/image_files/'):
+                        data_processor.download(cam=cam,ccd=ccd,single=ref_idx_full,number=None)
+                        image_path = glob(f'{ccd_folder}/image_files/*.fits')[0]
+                    elif len(glob(f'{ccd_folder}/image_files/*.fits')) < 100:
+                        os.system(f'rm -r {ccd_folder}/image_files')
+                        data_processor.download(cam=cam,ccd=ccd,single=ref_idx_full,number=None)
+                        image_path = glob(f'{ccd_folder}/image_files/*.fits')[0]    
+                    else:
+                        image_path = sorted(glob(f'{ccd_folder}/image_files/*.fits'))[ref_idx_full]
+
+                    with fits.open(image_path) as f:
+                        wcs = WCS(f[1].header)
+                    if wcs.is_celestial:
+                        done=True
+                    else:
+                        ref_idx_full += 1
+                        ref_idx_good += 1
+                    
             else:
                 image_path = f'{ccd_folder}/wcs/ref/corrected.fits'
                 with open(f'{ccd_folder}/wcs/ref/reference.txt', 'r') as file:

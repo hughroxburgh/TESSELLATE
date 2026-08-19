@@ -84,7 +84,14 @@ class TessTransient():
         self.neighbours = None
 
         if self.obs:
-            _ = self._sector_suggestions()         
+            
+            if self.sector in range(1, 28):      # Primary mission: ~1200 FFIs, 30 min cadence
+                self.cadence = 1 / 48
+            elif self.sector in range(28, 56):  # Secondary mission: ~3600 FFIs, 10 min cadence
+                self.cadence = 1 / (3 * 48)
+            else:                               # Tertiary mission
+                self.cadence = 200 / (24 * 60 * 60)
+
             if run:
                 print('\n')
                 self.run()
@@ -733,33 +740,7 @@ class TessTransient():
                 if type(item) == tuple:
                     self.neighbours.append(item[:-1])
 
-    def _sector_suggestions(self):
-
-        # t = Tessellate(data_path=self.data_path,job_output_path='',working_path='',
-        #                sector=self.sector,cam=1,ccd=1,
-        #                download=False,make_cube=False,make_cuts=False,reduce=False,
-        #                search=False,plot=False,overwrite=False,reset_logs=False,delete=False)
-
-        t = Tessellate(data_path=self.data_path,job_output_path='',working_path='',
-                       sector=self.sector,go=False)
         
-        if self.sector in range(1, 28):      # Primary mission: ~1200 FFIs, 30 min cadence
-            self.cadence = 1 / 48
-        elif self.sector in range(28, 56):  # Secondary mission: ~3600 FFIs, 10 min cadence
-            self.cadence = 1 / (3 * 48)
-        else:                               # Tertiary mission
-            self.cadence = 200 / (24 * 60 * 60)
-
-        suggestions = t._sector_suggestions()
-
-        self.part = t.part
-
-        # suggestions = np.array(suggestions)
-        # suggestions = suggestions[:,:2]
-
-        return suggestions
-        
-
     def _run_tessellate(self,cam=None,ccd=None):
 
         if cam is None:
@@ -767,29 +748,15 @@ class TessTransient():
         if ccd is None:
             ccd = self.ccd
 
-        suggestions = self._sector_suggestions()
         cuts = self.get_impacted_cuts(cam,ccd)
-
-        cubing = suggestions[0]
-        cutting = suggestions[1]
-        reducing = suggestions[2]
-        searching = suggestions[3]
-        plotting = suggestions[4]
-        calibrating = suggestions[5]
 
         run = Tessellate(data_path=self.data_path,working_path=self.working_path,job_output_path=self.job_output_path,
                         sector=self.sector,cam=cam,ccd=ccd,n=self.n,cuts=cuts,
                         download=self.download,download_number='all',
-                        make_cube=True,cube_time=cubing[0],cube_mem=int(cubing[1][:-1]),
-                        fix_wcs=True,
-                        make_cuts=True,cut_time=cutting[0],cut_mem=int(cutting[1][:-1]),
-                        predict_asteroids=False,
-                        reduce=True,reduce_time=reducing[0],reduce_cpu=int(reducing[1]),
-                        asteroid_lightcurves=False,
-                        calibrate=True,calibrate_time=calibrating[0],calibrate_cpu=int(calibrating[1]),
-                        search=True,search_time=searching[0],search_cpu=int(searching[1]),time_bins=searching[3],
-                        plot=False,plot_time=plotting[0],plot_cpu=int(plotting[1]),
-                        delete=False,reset_logs=False,overwrite=False,ask_config=False,save_config=False)
+                        make_cube=True,fix_wcs=True,make_cuts=True,
+                        predict_asteroids=False,reduce=True,asteroid_lightcurves=False,
+                        calibrate=True,search=True,plot=False,delete=False,
+                        reset_logs=False,overwrite=False,ask_config=False,save_config=False,use_suggestions=True)
         
     def run(self):
 

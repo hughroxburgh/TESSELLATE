@@ -717,7 +717,7 @@ def _Lightcurve_event_checker(lc_sig,triggers,siglim=3,maxsep=5):
     return new_start,new_end,n_detections,sorted(triggers)
 
 
-def _Fit_psf(flux, event, prf, frames, uncertainty_funcs, big_size=15, small_size=5):
+def _Fit_psf(flux, event, prf, frames, uncertainty_funcs, exposure_time, big_size=15, small_size=5,core_size=3):
     """
     Generate an cutout around an event and fit PSF. 
     Chooses the frame based on the highest SNR between stack through event and individual frames.
@@ -732,6 +732,7 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_funcs, big_size=15, small_siz
 
     half_big = big_size // 2
     half_small = small_size // 2
+    half_core = core_size // 2
 
     h, w = flux.shape[1], flux.shape[2]
 
@@ -785,12 +786,16 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_funcs, big_size=15, small_siz
         _, _, noise = sigma_clipped_stats(valid, sigma=3)
 
         core = cut[                         
-            half_big-half_small:half_big+half_small+1,      # 3x3 aperture around core
-            half_big-half_small:half_big+half_small+1,
+            half_big-half_core:half_big+half_core+1,      # core_size x core_size aperture around core
+            half_big-half_core:half_big+half_core+1,
         ]
 
         flux_sum = np.nansum(core)      # Estimate the snr from core
-        snr = flux_sum / (9 * noise)
+        npix = core_size ** 2            # NOTE: core_size here should be the side length (3), not sqrt(npix)
+        background_term = npix * noise**2
+        poisson_term = flux_sum / exposure_time   # flux_sum in e-/s, exptime_s the effective exposure time
+        ap_err = np.sqrt(background_term + poisson_term)
+        snr = flux_sum / ap_err
 
         cuts.append(cut)
         snrs.append(snr)
@@ -804,16 +809,24 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_funcs, big_size=15, small_siz
     valid = stacked_big[~np.isnan(stacked_big)]
     _, _, noise = sigma_clipped_stats(valid, sigma=3)
 
-    stacked_core = stacked_big[
+    stacked_small = stacked_big[
         half_big-half_small:half_big+half_small+1,
         half_big-half_small:half_big+half_small+1,
     ]
 
-    stacked_flux_sum = np.nansum(stacked_core)
-    stacked_snr = stacked_flux_sum / (9 * noise)
+    stacked_core = stacked_big[
+        half_big-half_core:half_big+half_core+1,
+        half_big-half_core:half_big+half_core+1,
+    ]
+
+    stacked_flux_sum = np.nansum(stacked_core)      # Estimate the snr from core
+    background_term = npix * noise**2
+    poisson_term = stacked_flux_sum / exposure_time   # flux_sum in e-/s, exptime_s the effective exposure time
+    stacked_ap_err = np.sqrt(background_term + poisson_term)
+    stacked_snr = stacked_flux_sum / stacked_ap_err
 
     # --- Choose best image or stacked through event --- #
-    if np.max(snrs) > stacked_snr:
+    if np.max(snrs) >= stacked_snr:
         idx = int(np.argmax(snrs))
         centred_flux = cuts[idx][
             half_big-half_small:half_big+half_small+1,
@@ -822,9 +835,9 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_funcs, big_size=15, small_siz
         snr = snrs[idx]
         stacked_psf_fit = 0
     else:
-        centred_flux = stacked_core
+        centred_flux = stacked_small
         snr = stacked_snr
-        stacked_psf_fit = 1
+        stacked_psf_fit = 1 
 
     # --- PSF fit --- #
     unc_x = uncertainty_funcs[0](snr)
@@ -851,7 +864,7 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_funcs, big_size=15, small_siz
 
 
 def _Isolate_events(objid,time,flux,sources,sector,cam,ccd,cut,prf,
-                    snr_to_localisation_func,nan_frames,
+                    exposure_time,snr_to_localisation_func,nan_frames,
                     frame_buffer,event_time_buffer,calc_time_window):
     """
     Groups sources for given objid into temporally separated events.
@@ -932,7 +945,7 @@ def _Isolate_events(objid,time,flux,sources,sector,cam,ccd,cut,prf,
         event['ycentroid_det'] = weighted_eventsources.iloc[0]['ycentroid']
 
         # -- Fit PSF -- #
-        event = _Fit_psf(flux,event,prf,frames,snr_to_localisation_func)
+        event = _Fit_psf(flux,event,prf,frames,snr_to_localisation_func,exposure_time)
         
         # -- If event is quite PSF-like, centroid likely good -- #
         if event['psf_like']>0.5:
@@ -1158,7 +1171,8 @@ def _Crossbin_group_worker(asteroid_group_id, group_events):
 class Detector():
 
     def __init__(self,sector,cam,ccd,data_path='/fred/oz335/TESSdata',n=8,
-                 match_variables=True,mode='both',part=None,cpu=multiprocessing.cpu_count()):
+                 match_variables=True,mode='both',part=None,injection=False,injection_dir='source_injection',
+                 cpu=multiprocessing.cpu_count()):
         
         """
         Tessellate Detection Class.
@@ -1184,6 +1198,8 @@ class Detector():
         self.cut = None
         self.bkg = None
 
+        self._inj_path = injection_dir if injection else '.'
+
         if part is None:
             self.path = f'{self.data_path}/Sector{self.sector}/Cam{self.cam}/Ccd{self.ccd}'
         elif part == 1:
@@ -1206,7 +1222,7 @@ class Detector():
         import os
 
         self.objects = None
-        path = f'{self.path}/Cut{cut}of{self.n**2}'
+        path = f'{self.path}/Cut{cut}of{self.n**2}/{self._inj_path}'
 
         if table_exists(f'{path}/detected_sources.csv'):
             self.sources = load_table(f'{path}/detected_sources.csv')    # raw detection results
@@ -1232,7 +1248,7 @@ class Detector():
             ts = clock()
             print(f'Loading Cut {cut} Data...',end='\r',flush=True)
 
-        base = f'{self.path}/Cut{cut}of{self.n**2}/sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{cut}_of{self.n**2}'
+        base = f'{self.path}/Cut{cut}of{self.n**2}/{self._inj_path}/sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{cut}_of{self.n**2}'
 
         if flux:
             self.flux = np.load(base + '_ReducedFlux.npy')
@@ -1378,7 +1394,7 @@ class Detector():
         # from .catalog_queries import match_result_to_cat #,find_variables, gaia_stars,
         from .tools import pandas_weighted_avg,Frame_Bin
         
-        save_folder = f'{self.path}/Cut{self.cut}of{self.n**2}'
+        save_folder = f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}'
 
         # -- Access information about the cut with respect to the original ccd -- #        
         processor = DataProcessor(sector=self.sector,data_path=self.data_path,verbose=2)
@@ -1503,7 +1519,7 @@ class Detector():
 
         self.sources = sources
 
-        save_table(self.sources,f'{self.path}/Cut{self.cut}of{self.n**2}/detected_sources.csv')
+        save_table(self.sources,f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}/detected_sources.csv')
 
 
 
@@ -1521,6 +1537,7 @@ class Detector():
         from .localisation import get_snr_to_localisation_func, get_wcs_uncertainty
         from .tools import Frame_Bin
         from PRF import TESS_PRF
+        from astropy.io import fits
         
     
         # -- Generate PRF -- #
@@ -1528,13 +1545,11 @@ class Detector():
         cutCornerPx, cutCentrePx, _, _ = dp.find_cuts(cam=self.cam,ccd=self.ccd,n=self.n,plot=False)
         column = cutCentrePx[self.cut-1][0]
         row = cutCentrePx[self.cut-1][1]
-        if self.sector < 4:
-            prf = TESS_PRF(self.cam,self.ccd,self.sector,column,row,localdatadir=f'{self.prf_path}/Sectors1_2_3')
-        else:
-            prf = TESS_PRF(self.cam,self.ccd,self.sector,column,row,localdatadir=f'{self.prf_path}/Sectors4+')
+        prf = TESS_PRF(self.cam,self.ccd,self.sector,column,row,localdatadir=self.prf_path)
         
         # -- Retrieve cut localisation quality -- #
-        snr_to_localisation = get_snr_to_localisation_func(self.data_path,self.sector,self.cam,self.ccd,self.cut,self.n)
+        snr_to_localisation = get_snr_to_localisation_func(self.prf_path,self.sector,self.cam,self.ccd,self.cut,self.n)
+        exposure_time = fits.open(f'{self.path}/wcs/ref/corrected.fits')[1].header['EXPOSURE'] * 86400  # in seconds
 
         # -- Iterate over frame bins -- #
         frame_bins = np.unique(self.sources.frame_bin)
@@ -1551,14 +1566,14 @@ class Detector():
             if self.cpu > 1:
                 length = np.arange(0,len(objids)).astype(int)
                 bin_events = Parallel(n_jobs=self.cpu)(delayed(_Isolate_events)(objids[i],time,flux,sources,
-                                                                    self.sector,self.cam,self.ccd,self.cut,prf,snr_to_localisation,nan_frames,
+                                                                    self.sector,self.cam,self.ccd,self.cut,prf,exposure_time,snr_to_localisation,nan_frames,
                                                                     frame_buffer,event_time_buffer,calc_time_window) for i in tqdm(length,desc=f'Isolating Bin {frame_bin} Events'))
             else:            
                 bin_events = []
                 for objid in objids:
                     e = _Isolate_events(objid,time,flux,sources,self.sector,self.cam,
-                                        self.ccd,self.cut,prf,snr_to_localisation,nan_frames,frame_buffer=frame_buffer,
-                                        buffer=event_time_buffer,calc_time_window=calc_time_window)
+                                        self.ccd,self.cut,prf,exposure_time,snr_to_localisation,nan_frames,
+                                        frame_buffer=frame_buffer,buffer=event_time_buffer,calc_time_window=calc_time_window)
                     bin_events += [e]
             
             # -- Extract light curve properties -- #
@@ -1579,8 +1594,8 @@ class Detector():
             events['xcentroid_err'] = 0.5
             events['ycentroid_err'] = 0.5
         else:
-            events['xcentroid_err'] = np.sqrt(events['xcentroid_err']**2 + wcs_unc[0]**2)
-            events['ycentroid_err'] = np.sqrt(events['ycentroid_err']**2 + wcs_unc[1]**2)
+            events['xcentroid_err'] = np.sqrt(events['xcentroid_err']**2 + wcs_unc[0]**2) * 1.136
+            events['ycentroid_err'] = np.sqrt(events['ycentroid_err']**2 + wcs_unc[1]**2) * 1.136
 
         # -- Remove all events with single frame durations -- #
         # fake_events = events[(events.frame_duration==1)&(events.frame_bin==1)].copy()
@@ -1619,8 +1634,8 @@ class Detector():
         
         events['ra_err'] = np.sqrt((dra_dx * events['xcentroid_err'])**2 + (dra_dy * events['ycentroid_err'])**2)
         events['dec_err'] = np.sqrt((ddec_dx * events['xcentroid_err'])**2 + (ddec_dy * events['ycentroid_err'])**2)
-        
-        events['dec_err'] = np.abs(events['ra_err'] * np.cos(np.radians(events['dec'])))   # account for cos(dec) factor in RA
+
+        events['ra_err'] = np.abs(events['ra_err'] * np.cos(np.radians(events['dec'])))   # account for cos(dec) factor in RA
 
         coords = SkyCoord(ra=events['ra'].values*u.degree,dec=events['dec'].values*u.degree)
         events['gal_l'] = coords.galactic.l.value
@@ -1752,19 +1767,64 @@ class Detector():
         events['gaia_id'] = '-'
         for i,event in events.iterrows():
             if event.classification not in ['Asteroid','CosmicRay','Junk']:
-                inside = gaia[(abs(gaia.ra-event.ra) < sigma*event.ra_err)&
-                            (abs(gaia.dec-event.dec) < sigma*event.dec_err)]
-                if len(inside) > 0:
-                    valid_rp = inside.dropna(subset=['RPmag'])
-                    valid_g = inside.dropna(subset=['Gmag'])
-                    if len(valid_rp) > 0:
-                        best_idx = valid_rp.RPmag.idxmin()
-                    elif len(valid_g) > 0:
-                        best_idx = valid_g.Gmag.idxmin()
-                    else:
-                        best_idx = inside.index[0]
 
-                    events.loc[i, 'gaia_id'] = gaia.at[best_idx, 'Source'] 
+                # --- RA wraparound-safe box pre-filter ---
+                dra_raw = gaia.ra - event.ra
+                dra_wrapped = (dra_raw + 180) % 360 - 180
+
+                box_mask = (
+                    (np.abs(dra_wrapped * np.cos(np.radians(event.dec))) < 3 * event.ra_err) &
+                    (np.abs(gaia.dec - event.dec) < 3 * event.dec_err)
+                )
+
+                if box_mask.any():
+                    
+                    sub_dra_wrapped = dra_wrapped[box_mask]
+                    sub_source = gaia.Source[box_mask].values
+                    sub_rpmag = gaia.RPmag[box_mask].values
+                    sub_gmag = gaia.Gmag[box_mask].values
+                    sub_dec = gaia.dec[box_mask].values
+
+                    dra_arcsec = sub_dra_wrapped * np.cos(np.radians(event.dec)) * 3600
+                    ddec_arcsec = (sub_dec - event.dec) * 3600
+
+                    ra_err_arcsec = event.ra_err * 3600
+                    dec_err_arcsec = event.dec_err * 3600
+
+                    mahalanobis = np.sqrt((dra_arcsec / ra_err_arcsec)**2 + (ddec_arcsec / dec_err_arcsec)**2)
+                    rad_mask = mahalanobis <= 3
+
+                    if rad_mask.any():
+
+                        cand_source = sub_source[rad_mask]
+                        cand_rpmag = sub_rpmag[rad_mask]
+                        cand_gmag = sub_gmag[rad_mask]
+
+                        valid_rp = ~np.isnan(cand_rpmag)
+                        valid_g = ~np.isnan(cand_gmag)
+
+                        if valid_rp.any():
+                            best_idx = np.nanargmin(np.where(valid_rp, cand_rpmag, np.inf))
+                        elif valid_g.any():
+                            best_idx = np.nanargmin(np.where(valid_g, cand_gmag, np.inf))
+                        else:
+                            best_idx = 0
+
+                        events.loc[i,'gaia_id'] = str(cand_source[best_idx])
+
+                                                    # inside = gaia[(abs(gaia.ra-event.ra) < sigma*event.ra_err)&
+                                                    #             (abs(gaia.dec-event.dec) < sigma*event.dec_err)]
+                                                    # if len(inside) > 0:
+                                                    #     valid_rp = inside.dropna(subset=['RPmag'])
+                                                    #     valid_g = inside.dropna(subset=['Gmag'])
+                                                    #     if len(valid_rp) > 0:
+                                                    #         best_idx = valid_rp.RPmag.idxmin()
+                                                    #     elif len(valid_g) > 0:
+                                                    #         best_idx = valid_g.Gmag.idxmin()
+                                                    #     else:
+                                                    #         best_idx = inside.index[0]
+
+                                                    #     events.loc[i, 'gaia_id'] = gaia.at[best_idx, 'Source'] 
         
         # -- Cross matches location to variable catalog -- #
         variables = pd.read_csv(f'{self.path}/Cut{self.cut}of{self.n**2}/variable_catalog.csv')
@@ -2133,7 +2193,7 @@ class Detector():
         self._order_events_columns()  
 
         # -- Save out results to csv file -- #
-        save_table(self.events,f'{self.path}/Cut{self.cut}of{self.n**2}/detected_events.csv')
+        save_table(self.events,f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}/detected_events.csv')
         
 
 
@@ -2215,7 +2275,7 @@ class Detector():
 
         self.objects = objects
 
-        save_table(self.objects,f'{self.path}/Cut{self.cut}of{self.n**2}/detected_objects.csv')
+        save_table(self.objects,f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}/detected_objects.csv')
         
         
     # ------------------------------ Main search function ------------------------------ #
@@ -2226,7 +2286,11 @@ class Detector():
 
         # -- Check if using starfinder and/or sourcedetect for detection -- #
         self.mode = mode
-        self.prf_path = prf_path
+
+        if self.sector < 4:
+            self.prf_path = f'{prf_path}/Sectors1_2_3'
+        else:
+            self.prf_path = f'{prf_path}/Sectors4+'
         
         # -- Gather time/flux data for the cut -- #
         print('-------Preloading sources / events-------',flush=True)
@@ -2242,11 +2306,11 @@ class Detector():
             self.find_sources(time_bins)
             print('\n')
 
-        if not os.path.exists(f'{self.path}/Cut{cut}of{self.n**2}/snr_localisation_coeffs.pkl'):
+        if not os.path.exists(f'{self.prf_path}/cam{self.cam}_ccd{self.ccd}/snr_to_localisation/cut{cut}of{int(self.n**2)}_coeffs_y.npy'):
             from .localisation import simulate_cut_psf_fitting
 
             print('-------Simulating PSF fit accuracy (see progress in errors log file)-------',flush=True)
-            simulate_cut_psf_fitting(self.data_path,self.sector,self.cam,self.ccd,cut,n=self.n,nfits=10000,nMedians=10)
+            simulate_cut_psf_fitting(self.prf_path,self.sector,self.cam,self.ccd,cut,n=self.n,nfits=100000,nMedians=10)
             print('\n')
 
         # -- self.events contains all individual events, grouped by time and space -- #  

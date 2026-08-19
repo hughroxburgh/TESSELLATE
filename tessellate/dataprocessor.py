@@ -613,7 +613,7 @@ class DataProcessor():
                     file.write(f'Reduced with TESSreduce version {tr.__version__}.')
 
 
-    def reduce(self,cam,ccd,n,cut,part=False):
+    def reduce(self,cam,ccd,n,cut,part=False,injection=False,injection_dir='source_injection'):
         """
         Reduces a cut on a ccd using TESSreduce. bkg correlation 
         correction and final calibration are disabled due to time constraints.
@@ -636,15 +636,31 @@ class DataProcessor():
         """
 
         import tessreduce as tr
+        from .localisation import CutWCS
         
         filepath = f'{self.path}/Cam{cam}/Ccd{ccd}'
+        injection_dir = injection_dir if injection else '.'
 
         if part:
             self._reduce_part_cuts(cam,ccd,n,cut,filepath)
         else:
             cutFolder = f'{filepath}/Cut{cut}of{n**2}'
-            cutName = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}.fits'
-            cutPath = f'{cutFolder}/{cutName}'
+            cutBase = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}' 
+
+            if injection:
+                cutPath = None
+                save_path = f'{cutFolder}/{injection_dir}/{cutBase}'
+                flux = np.load(f'{save_path}_RawFlux.npy')
+                mjd = np.load(f'{cutFolder}/{cutBase}_Times.npy')
+                shifts = np.load(f'{cutFolder}/{cutBase}_Shifts.npy')
+                wcs = CutWCS(self.data_path,self.sector,cam,ccd,cut,n)
+            else:
+                cutPath = f'{cutFolder}/{cutBase}.fits'
+                save_path = f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
+                flux = None
+                mjd = None
+                shifts = None
+                wcs = None
 
             cut_corners,_,_,_ = self.find_cuts(cam,ccd,n,plot=False)
 
@@ -663,17 +679,25 @@ class DataProcessor():
                 
 
 
-
-
             # -- Defining so can be deleted if failed -- #
             tessreduce = 0
 
             # -- reduce -- #
-            tessreduce = tr.tessreduce(tpf=cutPath,sector=self.sector,reduce=True,corr_correction=True,
+            tessreduce = tr.tessreduce(tpf=cutPath,sector=self.sector,camera=cam,ccd=ccd,
+                                       flux=flux,mjd=mjd,shifts=shifts,wcs=wcs,
+                                        reduce=True,corr_correction=True,
                                         calibrate=False,catalogue_path=f'{cutFolder}/local_gaia_cat.csv',col_offset=int(cut_corners[cut-1][0]),#-44,
                                         prf_path='/fred/oz335/_local_TESS_PRFs',vector_path='/fred/oz335/_local_TESS_vectors',
                                         ref_ind=ref_ind,quality_bitmask='hard',shift_method='sep_core',smooth_motion=False,
                                         orbit_ref=True,create_lc=False,timing=True,backend='multiprocessing',verbose=2)
+
+            # # -- reduce -- #
+            # tessreduce = tr.tessreduce(tpf=cutPath,flux=fluxPath,time=timePath,ref=refPath,
+            #                            sector=self.sector,reduce=True,corr_correction=True,
+            #                             calibrate=False,catalogue_path=f'{cutFolder}/local_gaia_cat.csv',col_offset=int(cut_corners[cut-1][0]),#-44,
+            #                             prf_path='/fred/oz335/_local_TESS_PRFs',vector_path='/fred/oz335/_local_TESS_vectors',
+            #                             ref_ind=ref_ind,quality_bitmask='hard',shift_method='sep_core',smooth_motion=False,
+            #                             orbit_ref=True,create_lc=False,timing=True,backend='multiprocessing',verbose=2)
             
             if self.verbose > 0:
                 print(f'--Reduction Complete (Time: {((t()-ts)/60):.2f} mins)--')
@@ -681,14 +705,14 @@ class DataProcessor():
             #tw = t()   # write timeStart
             
             # -- Saves information out as Numpy Arrays -- #
-            np.save(f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_Times.npy',tessreduce.tpf.time.mjd)
-            save_compact_array(f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_ReducedFlux.npy',tessreduce.flux)
-            save_compact_array(f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_Background.npy',tessreduce.bkg)
-            np.save(f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_Ref.npy',tessreduce.ref)
-            np.save(f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_Mask.npy',tessreduce.mask)
-            np.save(f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_Shifts.npy',tessreduce.shift)
-            np.save(f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_OrbitSegments.npy',tessreduce.orbit_segments)
-            np.savez(f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_OrbitRefs.npz',
+            np.save(f'{save_path}_Times.npy',tessreduce.mjd)
+            np.save(f'{save_path}_ReducedFlux.npy',tessreduce.flux.astype(np.float32))
+            np.save(f'{save_path}_Background.npy',tessreduce.bkg)
+            np.save(f'{save_path}_Ref.npy',tessreduce.ref)
+            np.save(f'{save_path}_Mask.npy',tessreduce.mask)
+            np.save(f'{save_path}_Shifts.npy',tessreduce.shift)
+            np.save(f'{save_path}_OrbitSegments.npy',tessreduce.orbit_segments)
+            np.savez(f'{save_path}_OrbitRefs.npz',
                      **{str(k): v for k, v in tessreduce.orbit_refs.items()})
 
             del (tessreduce)

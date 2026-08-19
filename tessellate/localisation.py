@@ -173,7 +173,7 @@ class PSF_Fitter():
         image = deepcopy(image)
 
         image -= np.nanmedian(image)    # ensure background is calibrated ish
-        image /= np.nansum(image)    # normalise the image
+        image /= np.nansum(image[self.mask])    # normalise the image
         
         coeff = [self.source_x,self.source_y]
         lims = [[-limx,limx],[-limy,limy]]
@@ -186,34 +186,71 @@ class PSF_Fitter():
 
 
 
-def model(snr, a, b, c):
-    return a * snr**(-b) + c
+# def model(snr, a, b, c):
+#     return a * snr**(-b) + c
+
+def model_quadrature(snr, a, b, c):
+    """
+    Quadrature combination of a power-law statistical term and a fixed
+    floor term.
+    """
+    return np.sqrt((a * snr**(-b))**2 + c**2)
+
+def log_model_quadrature(snr, log_a, b, log_c):
+    a = 10**log_a
+    c = 10**log_c
+    return np.log10(model_quadrature(snr, a, b, c))
 
 def predict_median(f,snr):
     return float(f(snr))
     
-def gen_and_fit_source(snr,shift,image_size,prf):
+def gen_and_fit_source(snr, shift, image_size, prf):
 
     noise_sigma = 1
     npix = 9
+    exptime_s = 600  # Exposure time used to go from counts/second to raw counts in order to incorporate Poisson shot noise error 
 
-    centx_s = image_size//2 + shift[0]
-    centy_s = image_size//2 + shift[1]
+    centx_s = image_size // 2 + shift[0]
+    centy_s = image_size // 2 + shift[1]
 
-    psf = prf.locate(centx_s,centy_s, (image_size,image_size))
-    psf /= np.nansum(psf[image_size//2-1:image_size//2+2,image_size//2-1:image_size//2+2])
+    psf = prf.locate(centx_s, centy_s, (image_size, image_size))
+    psf /= np.nansum(psf[image_size//2-1:image_size//2+2, image_size//2-1:image_size//2+2])
 
-    noise_frame = np.random.normal(0,noise_sigma,(image_size,image_size))
-    
-    flux = snr * (npix*noise_sigma)
-    
+    # invert snr = flux / sqrt(npix*noise_sigma^2 + flux/exptime_s) for flux
+    b = -snr**2 / exptime_s
+    c = -snr**2 * npix 
+    flux = (-b + np.sqrt(b**2 - 4*c)) / 2
+
     signal = psf * flux
-    frame = signal + noise_frame
 
-    PSF_fitter = PSF_Fitter(image_size,prf,central_shape=5,function='sq')
-    PSF_fitter.fit_psf(frame,0.5,0.5)
+    background_noise = np.random.normal(0, noise_sigma, (image_size, image_size))
+    poisson_std = np.sqrt(np.clip(signal, 0, None) / exptime_s)
+    poisson_noise = np.random.normal(0, poisson_std)
 
-    return [PSF_fitter.source_x,PSF_fitter.source_y]
+    frame = signal + background_noise + poisson_noise
+
+    PSF_fitter = PSF_Fitter(image_size, prf, central_shape=5, function='sq')
+    PSF_fitter.fit_psf(frame, 0.5, 0.5)
+
+    return [PSF_fitter.source_x, PSF_fitter.source_y]
+
+    # centx_s = image_size//2 + shift[0]
+    # centy_s = image_size//2 + shift[1]
+
+    # psf = prf.locate(centx_s,centy_s, (image_size,image_size))
+    # psf /= np.nansum(psf[image_size//2-1:image_size//2+2,image_size//2-1:image_size//2+2])
+
+    # noise_frame = np.random.normal(0,noise_sigma,(image_size,image_size))
+    
+    # flux = snr * (np.sqrt(npix)*noise_sigma)
+    
+    # signal = psf * flux
+    # frame = signal + noise_frame
+
+    # PSF_fitter = PSF_Fitter(image_size,prf,central_shape=5,function='sq')
+    # PSF_fitter.fit_psf(frame,0.5,0.5)
+
+    # return [PSF_fitter.source_x,PSF_fitter.source_y]
 
 def simulate_cut_psf_fitting(path,sector,cam,ccd,cut,n=8,nfits=1000,nMedians=20,image_size=7,plot=False,return_models=False):
 
@@ -241,34 +278,6 @@ def simulate_cut_psf_fitting(path,sector,cam,ccd,cut,n=8,nfits=1000,nMedians=20,
 
     fits = Parallel(n_jobs=-1)(delayed(gen_and_fit_source)(snrs[i],shifts[i],image_size,prf) for i in tqdm(range(nfits),desc='    Fitting injected sources'))
 
-    # fits = np.array(fits)
-    # diffs = np.sqrt((fits[:,0]-shifts[:,0])**2 + (fits[:,1]-shifts[:,1])**2)
-
-    # edges = np.logspace(np.log10(snrs.min()), np.log10(snrs.max()), nMedians + 1)
-    # centers = np.sqrt(edges[:-1] * edges[1:])
-
-    # medians = np.array([
-    #     np.median(diffs[(snrs >= edges[i]) & (snrs < edges[i+1])])
-    #     for i in range(nMedians)
-    # ])
-
-    # # Add 68th percentile for 1σ containment radius
-    # r68 = np.array([
-    #     np.percentile(diffs[(snrs >= edges[i]) & (snrs < edges[i+1])], 68)
-    #     for i in range(nMedians)
-    # ])
-
-    # # -- fit median -- #
-    # p0 = [np.max(medians), 0.5, np.min(medians)]
-    # popt, _ = curve_fit(model, centers, medians, p0=p0, maxfev=10000)
-
-    # snr_space = np.logspace(0,2,1000)
-    # med_fit = model(snr_space,popt[0],popt[1],popt[2])
-
-    # # -- fit r68 -- #
-    # p0 = [np.max(r68), 0.5, np.min(r68)]
-    # popt, _ = curve_fit(model, centers, r68, p0=p0, maxfev=10000)
-
     fits = np.array(fits)
     dx = fits[:,0] - shifts[:,0]
     dy = fits[:,1] - shifts[:,1]
@@ -287,11 +296,23 @@ def simulate_cut_psf_fitting(path,sector,cam,ccd,cut,n=8,nfits=1000,nMedians=20,
     ])
 
     # fit each separately vs SNR
-    p0x = [np.max(x68), 0.5, np.min(x68)]
-    poptx, _ = curve_fit(model, centers, x68, p0=p0x, maxfev=10000)
+    p0x = [np.log10(x68[0]), 0.7, np.log10(x68[-1])]
+    poptx_log, _ = curve_fit(log_model_quadrature, centers, np.log10(x68), p0=p0x, maxfev=20000,
+                          bounds=([-3, 0, -3], [1, 5, 1]))
+    popty = 10**poptx_log[0], poptx_log[1], 10**poptx_log[2]
 
-    p0y = [np.max(y68), 0.5, np.min(y68)]
-    popty, _ = curve_fit(model, centers, y68, p0=p0y, maxfev=10000)
+    p0y = [np.log10(y68[0]), 0.7, np.log10(y68[-1])]
+    popty_log, _ = curve_fit(log_model_quadrature, centers, np.log10(y68), p0=p0y, maxfev=20000,
+                            bounds=([-3, 0, -3], [1, 5, 1]))
+    poptx = 10**popty_log[0], popty_log[1], 10**popty_log[2]
+
+
+
+    # p0x = [np.max(x68), 0.5, np.min(x68)]
+    # poptx, _ = curve_fit(model, centers, x68, p0=p0x, maxfev=10000)
+
+    # p0y = [np.max(y68), 0.5, np.min(y68)]
+    # popty, _ = curve_fit(model, centers, y68, p0=p0y, maxfev=10000)
 
     
     # if plot:
@@ -308,8 +329,14 @@ def simulate_cut_psf_fitting(path,sector,cam,ccd,cut,n=8,nfits=1000,nMedians=20,
 
     #     plt.xscale('log')
 
-    np.save(f'{path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{int(n**2)}/snr_localisation_coeffs_x.npy',poptx)
-    np.save(f'{path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{int(n**2)}/snr_localisation_coeffs_y.npy',popty)
+    df = pd.DataFrame()
+    df['snr'] = snrs
+    df['dx'] = dx
+    df['dy'] = dy
+
+    np.save(f'{path}/cam{cam}_ccd{ccd}/snr_to_localisation/cut{cut}of{int(n**2)}_coeffs_x.npy',poptx)
+    np.save(f'{path}/cam{cam}_ccd{ccd}/snr_to_localisation/cut{cut}of{int(n**2)}_coeffs_y.npy',popty)
+    df.to_csv(f'{path}/cam{cam}_ccd{ccd}/snr_to_localisation/cut{cut}of{int(n**2)}_sources.csv',index=False)
 
     # with open(f'{path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{int(n**2)}/snr_localisation_coeffs_x.pkl', 'wb') as file:
     #     pickle.dump(poptx, file)
@@ -326,17 +353,14 @@ def get_snr_to_localisation_func(path,sector,cam,ccd,cut,n=8,xy=True):
     import pickle
 
     if xy:
-        if sector < 4:
-            path = f'{path}/Sectors1_2_3'
-        else:
-            path = f'{path}/Sectors4+'
+
         poptx = np.load(f'{path}/cam{cam}_ccd{ccd}/snr_to_localisation/cut{cut}of{int(n**2)}_coeffs_x.npy')
         popty = np.load(f'{path}/cam{cam}_ccd{ccd}/snr_to_localisation/cut{cut}of{int(n**2)}_coeffs_y.npy')
 
         def func_x(snr):
-            return model(snr, *poptx) 
+            return model_quadrature(snr, *poptx) 
         def func_y(snr):
-            return model(snr, *popty) 
+            return model_quadrature(snr, *popty) 
         
         return func_x,func_y
 

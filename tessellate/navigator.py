@@ -66,7 +66,7 @@ def _bazin_fit_worker(stamp_cube, sub_time, x_sub, y_sub, ccd_x, ccd_y,
 
 class Navigator():
 
-    def __init__(self,sector,cam,ccd,data_path='/fred/oz335/TESSdata',n=8):
+    def __init__(self,sector,cam,ccd,data_path='/fred/oz335/TESSdata',n=8,injection=False,injection_dir='source_injection'):
 
         self.sector = sector
         self.cam = cam
@@ -75,6 +75,7 @@ class Navigator():
         self.n = n
 
         self.path = f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}'
+        self._inj_path = injection_dir if injection else '.'
 
         self.cut = None
 
@@ -95,7 +96,7 @@ class Navigator():
 
     # ----------------------------- Gathering data products ----------------------------- #
  
-    def gather_results(self,cut,sources=True,events=True,objects=True):
+    def gather_results(self,cut,sources=True,events=True,objects=True,isolated=False):
         """
         Gather detection csvs.
         """
@@ -103,7 +104,7 @@ class Navigator():
         from .localisation import CutWCS
         import ast
 
-        path = f'{self.path}/Cut{cut}of{self.n**2}'
+        path = f'{self.path}/Cut{cut}of{self.n**2}/{self._inj_path}'
 
         if sources:
             try:
@@ -130,7 +131,14 @@ class Navigator():
                 self.objects = None
         
         self.wcs = CutWCS(self.data_path,self.sector,self.cam,self.ccd,cut=cut,n=self.n)
-        
+
+        if isolated: 
+            try:
+                self.isolated = pd.read_csv(f'{path}/single_isolated_detections.csv')    # raw detection results
+            except:
+                print('No detected isolated sources file found')
+                self.isoalted = None
+
     def gather_data(self,cut,flux=True,time=True,ref=False,mask=False,bkg=False,verbose=True):
         """
         Gather reduced data.
@@ -142,7 +150,7 @@ class Navigator():
             ts = clock()
             print(f'Loading Cut {cut} Data...',end='\r')
 
-        base = f'{self.path}/Cut{cut}of{self.n**2}/sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{cut}_of{self.n**2}'
+        base = f'{self.path}/Cut{cut}of{self.n**2}/{self._inj_path}/sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{cut}_of{self.n**2}'
 
         if flux:
             self.flux = np.load(base + '_ReducedFlux.npy')
@@ -502,7 +510,7 @@ class Navigator():
         return path
 
     def event_lc(self,objid,eventid,cut=None,frame_buffer=10,plot=True,frame_bin=None,
-                 method='aperture',units='counts',stamp_size=9,savedir=None):
+                 method='aperture',units='counts',stamp_size=9,savedir=None,calc_error=True):
         """
         Extract a light curve for a desired event (objid/eventid pair).
 
@@ -570,24 +578,27 @@ class Navigator():
 
             t,f = Generate_LC(time,flux,x,y,window_start,window_end,radius=1.5)
 
-            # Background-limited aperture error (3x3 box on the difference frames)
-            buf = 1
-            fl_win = flux[window_start:window_end+1]
-            med = np.nanmedian(fl_win, axis=(1,2), keepdims=True)
-            sig = 1.4826 * np.nanmedian(np.abs(fl_win - med), axis=(1,2))
-            ferr = np.sqrt((2*buf+1)**2) * sig
+            ferr = np.zeros_like(f)
+            if calc_error:
 
-            if units.lower() not in ('count','counts'):
-                from .psf_flux_calibration import aperture_correction, _convert_flux_units
-                cc = self._cut_corner(cut)
-                xs = float(event.get('xcentroid_psf', x))
-                ys = float(event.get('ycentroid_psf', y))
-                frac = aperture_correction(self.sector, self.cam, self.ccd,
-                                        cc[0]+xs, cc[1]+ys,
-                                        xs-np.round(xs), ys-np.round(ys), radius=1.5)
-                zp_eff = zp + 2.5*np.log10(frac)   # aperture loss folded into the ZP
-                print(f'Aperture correction: {frac:.3f} of PRF flux (ZP {zp:.3f} -> {zp_eff:.3f})')
-                f, ferr, _ = _convert_flux_units(f, ferr, units, zp_eff)
+                # Background-limited aperture error (3x3 box on the difference frames)
+                buf = 1
+                fl_win = flux[window_start:window_end+1]
+                med = np.nanmedian(fl_win, axis=(1,2), keepdims=True)
+                sig = 1.4826 * np.nanmedian(np.abs(fl_win - med), axis=(1,2))
+                ferr = np.sqrt((2*buf+1)**2) * sig
+
+                if units.lower() not in ('count','counts'):
+                    from .psf_flux_calibration import aperture_correction, _convert_flux_units
+                    cc = self._cut_corner(cut)
+                    xs = float(event.get('xcentroid_psf', x))
+                    ys = float(event.get('ycentroid_psf', y))
+                    frac = aperture_correction(self.sector, self.cam, self.ccd,
+                                            cc[0]+xs, cc[1]+ys,
+                                            xs-np.round(xs), ys-np.round(ys), radius=1.5)
+                    zp_eff = zp + 2.5*np.log10(frac)   # aperture loss folded into the ZP
+                    print(f'Aperture correction: {frac:.3f} of PRF flux (ZP {zp:.3f} -> {zp_eff:.3f})')
+                    f, ferr, _ = _convert_flux_units(f, ferr, units, zp_eff)
 
         if plot:
             cadence = np.median(np.diff(time))
@@ -994,7 +1005,7 @@ class Navigator():
         
 
     def object_lc(self,objid,cut=None,method='aperture',units='counts',stamp_size=9,
-                  savedir=None):
+                  savedir=None,calc_error=True):
         """
         Extract a light curve for a desired object.
 
@@ -1046,22 +1057,25 @@ class Navigator():
 
         t,f = Generate_LC(time,flux,x,y)
 
-        buf = 1
-        med = np.nanmedian(flux, axis=(1,2), keepdims=True)
-        sig = 1.4826 * np.nanmedian(np.abs(flux - med), axis=(1,2))
-        ferr = np.sqrt((2*buf+1)**2) * sig
+        ferr = np.zeros_like(f)
+        if calc_error:
 
-        if units.lower() not in ('count','counts'):
-            from .psf_flux_calibration import aperture_correction, _convert_flux_units
-            cc = self._cut_corner(cut)
-            xs = float(obj.get('xcentroid_psf', x))
-            ys = float(obj.get('ycentroid_psf', y))
-            frac = aperture_correction(self.sector, self.cam, self.ccd,
-                                       cc[0]+xs, cc[1]+ys,
-                                       xs-np.round(xs), ys-np.round(ys), radius=1.5)
-            zp_eff = zp + 2.5*np.log10(frac)
-            print(f'Aperture correction: {frac:.3f} of PRF flux (ZP {zp:.3f} -> {zp_eff:.3f})')
-            f, ferr, _ = _convert_flux_units(f, ferr, units, zp_eff)
+            buf = 1
+            med = np.nanmedian(flux, axis=(1,2), keepdims=True)
+            sig = 1.4826 * np.nanmedian(np.abs(flux - med), axis=(1,2))
+            ferr = np.sqrt((2*buf+1)**2) * sig
+
+            if units.lower() not in ('count','counts'):
+                from .psf_flux_calibration import aperture_correction, _convert_flux_units
+                cc = self._cut_corner(cut)
+                xs = float(obj.get('xcentroid_psf', x))
+                ys = float(obj.get('ycentroid_psf', y))
+                frac = aperture_correction(self.sector, self.cam, self.ccd,
+                                        cc[0]+xs, cc[1]+ys,
+                                        xs-np.round(xs), ys-np.round(ys), radius=1.5)
+                zp_eff = zp + 2.5*np.log10(frac)
+                print(f'Aperture correction: {frac:.3f} of PRF flux (ZP {zp:.3f} -> {zp_eff:.3f})')
+                f, ferr, _ = _convert_flux_units(f, ferr, units, zp_eff)
 
         if savedir is not None:
             self._save_lc(savedir,cut,objid,'aperture',units,t,f,ferr)

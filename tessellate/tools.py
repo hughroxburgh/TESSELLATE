@@ -1,10 +1,51 @@
 import numpy as np
 import os
+import pandas as pd
 
 fig_width_pt = 240.0  # Get this from LaTeX using \showthe\columnwidth
 inches_per_pt = 1.0/72.27			   # Convert pt to inches
 golden_mean = (np.sqrt(5)-1.0)/2.0		 # Aesthetic ratio
 fig_width = fig_width_pt*inches_per_pt  # width in inches
+
+def save_compact_array(path,arr):
+    """
+    Save an ndarray with np.save, downcasting float64 to float32 first.
+    Reduces on-disk size for large reduction products (flux/background cubes)
+    with no precision loss that matters for photometry. Non-float64 arrays
+    (bool masks, int arrays, existing float32) pass through unchanged.
+    """
+    arr = np.asarray(arr)
+    if arr.dtype == np.float64:
+        arr = arr.astype(np.float32)
+    np.save(path,arr)
+
+def save_table(df,path):
+    """
+    Save a DataFrame as Parquet instead of CSV to reduce on-disk size.
+    `path` should be the '.csv' path used historically by callers; the file
+    is actually written alongside it with a '.parquet' extension.
+    """
+    parquet_path = path[:-4]+'.parquet' if path.endswith('.csv') else path+'.parquet'
+    df.to_parquet(parquet_path,index=False)
+
+def load_table(path):
+    """
+    Load a DataFrame saved with save_table. Looks for the Parquet file first,
+    falling back to the legacy '.csv' path so pre-existing outputs on disk
+    remain readable without needing to be regenerated.
+    """
+    parquet_path = path[:-4]+'.parquet' if path.endswith('.csv') else path
+    if os.path.exists(parquet_path):
+        return pd.read_parquet(parquet_path)
+    return pd.read_csv(path)
+
+def table_exists(path):
+    """
+    True if a table saved with save_table exists, checking both the
+    '.parquet' path and the legacy '.csv' path.
+    """
+    parquet_path = path[:-4]+'.parquet' if path.endswith('.csv') else path
+    return os.path.exists(parquet_path) or os.path.exists(path)
 
 def _Save_space(Save,delete=False):
     """
@@ -141,6 +182,32 @@ def _remove_cuts(data_path,sector,n,cams,ccds,cuts,part):
                 else:
                     os.system(f'rm -r -f {data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
 
+def _remove_asteroids(data_path,sector,n,cams,ccds,cuts,part):
+
+    home_path = os.getcwd()
+    for cam in cams:
+        for ccd in ccds:
+            for cut in cuts:
+                if part:
+                    for i in range(1,3):
+                        try:
+                            os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Part{i}/Cut{cut}of{n**2}')
+                            os.system(f'rm -f *_Asteroids.parquet')
+                            os.system(f'rm -f *_AsteroidTrails.png')
+                            os.system(f'rm -f asteroids.txt')
+                        except:
+                            pass
+                else:
+                    try:
+                        os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
+                        os.system(f'rm -f *_Asteroids.parquet')
+                        os.system(f'rm -f *_AsteroidTrails.png')
+                        os.system(f'rm -f asteroids.txt')
+                    except:
+                        pass
+
+    os.chdir(home_path)
+
 def _remove_reductions(data_path,sector,n,cams,ccds,cuts,part):
 
     home_path = os.getcwd()
@@ -172,6 +239,38 @@ def _remove_reductions(data_path,sector,n,cams,ccds,cuts,part):
                         os.system('rm -f lcs.zip')  
                     except:
                         pass   
+
+    os.chdir(home_path)
+
+def _remove_asteroid_lightcurves(data_path,sector,n,cams,ccds,cuts,part):
+
+    home_path = os.getcwd()
+    for cam in cams:
+        for ccd in ccds:
+            for cut in cuts:
+                if part:
+                    for i in range(1,3):
+                        try:
+                            os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Part{i}/Cut{cut}of{n**2}')
+                            os.system(f'rm -f *_AsteroidAperturePhotometry.parquet')
+                            os.system(f'rm -f *_AsteroidPSFPhotometry.parquet')
+                            os.system(f'rm -f *_AsteroidStackSummary.parquet')
+                            os.system(f'rm -f *_AsteroidStackedPhotometry.parquet')
+                            os.system(f'rm -f *_AsteroidCutOffset.parquet')
+                            os.system(f'rm -f asteroid_lightcurves.txt')
+                        except:
+                            pass
+                else:
+                    try:
+                        os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
+                        os.system(f'rm -f *_AsteroidAperturePhotometry.parquet')
+                        os.system(f'rm -f *_AsteroidPSFPhotometry.parquet')
+                        os.system(f'rm -f *_AsteroidStackSummary.parquet')
+                        os.system(f'rm -f *_AsteroidStackedPhotometry.parquet')
+                        os.system(f'rm -f *_AsteroidCutOffset.parquet')
+                        os.system(f'rm -f asteroid_lightcurves.txt')
+                    except:
+                        pass
 
     os.chdir(home_path)
 
@@ -264,16 +363,18 @@ def delete_files(filetype,data_path,sector,n=4,cams='all',ccds='all',cuts='all',
     possibleFiles = {'ffis':_remove_ffis,
                         'cubes':_remove_cubes,
                         'cuts':_remove_cuts,
+                        'asteroids':_remove_asteroids,
                         'reductions':_remove_reductions,
+                        'asteroid_lightcurves':_remove_asteroid_lightcurves,
                         'calibrations':_remove_calibrations,
                         'search':_remove_search,
                         'plot':_remove_plots}
-    
+
     if filetype.lower() in possibleFiles.keys():
         function = possibleFiles[filetype.lower()]
         function(data_path,sector,n,cams,ccds,cuts,part)
     else:
-        e = 'Invalid filetype! Valid types: "ffis" , "cubes" , "cuts" , "reductions" , "calibrations" , "search", "plot". '
+        e = 'Invalid filetype! Valid types: "ffis" , "cubes" , "cuts" , "asteroids" , "reductions" , "asteroid_lightcurves" , "calibrations" , "search", "plot". '
         raise AttributeError(e)
     
     

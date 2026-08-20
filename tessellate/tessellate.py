@@ -234,7 +234,7 @@ class Tessellate():
                 _Save_space(f'{self.job_output_path}/tessellate_cutting_logs')
 
             if predict_asteroids:
-                self._predict_asteroids_properties(suggestions[6],use_suggestions)
+                self._predict_asteroids_properties(make_cuts,suggestions[6],use_suggestions)
                 _Save_space(f'{self.job_output_path}/tessellate_asteroid_prediction_logs')
 
             if reduce:
@@ -1184,13 +1184,70 @@ class Tessellate():
 
         print('\n')
 
-    def _predict_asteroids_properties(self,suggestions,use_suggestions):
+    def _predict_asteroids_properties(self,making_cuts,suggestions,use_suggestions):
         """
         Confirm asteroid prediction process properties. CPU is set directly
         (not derived from a mem/cpu ratio like cube/cut) since asteroid
         prediction parallelises via a fixed worker-process pool, matching
         reduce/search's convention rather than cube/cut's.
+
+        predict_asteroids runs ahead of reduce() and can be the very first
+        cut-consuming stage in a run (e.g. reduce=False, make_cuts=False --
+        already-reduced data), so unlike reduce/calibrate/search it can't
+        assume self.n/self.cuts were already resolved from 'all' by an
+        earlier stage's properties method; resolves them itself here
+        (mirroring _reduce_properties's own if not cutting: block) when
+        make_cuts won't. Confirmed the hard way: leaving this out let
+        self.cuts stay the literal string 'all', and `for cut in self.cuts`
+        silently iterated its characters ('a', 'l', 'l') instead of raising.
         """
+
+        if not making_cuts:
+            if self.n is None:
+                n = input('   - n (Number of Cuts = n^2) = ')
+                done = False
+                while not done:
+                    try:
+                        n = int(n)
+                        if n > 0:
+                            self.n = n
+                            done = True
+                        else:
+                            n = input('      Invalid choice! n (Number of Cuts = n^2) =  ')
+                    except:
+                        n = input('      Invalid choice! n (Number of Cuts = n^2) =  ')
+            elif self.n > 0:
+                print(f'   - n (Number of Cuts = n^2) = {self.n}')
+            else:
+                e = f"Invalid 'n' value Input of {self.n}\n"
+                raise ValueError(e)
+
+
+            if self.cuts is None:
+                cut = input(f'   - Cut [1-{self.n**2},all] = ')
+                done = False
+                while not done:
+                    if cut == 'all':
+                        self.cuts = range(1,self.n**2+1)
+                        done = True
+                    elif cut in np.array(range(1,self.n**2+1)).astype(str):
+                        self.cuts = [int(cut)]
+                        done = True
+                    else:
+                        cut = input(f'      Invalid choice! Cut [1-{self.n**2},all] =  ')
+            elif self.cuts == 'all':
+                print(f'   - Cut = all')
+                self.cuts = range(1,self.n**2+1)
+            elif self.cuts in range(1,self.n**2+1):
+                print(f'   - Cut = {self.cuts}')
+                self.cuts = [self.cuts]
+            elif type(self.cuts) == list:
+                print(f'   - Cut = {self.cuts}')
+            else:
+                e = f"Invalid Cut Input of {self.cuts} with 'n' of {self.n}\n"
+                raise ValueError(e)
+
+            print('\n')
 
         if self.predict_asteroids_time is None:
             if use_suggestions:

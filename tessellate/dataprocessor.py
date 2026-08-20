@@ -813,10 +813,6 @@ class DataProcessor():
             reduced_mjd = np.load(times_path)
             ephemeris = match_ephemeris_to_reduced_frames(ephemeris, reduced_mjd)
 
-            aperture_df = forced_aperture_photometry(cube, ephemeris)
-            psf_df = forced_psf_photometry(cube, ephemeris, self.sector, cam, ccd, cut_corner[0], cut_corner[1])
-            psf_df = detrend_pixel_phase(psf_df)
-
             gaia_cat_path = f'{cutFolder}/local_gaia_cat.csv'
             if os.path.exists(gaia_cat_path):
                 gaia_cat = pd.read_csv(gaia_cat_path)
@@ -824,16 +820,35 @@ class DataProcessor():
             else:
                 stars = pd.DataFrame(columns=['x','y','mag'])
 
-            aperture_df = flag_star_contamination(aperture_df, stars, flux_col='flux')
-            psf_df = flag_star_contamination(psf_df, stars, flux_col='flux_detrended')
+            def _run_photometry(eph):
+                ap = forced_aperture_photometry(cube, eph)
+                psf = forced_psf_photometry(cube, eph, self.sector, cam, ccd, cut_corner[0], cut_corner[1])
+                psf = detrend_pixel_phase(psf)
+                ap = flag_star_contamination(ap, stars, flux_col='flux')
+                psf = flag_star_contamination(psf, stars, flux_col='flux_detrended')
+                summary, stacked = stack_lightcurves(psf)
+                return ap, psf, summary, stacked
 
-            stack_summary, stacked_df = stack_lightcurves(psf_df)
-
-            # predicted-vs-measured offset from the shift-and-stack image centroid of every
-            # high-SNR track, pooled -- far more precise than fitting an offset from noisy
-            # single-frame detected centroids downstream in detector.py; consumed by
-            # identify_known_asteroids() when cross-matching detections against this ephemeris
+            # first pass, at the raw predicted position -- needed to measure the predicted-vs-
+            # measured offset itself (pool_offset_from_stacks, from the shift-and-stack image
+            # centroid of every high-SNR track) in the first place, a chicken-and-egg the offset
+            # can only be measured from an initial round of forced photometry
+            aperture_df, psf_df, stack_summary, stacked_df = _run_photometry(ephemeris)
             offset_x, offset_y, n_offset_tracks = pool_offset_from_stacks(psf_df, stack_summary, cube)
+
+            if np.isfinite(offset_x) and np.isfinite(offset_y):
+                # re-run at the corrected position for the actual saved photometry -- both the
+                # aperture and the (non-centroiding, fixed-position) PSF fit assume the given
+                # x,y IS the source, so a real, measured predicted-vs-actual offset left
+                # uncorrected here silently loses flux (an off-centre aperture misses part of
+                # the source; an offset PSF template correlates less well with the data and
+                # its best-fit amplitude comes out low) on every single measurement, not just
+                # the cross-match against detector.py's own detections downstream
+                corrected_ephemeris = ephemeris.copy()
+                corrected_ephemeris['x'] += offset_x
+                corrected_ephemeris['y'] += offset_y
+                aperture_df, psf_df, stack_summary, stacked_df = _run_photometry(corrected_ephemeris)
+
             offset_df = pd.DataFrame([{'offset_x': offset_x, 'offset_y': offset_y,
                                         'n_tracks_used': n_offset_tracks}])
 

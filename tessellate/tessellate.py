@@ -2966,17 +2966,20 @@ python {self.working_path}/reduction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_sc
                 sleep(120)
                 i += 1
 
-    # Evidence-based linear fit (time_s = intercept + slope*n_tracks), not a pure
-    # scale-from-baseline ratio -- real per-cut data (8 completed parallel-forced-photometry
-    # jobs on Sector 32's Cam1 Ccd3/Ccd4, 1-197 tracks, 8 workers) showed real fixed overhead
-    # that a through-the-origin ratio badly misfits. Least-squares fit gave slope=2.556 s/track,
-    # intercept=-4.9s (time) and slope=0.280 GB/track, intercept=-7.4GB (mem), max residual 70s
-    # / 10GB across the sample -- the constants below round those up with real margin on top
-    # (not just re-deriving the same fit), and floor at a sane minimum for sparse cuts
-    _LIGHTCURVES_TIME_PER_TRACK_S = 5    # ~2x the fitted 2.556 s/track slope
-    _LIGHTCURVES_TIME_FLOOR_S = 180      # ~2.6x the fitted intercept's magnitude
-    _LIGHTCURVES_MEM_PER_TRACK_GB = 0.5  # ~1.8x the fitted 0.280 GB/track slope
-    _LIGHTCURVES_MEM_FLOOR_GB = 6
+    # Re-derived after flag_star_contamination's O(n_rows x n_stars) matrix was replaced with a
+    # KDTree query (see asteroid_photometry.py) -- that was the real dominant cost the previous
+    # constants below were fit against, and removing it changed the scaling relationship
+    # entirely, not just the absolute numbers: real post-fix data (2 completed dense cuts, 302
+    # and 336 tracks) came in at 530s/6.0GB and 537s/5.3GB -- both time and memory now nearly
+    # FLAT with track count (~1.6-1.8 s/track and ~0.02 GB/track from the origin), since the
+    # remaining cost is dominated by the parallel forced-photometry pass rather than a
+    # single-core step that scaled with rows x stars. Only 2 data points so far (no post-fix
+    # sample yet at low track count) -- kept a real per-track slope and generous floor margin
+    # (~1.7-3.9x across the sample) rather than assuming perfectly flat
+    _LIGHTCURVES_TIME_PER_TRACK_S = 2
+    _LIGHTCURVES_TIME_FLOOR_S = 300
+    _LIGHTCURVES_MEM_PER_TRACK_GB = 0.02
+    _LIGHTCURVES_MEM_FLOOR_GB = 12
 
     def _lightcurves_resources_for_cut(self,cam,ccd,cut):
         """Size asteroid_lightcurves' time/mem request from this cut's actual predicted track

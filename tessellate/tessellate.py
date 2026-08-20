@@ -3002,7 +3002,13 @@ python {self.working_path}/reduction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_sc
 
         total = int(self._LIGHTCURVES_TIME_PER_TRACK_S * n_tracks + self._LIGHTCURVES_TIME_FLOOR_S)
         scaled_time = f"{total // 3600}:{(total % 3600) // 60:02}:{total % 60:02}"
-        scaled_mem = int(np.ceil(self._LIGHTCURVES_MEM_PER_TRACK_GB * n_tracks + self._LIGHTCURVES_MEM_FLOOR_GB))
+        # _LIGHTCURVES_MEM_PER_TRACK_GB/_FLOOR_GB were fit against each job's TOTAL peak memory
+        # (job reports show peak/total, e.g. "57.9 GB peak / 176 GB"), but the SBATCH template
+        # uses this return value directly as --mem-per-cpu, not divided by cpu count -- caught
+        # after a real relaunch got "Max memory per core exceeded" sbatch errors on every dense
+        # cut (e.g. 105GB total requested *per core* across 8 cores instead of ~13GB/core)
+        total_mem = self._LIGHTCURVES_MEM_PER_TRACK_GB * n_tracks + self._LIGHTCURVES_MEM_FLOOR_GB
+        scaled_mem = int(np.ceil(total_mem / cpu))
 
         return scaled_time, cpu, scaled_mem
 

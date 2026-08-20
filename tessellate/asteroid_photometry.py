@@ -213,7 +213,15 @@ def flag_radius_px(mag):
 def local_gaia_cat_to_stars(gaia_cat, wcs, ccd_x0, ccd_y0):
     """Converts the cut's already-cached local_gaia_cat.csv (ra, dec, Gmag,
     Source -- see catalog_queries.create_external_gaia_cat) into cut-local
-    pixel positions, avoiding a fresh Gaia query for star flagging."""
+    pixel positions, avoiding a fresh Gaia query for star flagging. Drops
+    any star with a NaN Gmag (real Gaia data: ~0.4% of a typical cut's
+    catalog) -- flag_star_contamination can't score an unratable star's
+    exclusion radius anyway, and leaving it in poisons its vectorized
+    argmin (a NaN flag_radius_px propagates into every distance-margin
+    comparison, so argmin can get stuck returning that star's index
+    instead of the true closest/worst one -- confirmed: this silently
+    hid a real, obvious 0.55px/Gmag=9.76 contaminating star)."""
+    gaia_cat = gaia_cat.dropna(subset=["Gmag"])
     x, y = wcs.all_world2pix(gaia_cat["ra"].values, gaia_cat["dec"].values, 0)
     return pd.DataFrame({"x": x - ccd_x0, "y": y - ccd_y0, "mag": gaia_cat["Gmag"].values})
 

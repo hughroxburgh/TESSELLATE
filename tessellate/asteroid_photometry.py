@@ -211,11 +211,11 @@ def flag_radius_px(mag):
 
 
 def local_gaia_cat_to_stars(gaia_cat, wcs, ccd_x0, ccd_y0):
-    """Converts the cut's already-cached local_gaia_cat.csv (ra, dec, mag,
+    """Converts the cut's already-cached local_gaia_cat.csv (ra, dec, Gmag,
     Source -- see catalog_queries.create_external_gaia_cat) into cut-local
     pixel positions, avoiding a fresh Gaia query for star flagging."""
     x, y = wcs.all_world2pix(gaia_cat["ra"].values, gaia_cat["dec"].values, 0)
-    return pd.DataFrame({"x": x - ccd_x0, "y": y - ccd_y0, "mag": gaia_cat["mag"].values})
+    return pd.DataFrame({"x": x - ccd_x0, "y": y - ccd_y0, "mag": gaia_cat["Gmag"].values})
 
 
 def _local_excess_mask(mjd, flux):

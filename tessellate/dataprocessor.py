@@ -566,7 +566,7 @@ class DataProcessor():
                 in_fov = ephemeris.index
 
             save_table(ephemeris,f'{cutFolder}/{base}_Asteroids.csv')
-            plot_asteroid_trails(ephemeris[in_fov],f'{cutFolder}/{base}_AsteroidTrails.png')
+            plot_asteroid_trails(ephemeris[in_fov],f'{cutFolder}/{base}_AsteroidTrails.png',footprint_size=2*cutSize)
 
             with open(f'{cutFolder}/asteroids.txt', 'w') as file:
                 file.write('Predicted!')

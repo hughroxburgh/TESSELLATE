@@ -858,19 +858,30 @@ def _mag_to_alpha(mag, bright_ref=14.0, faint_limit=20.8, alpha_min=0.12, alpha_
     return np.where(np.isfinite(mag), alpha, alpha_max)
 
 
-def plot_asteroid_trails(ephemeris_df, save_path):
+def plot_asteroid_trails(ephemeris_df, save_path, footprint_size=None):
     """Every predicted asteroid's track through the footprint, in pixel
     coordinates, points coloured by frame number (a single shared colour
     axis across all objects, so relative timing between different tracks
     is visible too, not just motion within one track), with marker/line
     opacity scaled by each object's expected apparent brightness (mag_expected,
     if present) so faint, marginal tracks visually recede against bright,
-    easily-recovered ones instead of all reading with equal visual weight."""
+    easily-recovered ones instead of all reading with equal visual weight.
+
+    footprint_size, if given, is the full pixel side length of the (square)
+    cutout -- axis limits are pinned to [0, footprint_size] on both axes so
+    the plotted box is actually square and matches the true field, rather
+    than autoscaling to wherever the surviving tracks happen to fall
+    (aspect='equal' alone only equalises the x/y *scale*, not the box
+    shape, so a data extent that's naturally taller than wide would still
+    render as a non-square rectangle without this)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(7, 7))
+    if footprint_size is not None:
+        ax.set_xlim(0, footprint_size)
+        ax.set_ylim(0, footprint_size)
     # x/y are both in pixel units of the same footprint -- an unequal aspect would stretch
     # one axis relative to the other and misrepresent the field as non-square
     ax.set_aspect("equal", adjustable="box")

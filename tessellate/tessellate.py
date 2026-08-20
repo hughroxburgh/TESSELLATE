@@ -693,11 +693,16 @@ class Tessellate():
             cut_mem_sug = '20G'
             cut_mem_req = 100
 
-            # scaled up from the secondary-mission tier's real benchmark (Sector 32) by the
-            # same ~4x time / ~3x mem ratio as reduce's own secondary/tertiary split -- not
-            # itself benchmarked on a tertiary-mission sector; more candidate objects and
-            # ~3.3x more frames per cut than secondary make more parallel headroom worthwhile
-            predict_asteroids_time_sug = '1:00:00'
+            # not itself benchmarked on a tertiary-mission sector. Scaled from the secondary
+            # tier's real 3min worst case by the true driver of predict_asteroids' runtime --
+            # precise_ephemeris's per-frame loop -- rather than an unrelated stage's ratio:
+            # tertiary cuts have ~3.3x more frames per cut than secondary (~12000 vs ~3600
+            # FFIs/sector at 200sec vs 10min cadence, same ~27-day window), so ~3min x 3.3 =
+            # ~10min real worst case, x the same ~5x margin used for secondary's 15:00 suggestion.
+            # A TIMEOUT here now auto-retries with +30min (see asteroid_lightcurves()'s polling
+            # of prediction_status), so undershooting costs a retry, not a failure -- no need to
+            # pad further
+            predict_asteroids_time_sug = '30:00'
             predict_asteroids_cpu_sug = '16'
             predict_asteroids_mem_req = 72
 

@@ -893,7 +893,11 @@ def plot_asteroid_trails(ephemeris_df, save_path):
         colors[:, 3] = _mag_to_alpha(ephemeris_df["mag_expected"].values) if has_mag else 1.0
         ax.scatter(ephemeris_df["x"], ephemeris_df["y"], color=colors, s=10, zorder=2)
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-        fig.colorbar(sm, ax=ax, label="frame number")
+        # attach via the axes' own divider (not fig.colorbar's default heuristic) so the
+        # colorbar tracks the axes' actual box height post-aspect-lock, not the full figure
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+        cax = make_axes_locatable(ax).append_axes("right", size="4%", pad=0.1)
+        fig.colorbar(sm, cax=cax, label="frame number")
 
         for designation, track in ephemeris_df.groupby("designation"):
             mid = track.iloc[len(track) // 2]

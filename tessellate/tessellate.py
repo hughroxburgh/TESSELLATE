@@ -2961,7 +2961,47 @@ python {self.working_path}/reduction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_sc
                 sleep(120)
                 i += 1
 
+    # forced photometry cost scales directly with tracks x frames, and real per-cut track
+    # counts can vary by an order of magnitude or more within a single sector (density
+    # depends on ecliptic latitude -- confirmed on Sector 32: Cut57 at 54 tracks ran cleanly
+    # within the secondary tier's suggested budget, while Cam1 Ccd3/Ccd4's cuts (~500-600+
+    # tracks) needed roughly 4x that and OOM'd/TIMED OUT repeatedly at the plain suggestion)
+    _LIGHTCURVES_BASELINE_TRACKS = 54
+
+    def _lightcurves_resources_for_cut(self,cam,ccd,cut):
+        """Scale asteroid_lightcurves' time/mem request by this cut's actual predicted track
+        count, read from predict_asteroids' own already-completed output (available by the
+        time this is called, since asteroid_lightcurves() only submits a cut's job once its
+        prediction_status shows COMPLETED) -- rather than using one static, sector-wide guess
+        for every cut regardless of how crowded it is. Falls back to the plain suggested
+        time/cpu/mem if the ephemeris can't be read for any reason (e.g. genuinely zero
+        tracks, or an unexpected layout)."""
+        from .tools import load_table, table_exists
+
+        base_time, cpu, base_mem = self.asteroid_lightcurves_time, self.asteroid_lightcurves_cpu, self.asteroid_lightcurves_mem
+        try:
+            cutFolder = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}'
+            base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{self.n**2}'
+            path = f'{cutFolder}/asteroids/{base}_Asteroids.csv'
+            if not table_exists(path):
+                return base_time, cpu, base_mem
+            n_tracks = load_table(path)['designation'].nunique()
+        except Exception:
+            return base_time, cpu, base_mem
+
+        scale = max(1.0, n_tracks / self._LIGHTCURVES_BASELINE_TRACKS)
+
+        parts = list(map(int, base_time.split(':')))
+        h, m, s = (0, parts[0], parts[1]) if len(parts) == 2 else parts
+        total = int((h * 3600 + m * 60 + s) * scale)
+        scaled_time = f"{total // 3600}:{(total % 3600) // 60:02}:{total % 60:02}"
+        scaled_mem = int(np.ceil(base_mem * scale))
+
+        return scaled_time, cpu, scaled_mem
+
     def _cut_asteroid_lightcurves(self,cam,ccd,cut):
+
+        time, cpu, mem = self._lightcurves_resources_for_cut(cam,ccd,cut)
 
         # -- Create python file for building asteroid lightcurves on a cut -- #
         print(f'Creating Asteroid Lightcurves Python File for Sector{self.sector} Cam{cam} Ccd{ccd} Cut{cut}')
@@ -2985,9 +3025,9 @@ processor.asteroid_lightcurves(cam={cam},ccd={ccd},n={self.n},cut={cut},part=par
 #SBATCH --error={self.job_output_path}/tessellate_asteroid_lightcurves_logs/%A_%x_errors.txt\n\
 #\n\
 #SBATCH --ntasks=1\n\
-#SBATCH --time={self.asteroid_lightcurves_time}\n\
-#SBATCH --cpus-per-task={self.asteroid_lightcurves_cpu}\n\
-#SBATCH --mem-per-cpu={self.asteroid_lightcurves_mem}G\n\
+#SBATCH --time={time}\n\
+#SBATCH --cpus-per-task={cpu}\n\
+#SBATCH --mem-per-cpu={mem}G\n\
 #SBATCH --account=oz335\n\
 \n\
 PYTHONUNBUFFERED=1\n\

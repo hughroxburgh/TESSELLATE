@@ -7,7 +7,7 @@ import warnings
 warnings.filterwarnings("ignore")
 warnings.filterwarnings("ignore", category=RuntimeWarning) 
 
-from .tools import RoundToInt, save_table, load_table, table_exists
+from .tools import RoundToInt, load_table, table_exists
 
 
 # ----------------------------------------------------------------------------------------------------------------------------- #
@@ -1519,7 +1519,7 @@ class Detector():
 
         self.sources = sources
 
-        save_table(self.sources,f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}/detected_sources.csv')
+        self.sources.to_csv(f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}/detected_sources.csv',index=False)
 
 
 
@@ -2193,7 +2193,7 @@ class Detector():
         self._order_events_columns()  
 
         # -- Save out results to csv file -- #
-        save_table(self.events,f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}/detected_events.csv')
+        self.events.to_csv(f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}/detected_events.csv',index=False)
         
 
 
@@ -2275,7 +2275,7 @@ class Detector():
 
         self.objects = objects
 
-        save_table(self.objects,f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}/detected_objects.csv')
+        self.objects.to_csv(f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}/detected_objects.csv',index=False)
         
         
     # ------------------------------ Main search function ------------------------------ #

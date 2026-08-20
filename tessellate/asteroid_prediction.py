@@ -871,6 +871,9 @@ def plot_asteroid_trails(ephemeris_df, save_path):
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(7, 7))
+    # x/y are both in pixel units of the same footprint -- an unequal aspect would stretch
+    # one axis relative to the other and misrepresent the field as non-square
+    ax.set_aspect("equal", adjustable="box")
     if len(ephemeris_df) == 0:
         ax.text(0.5, 0.5, "No asteroids predicted in this footprint",
                  ha="center", va="center", transform=ax.transAxes)

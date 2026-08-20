@@ -804,34 +804,38 @@ def predict_asteroids_for_footprint(ra_center_deg, dec_center_deg, radius_deg,
     mjd_to_frame = {mjd: i for i, mjd in enumerate(frame_mjds)}
 
     all_rows = []
-    n_workers = min(len(survivors), max(1, (os.cpu_count() or 4) - 1))
-    with ProcessPoolExecutor(max_workers=n_workers, initializer=_pool_worker_init,
-                              initargs=(data_dir,)) as pool:
-        futures = {pool.submit(_precise_ephemeris_worker, row, frame_mjds, data_dir, allow_download): row
-                   for _, row in survivors.iterrows()}
-        for fut in as_completed(futures):
-            row = futures[fut]
-            try:
-                eph = fut.result()
-            except Exception as ex:
-                print(f"  {row.designation}: precise ephemeris failed: {ex}", flush=True)
-                continue
-            sky = SkyCoord(ra=eph["ra"].values * u.deg, dec=eph["dec"].values * u.deg)
-            sep = SkyCoord(ra=ra_center_deg * u.deg, dec=dec_center_deg * u.deg).separation(sky).deg
-            in_fov = sep <= radius_deg
-            if not in_fov.any():
-                continue
-            eph = eph[in_fov].copy()
-            x, y = wcs.world_to_pixel(sky[in_fov])
-            eph["x"], eph["y"] = x, y
-            eph["frame"] = eph["mjd"].map(mjd_to_frame)
-            eph["designation"] = row.designation
-            eph["magnitude_H"] = row.magnitude_H
-            eph["magnitude_G"] = row.magnitude_G
-            eph["mag_expected"] = expected_apparent_magnitude(
-                row.magnitude_H, row.magnitude_G, eph["r_helio_au"].values,
-                eph["delta_au"].values, eph["phase_angle_deg"].values)
-            all_rows.append(eph)
+    if len(survivors):
+        # ProcessPoolExecutor rejects max_workers=0 -- a cut with zero stage-2 survivors (a real,
+        # common case for high-ecliptic-latitude footprints) would otherwise crash here instead
+        # of legitimately returning an empty result
+        n_workers = min(len(survivors), max(1, (os.cpu_count() or 4) - 1))
+        with ProcessPoolExecutor(max_workers=n_workers, initializer=_pool_worker_init,
+                                  initargs=(data_dir,)) as pool:
+            futures = {pool.submit(_precise_ephemeris_worker, row, frame_mjds, data_dir, allow_download): row
+                       for _, row in survivors.iterrows()}
+            for fut in as_completed(futures):
+                row = futures[fut]
+                try:
+                    eph = fut.result()
+                except Exception as ex:
+                    print(f"  {row.designation}: precise ephemeris failed: {ex}", flush=True)
+                    continue
+                sky = SkyCoord(ra=eph["ra"].values * u.deg, dec=eph["dec"].values * u.deg)
+                sep = SkyCoord(ra=ra_center_deg * u.deg, dec=dec_center_deg * u.deg).separation(sky).deg
+                in_fov = sep <= radius_deg
+                if not in_fov.any():
+                    continue
+                eph = eph[in_fov].copy()
+                x, y = wcs.world_to_pixel(sky[in_fov])
+                eph["x"], eph["y"] = x, y
+                eph["frame"] = eph["mjd"].map(mjd_to_frame)
+                eph["designation"] = row.designation
+                eph["magnitude_H"] = row.magnitude_H
+                eph["magnitude_G"] = row.magnitude_G
+                eph["mag_expected"] = expected_apparent_magnitude(
+                    row.magnitude_H, row.magnitude_G, eph["r_helio_au"].values,
+                    eph["delta_au"].values, eph["phase_angle_deg"].values)
+                all_rows.append(eph)
 
     if not all_rows:
         result = pd.DataFrame(columns=["designation", "mjd", "frame", "ra", "dec", "x", "y",

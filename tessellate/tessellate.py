@@ -596,10 +596,11 @@ class Tessellate():
             cut_mem_sug = '20G'
             cut_mem_req = 20
 
-            # scaled down from the secondary-mission tier's real benchmark (Sector 32) by the
-            # same ~0.67x ratio as reduce's own primary/secondary split -- not itself
-            # benchmarked on a primary-mission sector
-            predict_asteroids_time_sug = '10:00'
+            # scaled from the secondary tier's real benchmark by frame count -- ~1200 vs ~3600
+            # FFIs/sector (30min vs 10min cadence, same ~27-day window) is the actual driver of
+            # both stages' runtime (precise_ephemeris's per-frame loop; one PSF fit per frame
+            # per track), a ~0.33x ratio -- not itself benchmarked on a primary-mission sector
+            predict_asteroids_time_sug = '5:00'
             predict_asteroids_cpu_sug = '8'
             predict_asteroids_mem_req = 24
 
@@ -610,7 +611,7 @@ class Tessellate():
             # forced aperture/PSF photometry is not internally parallelised (confirmed: CPU
             # usage stayed near one core regardless of cpus-per-task requested), so cpu is
             # kept minimal rather than scaled with cube/cut/reduce's worker-pool stages
-            asteroid_lightcurves_time_sug = '15:00'
+            asteroid_lightcurves_time_sug = '8:00'
             asteroid_lightcurves_cpu_sug = '2'
             asteroid_lightcurves_mem_req = 8
 
@@ -644,7 +645,7 @@ class Tessellate():
             # 3 min / 3.6GB peak (Cam1 Ccd1 Cut57, 54 crossing tracks, 215 stage-2
             # survivors -- a genuinely dense, near-ecliptic cut) with cpu_sug=8 at ~70%
             # average utilisation, vs. the previous unbenchmarked 30:00/128G guess
-            predict_asteroids_time_sug = '15:00'
+            predict_asteroids_time_sug = '10:00'
             predict_asteroids_cpu_sug = '8'
             predict_asteroids_mem_req = 24
 
@@ -661,7 +662,7 @@ class Tessellate():
             # ~25% of a single requested core (confirmed: forced aperture/PSF photometry
             # isn't internally parallelised), vs. the previous unbenchmarked 30:00/32G
             # guess with 8 cpus that were never used
-            asteroid_lightcurves_time_sug = '25:00'
+            asteroid_lightcurves_time_sug = '15:00'
             asteroid_lightcurves_cpu_sug = '2'
             asteroid_lightcurves_mem_req = 8
 
@@ -694,14 +695,10 @@ class Tessellate():
             cut_mem_req = 100
 
             # not itself benchmarked on a tertiary-mission sector. Scaled from the secondary
-            # tier's real 3min worst case by the true driver of predict_asteroids' runtime --
-            # precise_ephemeris's per-frame loop -- rather than an unrelated stage's ratio:
-            # tertiary cuts have ~3.3x more frames per cut than secondary (~12000 vs ~3600
-            # FFIs/sector at 200sec vs 10min cadence, same ~27-day window), so ~3min x 3.3 =
-            # ~10min real worst case, x the same ~5x margin used for secondary's 15:00 suggestion.
-            # A TIMEOUT here now auto-retries with +30min (see asteroid_lightcurves()'s polling
-            # of prediction_status), so undershooting costs a retry, not a failure -- no need to
-            # pad further
+            # tier's real 3min/7:11 worst case by frame count -- ~12000 vs ~3600 FFIs/sector
+            # (200sec vs 10min cadence, same ~27-day window), a ~3.3x ratio, the actual driver
+            # of both stages' runtime (precise_ephemeris's per-frame loop; one PSF fit per
+            # frame per track)
             predict_asteroids_time_sug = '30:00'
             predict_asteroids_cpu_sug = '16'
             predict_asteroids_mem_req = 72
@@ -710,7 +707,7 @@ class Tessellate():
             reduce_cpu_sug = '32'
             reduce_mem_req = 200
 
-            asteroid_lightcurves_time_sug = '1:40:00'
+            asteroid_lightcurves_time_sug = '45:00'
             asteroid_lightcurves_cpu_sug = '2'
             asteroid_lightcurves_mem_req = 24
 

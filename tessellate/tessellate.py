@@ -242,7 +242,7 @@ class Tessellate():
                 _Save_space(f'{self.job_output_path}/tessellate_reduction_logs')
 
             if asteroid_lightcurves:
-                self._asteroid_lightcurves_properties(suggestions[7],use_suggestions)
+                self._asteroid_lightcurves_properties(make_cuts or predict_asteroids,suggestions[7],use_suggestions)
                 _Save_space(f'{self.job_output_path}/tessellate_asteroid_lightcurves_logs')
 
             if calibrate:
@@ -1439,12 +1439,66 @@ class Tessellate():
             raise ValueError(e)
         print('\n')
 
-    def _asteroid_lightcurves_properties(self,suggestions,use_suggestions):
+    def _asteroid_lightcurves_properties(self,making_cuts_or_predicting,suggestions,use_suggestions):
         """
         Confirm asteroid lightcurve generation process properties. CPU is
         set directly (not derived from a mem/cpu ratio), matching
         reduce/predict_asteroids' convention.
+
+        Like _predict_asteroids_properties, resolves self.n/self.cuts from
+        'all' itself when neither make_cuts nor predict_asteroids will --
+        asteroid_lightcurves can run standalone against already-reduced,
+        already-predicted data (reduce=False, predict_asteroids=False),
+        the same gap that let self.cuts stay the literal string 'all' and
+        silently iterate its characters instead of raising.
         """
+
+        if not making_cuts_or_predicting:
+            if self.n is None:
+                n = input('   - n (Number of Cuts = n^2) = ')
+                done = False
+                while not done:
+                    try:
+                        n = int(n)
+                        if n > 0:
+                            self.n = n
+                            done = True
+                        else:
+                            n = input('      Invalid choice! n (Number of Cuts = n^2) =  ')
+                    except:
+                        n = input('      Invalid choice! n (Number of Cuts = n^2) =  ')
+            elif self.n > 0:
+                print(f'   - n (Number of Cuts = n^2) = {self.n}')
+            else:
+                e = f"Invalid 'n' value Input of {self.n}\n"
+                raise ValueError(e)
+
+
+            if self.cuts is None:
+                cut = input(f'   - Cut [1-{self.n**2},all] = ')
+                done = False
+                while not done:
+                    if cut == 'all':
+                        self.cuts = range(1,self.n**2+1)
+                        done = True
+                    elif cut in np.array(range(1,self.n**2+1)).astype(str):
+                        self.cuts = [int(cut)]
+                        done = True
+                    else:
+                        cut = input(f'      Invalid choice! Cut [1-{self.n**2},all] =  ')
+            elif self.cuts == 'all':
+                print(f'   - Cut = all')
+                self.cuts = range(1,self.n**2+1)
+            elif self.cuts in range(1,self.n**2+1):
+                print(f'   - Cut = {self.cuts}')
+                self.cuts = [self.cuts]
+            elif type(self.cuts) == list:
+                print(f'   - Cut = {self.cuts}')
+            else:
+                e = f"Invalid Cut Input of {self.cuts} with 'n' of {self.n}\n"
+                raise ValueError(e)
+
+            print('\n')
 
         if self.asteroid_lightcurves_time is None:
             if use_suggestions:

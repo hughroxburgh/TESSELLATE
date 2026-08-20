@@ -192,16 +192,16 @@ def _remove_asteroids(data_path,sector,n,cams,ccds,cuts,part):
                     for i in range(1,3):
                         try:
                             os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Part{i}/Cut{cut}of{n**2}')
-                            os.system(f'rm -f *_Asteroids.parquet')
-                            os.system(f'rm -f *_AsteroidTrails.png')
+                            os.system(f'rm -f asteroids/*_Asteroids.parquet')
+                            os.system(f'rm -f asteroids/*_AsteroidTrails.png')
                             os.system(f'rm -f asteroids.txt')
                         except:
                             pass
                 else:
                     try:
                         os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
-                        os.system(f'rm -f *_Asteroids.parquet')
-                        os.system(f'rm -f *_AsteroidTrails.png')
+                        os.system(f'rm -f asteroids/*_Asteroids.parquet')
+                        os.system(f'rm -f asteroids/*_AsteroidTrails.png')
                         os.system(f'rm -f asteroids.txt')
                     except:
                         pass
@@ -252,22 +252,22 @@ def _remove_asteroid_lightcurves(data_path,sector,n,cams,ccds,cuts,part):
                     for i in range(1,3):
                         try:
                             os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Part{i}/Cut{cut}of{n**2}')
-                            os.system(f'rm -f *_AsteroidAperturePhotometry.parquet')
-                            os.system(f'rm -f *_AsteroidPSFPhotometry.parquet')
-                            os.system(f'rm -f *_AsteroidStackSummary.parquet')
-                            os.system(f'rm -f *_AsteroidStackedPhotometry.parquet')
-                            os.system(f'rm -f *_AsteroidCutOffset.parquet')
+                            os.system(f'rm -f asteroids/*_AsteroidAperturePhotometry.parquet')
+                            os.system(f'rm -f asteroids/*_AsteroidPSFPhotometry.parquet')
+                            os.system(f'rm -f asteroids/*_AsteroidStackSummary.parquet')
+                            os.system(f'rm -f asteroids/*_AsteroidStackedPhotometry.parquet')
+                            os.system(f'rm -f asteroids/*_AsteroidCutOffset.parquet')
                             os.system(f'rm -f asteroid_lightcurves.txt')
                         except:
                             pass
                 else:
                     try:
                         os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
-                        os.system(f'rm -f *_AsteroidAperturePhotometry.parquet')
-                        os.system(f'rm -f *_AsteroidPSFPhotometry.parquet')
-                        os.system(f'rm -f *_AsteroidStackSummary.parquet')
-                        os.system(f'rm -f *_AsteroidStackedPhotometry.parquet')
-                        os.system(f'rm -f *_AsteroidCutOffset.parquet')
+                        os.system(f'rm -f asteroids/*_AsteroidAperturePhotometry.parquet')
+                        os.system(f'rm -f asteroids/*_AsteroidPSFPhotometry.parquet')
+                        os.system(f'rm -f asteroids/*_AsteroidStackSummary.parquet')
+                        os.system(f'rm -f asteroids/*_AsteroidStackedPhotometry.parquet')
+                        os.system(f'rm -f asteroids/*_AsteroidCutOffset.parquet')
                         os.system(f'rm -f asteroid_lightcurves.txt')
                     except:
                         pass

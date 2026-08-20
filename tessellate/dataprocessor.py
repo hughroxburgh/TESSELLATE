@@ -565,8 +565,12 @@ class DataProcessor():
             else:
                 in_fov = ephemeris.index
 
-            save_table(ephemeris,f'{cutFolder}/{base}_Asteroids.csv')
-            plot_asteroid_trails(ephemeris[in_fov],f'{cutFolder}/{base}_AsteroidTrails.png',footprint_size=2*cutSize)
+            # every asteroid output except the asteroids.txt marker (checked directly in the
+            # cut folder, matching cut.txt/reduced.txt's convention) lives in its own
+            # subdirectory rather than cluttering the cut folder alongside everything else
+            _Save_space(f'{cutFolder}/asteroids')
+            save_table(ephemeris,f'{cutFolder}/asteroids/{base}_Asteroids.csv')
+            plot_asteroid_trails(ephemeris[in_fov],f'{cutFolder}/asteroids/{base}_AsteroidTrails.png',footprint_size=2*cutSize)
 
             with open(f'{cutFolder}/asteroids.txt', 'w') as file:
                 file.write('Predicted!')
@@ -783,7 +787,7 @@ class DataProcessor():
             cutFolder = f'{file_path}/Part{i+1}/Cut{cut}of{n**2}' if part else f'{file_path}/Cut{cut}of{n**2}'
             base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
 
-            asteroids_path = f'{cutFolder}/{base}_Asteroids.csv'
+            asteroids_path = f'{cutFolder}/asteroids/{base}_Asteroids.csv'
             if not table_exists(asteroids_path):
                 print(f'No asteroid predictions found for Cam {cam} Ccd {ccd} Cut {cut}{part_label} '
                       '-- run predict_asteroids first!')
@@ -833,11 +837,11 @@ class DataProcessor():
             offset_df = pd.DataFrame([{'offset_x': offset_x, 'offset_y': offset_y,
                                         'n_tracks_used': n_offset_tracks}])
 
-            save_table(aperture_df,f'{cutFolder}/{base}_AsteroidAperturePhotometry.csv')
-            save_table(psf_df,f'{cutFolder}/{base}_AsteroidPSFPhotometry.csv')
-            save_table(stack_summary.reset_index(),f'{cutFolder}/{base}_AsteroidStackSummary.csv')
-            save_table(stacked_df,f'{cutFolder}/{base}_AsteroidStackedPhotometry.csv')
-            save_table(offset_df,f'{cutFolder}/{base}_AsteroidCutOffset.csv')
+            save_table(aperture_df,f'{cutFolder}/asteroids/{base}_AsteroidAperturePhotometry.csv')
+            save_table(psf_df,f'{cutFolder}/asteroids/{base}_AsteroidPSFPhotometry.csv')
+            save_table(stack_summary.reset_index(),f'{cutFolder}/asteroids/{base}_AsteroidStackSummary.csv')
+            save_table(stacked_df,f'{cutFolder}/asteroids/{base}_AsteroidStackedPhotometry.csv')
+            save_table(offset_df,f'{cutFolder}/asteroids/{base}_AsteroidCutOffset.csv')
 
             with open(f'{cutFolder}/asteroid_lightcurves.txt', 'w') as file:
                 file.write('Done!')

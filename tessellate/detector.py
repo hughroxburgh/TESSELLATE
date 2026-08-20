@@ -1720,7 +1720,7 @@ class Detector():
         from .tools import load_table, table_exists
         from .asteroid_photometry import identify_known_asteroids
 
-        ephemeris_path = f'{self.path}/Cut{self.cut}of{self.n**2}/sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{self.cut}_of{self.n**2}_Asteroids.csv'
+        ephemeris_path = f'{self.path}/Cut{self.cut}of{self.n**2}/asteroids/sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{self.cut}_of{self.n**2}_Asteroids.csv'
         if not table_exists(ephemeris_path) or self.sources is None or len(self.sources) == 0:
             self.events['known_asteroid_designation'] = None
             self.events['known_asteroid_dist_px'] = np.nan
@@ -1734,7 +1734,7 @@ class Detector():
             self.events['known_asteroid_frame'] = None
             return
 
-        offset_path = f'{self.path}/Cut{self.cut}of{self.n**2}/sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{self.cut}_of{self.n**2}_AsteroidCutOffset.csv'
+        offset_path = f'{self.path}/Cut{self.cut}of{self.n**2}/asteroids/sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{self.cut}_of{self.n**2}_AsteroidCutOffset.csv'
         offset_x = offset_y = None
         if table_exists(offset_path):
             offset_row = load_table(offset_path)

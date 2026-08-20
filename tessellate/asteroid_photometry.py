@@ -18,6 +18,10 @@ that same halo contamination once pixel-phase systematics are removed (see
 detrend_pixel_phase) -- comparing the two is itself a useful diagnostic.
 """
 import math
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import shared_memory
+
 import numpy as np
 import pandas as pd
 
@@ -27,17 +31,98 @@ GAIA_MAG_LIMIT = 19.0
 
 
 # ---------------------------------------------------------------------------
+# Shared-memory-backed parallel dispatch across tracks
+# ---------------------------------------------------------------------------
+#
+# Forced photometry on a dense cut (hundreds of tracks) is easily the
+# dominant cost of the asteroid_lightcurves stage, and was entirely
+# single-threaded (confirmed: CPU usage stayed near one core regardless of
+# cpus-per-task requested). Each track's own frames are independent of every
+# other track's, so this parallelises cleanly across tracks. The cube is put
+# in a multiprocessing.shared_memory block rather than pickled into each
+# worker's initargs, so N workers don't each hold their own full copy of a
+# (potentially large) reduced flux cube -- doubling as memory as well as CPU
+# usage would defeat the point on exactly the dense, memory-tight cuts this
+# is meant to help.
+
+_worker_cube = None
+_worker_shm = None
+
+
+def _photometry_worker_init(shm_name, shape, dtype):
+    global _worker_cube, _worker_shm
+    _worker_shm = shared_memory.SharedMemory(name=shm_name)
+    _worker_cube = np.ndarray(shape, dtype=dtype, buffer=_worker_shm.buf)
+
+
+def _aperture_track_worker(track_df, radius_px):
+    return _forced_aperture_photometry_core(_worker_cube, track_df, radius_px)
+
+
+def _psf_track_worker(track_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size):
+    return _forced_psf_photometry_core(_worker_cube, track_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size)
+
+
+def _run_parallel_by_track(cube, ephemeris_df, track_worker, worker_args, empty_columns, n_workers):
+    """Shared dispatch: one task per track (designation), against a shared-memory copy of
+    cube, via track_worker(track_df, *worker_args) run in each subprocess (must be a
+    module-level function so ProcessPoolExecutor can pickle it). Falls back to sequential
+    (no subprocess/shared-memory overhead) for a single track or n_workers<=1."""
+    if len(ephemeris_df) == 0:
+        return pd.DataFrame(columns=empty_columns)
+
+    designations = ephemeris_df["designation"].unique()
+    if n_workers is None:
+        n_workers = max(1, min(len(designations), (os.cpu_count() or 4)))
+
+    if n_workers <= 1 or len(designations) <= 1:
+        return None  # signal: caller should run its own sequential _core directly
+
+    shm = shared_memory.SharedMemory(create=True, size=cube.nbytes)
+    try:
+        shared_cube = np.ndarray(cube.shape, dtype=cube.dtype, buffer=shm.buf)
+        shared_cube[:] = cube[:]
+        with ProcessPoolExecutor(max_workers=n_workers, initializer=_photometry_worker_init,
+                                  initargs=(shm.name, cube.shape, cube.dtype)) as pool:
+            futures = [pool.submit(track_worker, ephemeris_df[ephemeris_df["designation"] == d].copy(), *worker_args)
+                       for d in designations]
+            results = [fut.result() for fut in as_completed(futures)]
+    finally:
+        shm.close()
+        shm.unlink()
+
+    results = [r for r in results if len(r)]
+    if not results:
+        return pd.DataFrame(columns=empty_columns)
+    return pd.concat(results, ignore_index=True)
+
+
+# ---------------------------------------------------------------------------
 # Forced aperture photometry
 # ---------------------------------------------------------------------------
 
-def forced_aperture_photometry(cube, ephemeris_df, radius_px=APERTURE_RADIUS_PX):
+_APERTURE_COLUMNS = ["designation", "frame", "mjd", "x", "y", "flux", "sky_std", "sig"]
+
+
+def forced_aperture_photometry(cube, ephemeris_df, radius_px=APERTURE_RADIUS_PX, n_workers=None):
     """Forced circular-aperture photometry at every predicted (frame, x, y)
     in ephemeris_df, with local sky background from a concentric annulus
     (sigma-clipped to reject nearby real sources). x, y must already be in
     the cube's own local pixel frame and ephemeris_df must carry a 'frame'
     column indexing directly into cube's first axis (see
     match_ephemeris_to_reduced_frames for building this against the
-    REDUCED cube's own frame list, which need not match the raw cut's)."""
+    REDUCED cube's own frame list, which need not match the raw cut's).
+
+    Parallelised across tracks (see _run_parallel_by_track) when there's
+    more than one and n_workers != 1; pass n_workers=1 to force sequential."""
+    result = _run_parallel_by_track(cube, ephemeris_df, _aperture_track_worker,
+                                      (radius_px,), _APERTURE_COLUMNS, n_workers)
+    if result is not None:
+        return result
+    return _forced_aperture_photometry_core(cube, ephemeris_df, radius_px)
+
+
+def _forced_aperture_photometry_core(cube, ephemeris_df, radius_px):
     from astropy.stats import sigma_clip
     from photutils.aperture import CircularAperture, CircularAnnulus, ApertureStats, aperture_photometry
 
@@ -62,7 +147,7 @@ def forced_aperture_photometry(cube, ephemeris_df, radius_px=APERTURE_RADIUS_PX)
     # (e.g. every frame lands within STAMP_SIZE/2 of a cut's edge) would otherwise silently
     # break every downstream column access instead of just contributing zero rows
     if not rows:
-        return pd.DataFrame(columns=["designation", "frame", "mjd", "x", "y", "flux", "sky_std", "sig"])
+        return pd.DataFrame(columns=_APERTURE_COLUMNS)
     return pd.DataFrame(rows)
 
 
@@ -70,8 +155,11 @@ def forced_aperture_photometry(cube, ephemeris_df, radius_px=APERTURE_RADIUS_PX)
 # Forced PSF photometry
 # ---------------------------------------------------------------------------
 
+_PSF_COLUMNS = ["designation", "frame", "mjd", "x", "y", "flux", "e_flux", "background", "sig"]
+
+
 def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
-                            prf_path=None, stamp_size=STAMP_SIZE):
+                            prf_path=None, stamp_size=STAMP_SIZE, n_workers=None):
     """Forced PSF photometry (joint fit of [target PRF shape, flat local
     background]) at every predicted (frame, x, y), reusing the same
     per-frame linear solve psf_flux_calibration.py's zeropoint calibration
@@ -80,10 +168,24 @@ def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
 
     ccd_x0, ccd_y0 : the cut's own corner offset (full-CCD pixels), needed
     only to look up the right PRF model for this part of the CCD -- x, y
-    in ephemeris_df stay in the cube's local frame throughout."""
-    from .psf_flux_calibration import _psf_lc_core, PRF_PATH_DEFAULT
+    in ephemeris_df stay in the cube's local frame throughout.
 
+    Parallelised across tracks (see _run_parallel_by_track) when there's
+    more than one and n_workers != 1; pass n_workers=1 to force sequential."""
+    from .psf_flux_calibration import PRF_PATH_DEFAULT
     prf_path = prf_path or PRF_PATH_DEFAULT
+
+    result = _run_parallel_by_track(cube, ephemeris_df, _psf_track_worker,
+                                      (sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size),
+                                      _PSF_COLUMNS, n_workers)
+    if result is not None:
+        return result
+    return _forced_psf_photometry_core(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size)
+
+
+def _forced_psf_photometry_core(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size):
+    from .psf_flux_calibration import _psf_lc_core
+
     half = stamp_size // 2
     rows = []
     for row in ephemeris_df.itertuples():
@@ -105,7 +207,7 @@ def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
     # (e.g. every frame lands within STAMP_SIZE/2 of a cut's edge) or one where every frame's
     # PRF fit raised would otherwise silently break every downstream column access
     if not rows:
-        return pd.DataFrame(columns=["designation", "frame", "mjd", "x", "y", "flux", "e_flux", "background", "sig"])
+        return pd.DataFrame(columns=_PSF_COLUMNS)
     return pd.DataFrame(rows)
 
 

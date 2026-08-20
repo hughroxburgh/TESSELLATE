@@ -608,13 +608,15 @@ class Tessellate():
             reduce_cpu_sug = '8'
             reduce_mem_req = 64
 
-            # forced aperture/PSF photometry is not internally parallelised (confirmed: CPU
-            # usage stayed near one core regardless of cpus-per-task requested), so cpu is
-            # kept minimal rather than scaled with cube/cut/reduce's worker-pool stages.
-            # Scaled from the secondary tier's post-full-run-revision values (see there for why)
-            asteroid_lightcurves_time_sug = '15:00'
-            asteroid_lightcurves_cpu_sug = '2'
-            asteroid_lightcurves_mem_req = 12
+            # forced aperture/PSF photometry is now parallelised across tracks (shared-memory
+            # cube, see asteroid_photometry.py's _run_parallel_by_track), so cpu is worth
+            # scaling again -- time halved from the previous single-threaded suggestion as a
+            # conservative estimate of the real speedup, not yet directly re-benchmarked in
+            # parallel; mem bumped for each worker's own PRF cache (bounded, but duplicated
+            # per worker) on top of the shared (not duplicated) cube
+            asteroid_lightcurves_time_sug = '8:00'
+            asteroid_lightcurves_cpu_sug = '8'
+            asteroid_lightcurves_mem_req = 16
 
             calibrate_time_sug = '10:00'
             calibrate_cpu_sug = '8'
@@ -662,10 +664,13 @@ class Tessellate():
             # badly on the sector's denser CCDs -- OOM-killed jobs peaked (by periodic sampling)
             # at only 3.8/8GB, meaning real transient spikes exceed what the sampling caught, and
             # TIMEOUTs hit cuts with far more tracks than Cut57's 54 (e.g. Cam1 Ccd3, a much
-            # lower-ecliptic-latitude CCD). Widened with real margin rather than re-trimming
-            asteroid_lightcurves_time_sug = '30:00'
-            asteroid_lightcurves_cpu_sug = '2'
-            asteroid_lightcurves_mem_req = 20
+            # lower-ecliptic-latitude CCD). Widened with real margin rather than re-trimming.
+            # Now also parallelised across tracks -- cpu scaled back up (see primary tier),
+            # time halved as a conservative not-yet-benchmarked-in-parallel estimate, and
+            # _cut_asteroid_lightcurves additionally scales both per-cut by real track count
+            asteroid_lightcurves_time_sug = '15:00'
+            asteroid_lightcurves_cpu_sug = '8'
+            asteroid_lightcurves_mem_req = 28
 
             calibrate_time_sug = '10:00'
             calibrate_cpu_sug = '8'
@@ -709,9 +714,9 @@ class Tessellate():
             reduce_mem_req = 200
 
             # scaled from the secondary tier's post-full-run-revision values (see there for why)
-            asteroid_lightcurves_time_sug = '1:30:00'
-            asteroid_lightcurves_cpu_sug = '2'
-            asteroid_lightcurves_mem_req = 48
+            asteroid_lightcurves_time_sug = '45:00'
+            asteroid_lightcurves_cpu_sug = '16'
+            asteroid_lightcurves_mem_req = 64
 
             calibrate_time_sug = '10:00'
             calibrate_cpu_sug = '8'

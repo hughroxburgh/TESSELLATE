@@ -610,10 +610,11 @@ class Tessellate():
 
             # forced aperture/PSF photometry is not internally parallelised (confirmed: CPU
             # usage stayed near one core regardless of cpus-per-task requested), so cpu is
-            # kept minimal rather than scaled with cube/cut/reduce's worker-pool stages
-            asteroid_lightcurves_time_sug = '8:00'
+            # kept minimal rather than scaled with cube/cut/reduce's worker-pool stages.
+            # Scaled from the secondary tier's post-full-run-revision values (see there for why)
+            asteroid_lightcurves_time_sug = '15:00'
             asteroid_lightcurves_cpu_sug = '2'
-            asteroid_lightcurves_mem_req = 8
+            asteroid_lightcurves_mem_req = 12
 
             calibrate_time_sug = '10:00'
             calibrate_cpu_sug = '8'
@@ -657,14 +658,14 @@ class Tessellate():
             reduce_cpu_sug = '8'
             reduce_mem_req = 64
 
-            # real-benchmarked (same Cut57): max observed 7:11 (with the two-pass,
-            # position-corrected forced photometry) / 1.1GB peak, CPU usage never above
-            # ~25% of a single requested core (confirmed: forced aperture/PSF photometry
-            # isn't internally parallelised), vs. the previous unbenchmarked 30:00/32G
-            # guess with 8 cpus that were never used
-            asteroid_lightcurves_time_sug = '15:00'
+            # revised after a real Sector 32 full-run: the 2-cut benchmark (15:00/8G) undershot
+            # badly on the sector's denser CCDs -- OOM-killed jobs peaked (by periodic sampling)
+            # at only 3.8/8GB, meaning real transient spikes exceed what the sampling caught, and
+            # TIMEOUTs hit cuts with far more tracks than Cut57's 54 (e.g. Cam1 Ccd3, a much
+            # lower-ecliptic-latitude CCD). Widened with real margin rather than re-trimming
+            asteroid_lightcurves_time_sug = '30:00'
             asteroid_lightcurves_cpu_sug = '2'
-            asteroid_lightcurves_mem_req = 8
+            asteroid_lightcurves_mem_req = 20
 
             calibrate_time_sug = '10:00'
             calibrate_cpu_sug = '8'
@@ -707,9 +708,10 @@ class Tessellate():
             reduce_cpu_sug = '32'
             reduce_mem_req = 200
 
-            asteroid_lightcurves_time_sug = '45:00'
+            # scaled from the secondary tier's post-full-run-revision values (see there for why)
+            asteroid_lightcurves_time_sug = '1:30:00'
             asteroid_lightcurves_cpu_sug = '2'
-            asteroid_lightcurves_mem_req = 24
+            asteroid_lightcurves_mem_req = 48
 
             calibrate_time_sug = '10:00'
             calibrate_cpu_sug = '8'

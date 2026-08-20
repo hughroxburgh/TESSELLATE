@@ -191,8 +191,16 @@ def _select_isolated(gaia_all, gaia_cal, wcs, cut_corner, image_shape,
 
 # Module-level cache, persistent within each (loky) worker process.  The TESS
 # PRF varies slowly across the CCD, so positions are bucketed to a coarse grid
-# and one PRF is built per bucket instead of one per star.
+# and one PRF is built per bucket instead of one per star. Bounded (LRU-evicted)
+# rather than left to grow forever: fine for star calibration, where one cut's
+# stars only ever span a handful of buckets, but a moving asteroid's ccd_x/ccd_y
+# changes every frame -- a dense cut with thousands of candidate tracks can touch
+# thousands of unique buckets over a single worker's lifetime, growing this cache
+# unboundedly (confirmed: this caused real, hard-to-diagnose OOM kills during a
+# Sector 32 asteroid_lightcurves run -- jobs killed despite periodic memory
+# sampling reporting a peak of barely over 1GB against a 20GB limit).
 _PRF_CACHE = {}
+_PRF_CACHE_MAX = 50
 
 
 def _get_prf(cam, ccd, sector, ccd_x, ccd_y, prf_dir, bucket=100):
@@ -202,11 +210,13 @@ def _get_prf(cam, ccd, sector, ccd_x, ccd_y, prf_dir, bucket=100):
     cb = int(np.clip((col // bucket) * bucket + bucket // 2, 44, 2090))
     rb = int(np.clip((row // bucket) * bucket + bucket // 2, 1, 2040))
     key = (cam, ccd, sector, cb, rb, prf_dir)
-    prf = _PRF_CACHE.get(key)
+    prf = _PRF_CACHE.pop(key, None)
     if prf is None:
         prf = TESS_PRF(cam=cam, ccd=ccd, sector=sector,
                        colnum=cb, rownum=rb, localdatadir=prf_dir)
-        _PRF_CACHE[key] = prf
+    _PRF_CACHE[key] = prf  # (re-)insert at the end -- most-recently-used
+    if len(_PRF_CACHE) > _PRF_CACHE_MAX:
+        _PRF_CACHE.pop(next(iter(_PRF_CACHE)))  # evict least-recently-used
     return prf
 
 

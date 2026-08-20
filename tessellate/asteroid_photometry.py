@@ -397,20 +397,44 @@ def flag_star_contamination(df, stars, flux_col="flux"):
     out = df.copy()
     if len(stars) == 0:
         # no known stars for this cut (e.g. no local_gaia_cat.csv) -- nothing can be flagged as
-        # near one, but np.argmin(..., axis=1) below would otherwise raise on the empty axis
+        # near one, but the KDTree query below would otherwise raise on zero input points
         out["near_star_proximity"] = False
         out["contaminating_star_dist_px"] = np.nan
         out["contaminating_star_mag"] = np.nan
     else:
+        # A full (n_rows x n_stars) pairwise distance matrix was the actual dominant cost of
+        # this whole stage on a dense cut -- e.g. ~180,000 photometry rows x several thousand
+        # local stars is a many-GB temporary array, computed on a single core (this function
+        # isn't parallelised) 4 times per job (aperture + PSF, x2 for the position-corrected
+        # second pass). A star can only ever contaminate (negative margin = dist - radius)
+        # within its own radius, capped at RADIUS_MAX_PX, so a KDTree query for stars within
+        # that radius of each point needs only the handful actually nearby -- no dense matrix,
+        # and no candidates at all (common for most points) skips the row entirely.
+        from scipy.spatial import cKDTree
+
         sx, sy, smag = stars["x"].values, stars["y"].values, stars["mag"].values
         sr = flag_radius_px(smag)
-        d = np.hypot(df["x"].values[:, None] - sx[None, :], df["y"].values[:, None] - sy[None, :])
+        tree = cKDTree(np.column_stack([sx, sy]))
+        points = np.column_stack([out["x"].values, out["y"].values])
+        candidates = tree.query_ball_point(points, r=RADIUS_MAX_PX)
 
-        margin = d - sr[None, :]
-        worst = np.argmin(margin, axis=1)
-        out["near_star_proximity"] = margin[np.arange(len(df)), worst] < 0
-        out["contaminating_star_dist_px"] = d[np.arange(len(df)), worst]
-        out["contaminating_star_mag"] = smag[worst]
+        near_star_proximity = np.zeros(len(out), dtype=bool)
+        contaminating_star_dist_px = np.full(len(out), np.nan)
+        contaminating_star_mag = np.full(len(out), np.nan)
+        for i, idxs in enumerate(candidates):
+            if not idxs:
+                continue
+            idxs = np.asarray(idxs)
+            d_local = np.hypot(points[i, 0] - sx[idxs], points[i, 1] - sy[idxs])
+            margin_local = d_local - sr[idxs]
+            j = np.argmin(margin_local)
+            contaminating_star_dist_px[i] = d_local[j]
+            contaminating_star_mag[i] = smag[idxs[j]]
+            near_star_proximity[i] = margin_local[j] < 0
+
+        out["near_star_proximity"] = near_star_proximity
+        out["contaminating_star_dist_px"] = contaminating_star_dist_px
+        out["contaminating_star_mag"] = contaminating_star_mag
 
     out["local_flux_excess"] = False
     out["near_bright_star"] = False

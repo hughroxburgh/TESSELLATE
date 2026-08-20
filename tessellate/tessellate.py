@@ -285,13 +285,13 @@ class Tessellate():
             self.make_cuts()
 
         if predict_asteroids:
-            self.predict_asteroids()
+            predict_asteroids = self.predict_asteroids()   # returns prediction slurm job ids for use in asteroid_lightcurves
 
         if reduce:
             reduce = self.reduce()     # returns reduction slurm job ids for use in transient search
 
         if asteroid_lightcurves:
-            self.asteroid_lightcurves()
+            self.asteroid_lightcurves(prediction_status=predict_asteroids)
 
         if calibrate:
             self.calibrate(reduction_status=reduce)
@@ -596,23 +596,23 @@ class Tessellate():
             cut_mem_sug = '20G'
             cut_mem_req = 20
 
-            # ASSIST's ephemeris (~750MB) is loaded once per worker process, so
-            # memory scales with cpu count -- generous headroom vs a lightweight
-            # stage like calibrate
-            predict_asteroids_time_sug = '20:00'
-            predict_asteroids_cpu_sug = '16'
-            predict_asteroids_mem_req = 128
+            # scaled down from the secondary-mission tier's real benchmark (Sector 32) by the
+            # same ~0.67x ratio as reduce's own primary/secondary split -- not itself
+            # benchmarked on a primary-mission sector
+            predict_asteroids_time_sug = '10:00'
+            predict_asteroids_cpu_sug = '8'
+            predict_asteroids_mem_req = 24
 
             reduce_time_sug = '30:00'
             reduce_cpu_sug = '8'
             reduce_mem_req = 64
 
-            # forced photometry per predicted position, not yet parallelised
-            # internally -- lighter than reduce (single reduced flux cube,
-            # no ASSIST ephemeris), unbenchmarked on the real cluster
-            asteroid_lightcurves_time_sug = '20:00'
-            asteroid_lightcurves_cpu_sug = '8'
-            asteroid_lightcurves_mem_req = 32
+            # forced aperture/PSF photometry is not internally parallelised (confirmed: CPU
+            # usage stayed near one core regardless of cpus-per-task requested), so cpu is
+            # kept minimal rather than scaled with cube/cut/reduce's worker-pool stages
+            asteroid_lightcurves_time_sug = '15:00'
+            asteroid_lightcurves_cpu_sug = '2'
+            asteroid_lightcurves_mem_req = 8
 
             calibrate_time_sug = '10:00'
             calibrate_cpu_sug = '8'
@@ -640,9 +640,13 @@ class Tessellate():
             cut_mem_sug = '20G'
             cut_mem_req = 60
 
-            predict_asteroids_time_sug = '30:00'
-            predict_asteroids_cpu_sug = '16'
-            predict_asteroids_mem_req = 128
+            # real-benchmarked (Sector 32, the only tier actually tested): max observed
+            # 3 min / 3.6GB peak (Cam1 Ccd1 Cut57, 54 crossing tracks, 215 stage-2
+            # survivors -- a genuinely dense, near-ecliptic cut) with cpu_sug=8 at ~70%
+            # average utilisation, vs. the previous unbenchmarked 30:00/128G guess
+            predict_asteroids_time_sug = '15:00'
+            predict_asteroids_cpu_sug = '8'
+            predict_asteroids_mem_req = 24
 
             # reduce_time_sug = '1:15:00'
             # reduce_cpu_sug = '32'
@@ -652,9 +656,14 @@ class Tessellate():
             reduce_cpu_sug = '8'
             reduce_mem_req = 64
 
-            asteroid_lightcurves_time_sug = '30:00'
-            asteroid_lightcurves_cpu_sug = '8'
-            asteroid_lightcurves_mem_req = 32
+            # real-benchmarked (same Cut57): max observed 7:11 (with the two-pass,
+            # position-corrected forced photometry) / 1.1GB peak, CPU usage never above
+            # ~25% of a single requested core (confirmed: forced aperture/PSF photometry
+            # isn't internally parallelised), vs. the previous unbenchmarked 30:00/32G
+            # guess with 8 cpus that were never used
+            asteroid_lightcurves_time_sug = '25:00'
+            asteroid_lightcurves_cpu_sug = '2'
+            asteroid_lightcurves_mem_req = 8
 
             calibrate_time_sug = '10:00'
             calibrate_cpu_sug = '8'
@@ -684,17 +693,21 @@ class Tessellate():
             cut_mem_sug = '20G'
             cut_mem_req = 100
 
-            predict_asteroids_time_sug = '45:00'
+            # scaled up from the secondary-mission tier's real benchmark (Sector 32) by the
+            # same ~4x time / ~3x mem ratio as reduce's own secondary/tertiary split -- not
+            # itself benchmarked on a tertiary-mission sector; more candidate objects and
+            # ~3.3x more frames per cut than secondary make more parallel headroom worthwhile
+            predict_asteroids_time_sug = '1:00:00'
             predict_asteroids_cpu_sug = '16'
-            predict_asteroids_mem_req = 128
+            predict_asteroids_mem_req = 72
 
             reduce_time_sug = '3:00:00'
             reduce_cpu_sug = '32'
             reduce_mem_req = 200
 
-            asteroid_lightcurves_time_sug = '1:00:00'
-            asteroid_lightcurves_cpu_sug = '16'
-            asteroid_lightcurves_mem_req = 64
+            asteroid_lightcurves_time_sug = '1:40:00'
+            asteroid_lightcurves_cpu_sug = '2'
+            asteroid_lightcurves_mem_req = 24
 
             calibrate_time_sug = '10:00'
             calibrate_cpu_sug = '8'
@@ -2527,6 +2540,14 @@ python {self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_scri
         footprint across its observing window -- runs ahead of reduce(),
         needing only the cut's sky footprint and frame times (both already
         available once make_cuts() has produced the cut's TPF).
+
+        Returns a prediction_status dict (mirroring reduce()'s
+        reduction_status) so asteroid_lightcurves() can wait for these
+        jobs to actually finish before running, the same way
+        calibrate() waits on reduction_status -- otherwise a lightcurves
+        job can start (and silently skip, "run predict_asteroids first!")
+        before its cut's prediction has actually written the ephemeris
+        it depends on.
         """
 
         _Save_space(f'{self.working_path}/asteroid_prediction_scripts')
@@ -2535,44 +2556,53 @@ python {self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_scri
             if (self.overwrite == 'all') | ('asteroids' in self.overwrite):
                 delete_files('asteroids',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts,part=self.part)
 
+        prediction_status = {}
         for cam in self.cam:
             for ccd in self.ccd:
                 print(_Print_buff(60,f'Predicting Asteroids for Sector{self.sector} Cam{cam} Ccd{ccd}'))
                 print('\n')
 
                 for cut in self.cuts:
-                    go = False
+                    prediction_status[(cam, ccd, cut)] = {'status': None, 'job_id': None, 'job_time': None}
                     if self.part:
                         asteroids_check1 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part1/Cut{cut}of{self.n**2}/asteroids.txt'
                         asteroids_check2 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part2/Cut{cut}of{self.n**2}/asteroids.txt'
-                        if (os.path.exists(asteroids_check1)) & (os.path.exists(asteroids_check2)):
-                            print(f'Cam {cam} CCD {ccd} cut {cut} asteroids already predicted!')
-                            print('\n')
-                        else:
-                            go = True
+                        done = (os.path.exists(asteroids_check1)) & (os.path.exists(asteroids_check2))
                     else:
                         asteroids_check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/asteroids.txt'
-                        if os.path.exists(asteroids_check):
-                            print(f'Cam {cam} CCD {ccd} cut {cut} asteroids already predicted!')
-                            print('\n')
-                        else:
-                            go = True
-                    if go:
-                        # -- Create python file for predicting asteroids on a cut -- #
-                        print(f'Creating Asteroid Prediction Python File for Sector{self.sector} Cam{cam} Ccd{ccd} Cut{cut}')
-                        python_text = f"\
+                        done = os.path.exists(asteroids_check)
+
+                    if done:
+                        print(f'Cam {cam} CCD {ccd} cut {cut} asteroids already predicted!')
+                        print('\n')
+                        prediction_status[(cam, ccd, cut)]['status'] = 'COMPLETED'
+                    else:
+                        job_id = self._cut_predict_asteroids(cam=cam,ccd=ccd,cut=cut)
+                        prediction_status[(cam, ccd, cut)]['status'] = 'INCOMPLETE'
+                        prediction_status[(cam, ccd, cut)]['job_id'] = job_id
+                        prediction_status[(cam, ccd, cut)]['job_time'] = self.predict_asteroids_time
+
+        return prediction_status
+
+    def _cut_predict_asteroids(self,cam,ccd,cut,time=None):
+
+        import subprocess
+
+        # -- Create python file for predicting asteroids on a cut -- #
+        print(f'Creating Asteroid Prediction Python File for Sector{self.sector} Cam{cam} Ccd{ccd} Cut{cut}')
+        python_text = f"\
 from tessellate import DataProcessor\n\
 \n\
 part = {self.part}\n\
 processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=2)\n\
 processor.predict_asteroids(cam={cam},ccd={ccd},n={self.n},cut={cut},part=part)"
 
-                        with open(f"{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py", "w") as python_file:
-                            python_file.write(python_text)
+        with open(f"{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py", "w") as python_file:
+            python_file.write(python_text)
 
-                        # -- Create bash file to submit job -- #
-                        #print('Creating Asteroid Prediction Batch File')
-                        batch_text = f'\
+        # -- Create bash file to submit job -- #
+        #print('Creating Asteroid Prediction Batch File')
+        batch_text = f'\
 #!/bin/bash\n\
 #\n\
 #SBATCH --job-name=TESS_S{self.sector}_Cam{cam}_Ccd{ccd}_Cut{cut}_PredictAsteroids\n\
@@ -2580,7 +2610,7 @@ processor.predict_asteroids(cam={cam},ccd={ccd},n={self.n},cut={cut},part=part)"
 #SBATCH --error={self.job_output_path}/tessellate_asteroid_prediction_logs/%A_%x_errors.txt\n\
 #\n\
 #SBATCH --ntasks=1\n\
-#SBATCH --time={self.predict_asteroids_time}\n\
+#SBATCH --time={self.predict_asteroids_time if time is None else time}\n\
 #SBATCH --cpus-per-task={self.predict_asteroids_cpu}\n\
 #SBATCH --mem-per-cpu={self.predict_asteroids_mem}G\n\
 #SBATCH --account=oz335\n\
@@ -2589,12 +2619,19 @@ PYTHONUNBUFFERED=1\n\
 source {VENV_PATH}/bin/activate\n\
 python {self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
-                        with open(f"{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
-                            batch_file.write(batch_text)
+        with open(f"{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
+            batch_file.write(batch_text)
 
-                        #print('Submitting Asteroid Prediction Batch File')
-                        os.system(f'sbatch {self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh')
-                        print('\n')
+        result = subprocess.run(
+            f'sbatch {self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh',
+            shell=True, capture_output=True, text=True
+        )
+
+        job_id = result.stdout.strip().split()[-1]
+        print(f'Submitted batch job {job_id}')
+        print('\n')
+
+        return job_id
 
     def _cut_reduce(self,cam,ccd,cut,time=None):
 
@@ -2716,15 +2753,22 @@ python {self.working_path}/reduction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_sc
                     
         return reduction_status
 
-    def asteroid_lightcurves(self,overwrite=True):
+    def asteroid_lightcurves(self, prediction_status, overwrite=True):
         """
         Build Asteroid Lightcurves!
 
         Forced aperture + PSF photometry, pixel-phase detrending, star-
         contamination flagging, and shift-and-stack for every asteroid
         predict_asteroids() found crossing each cut, using the REDUCED
-        flux cube -- runs after reduce().
+        flux cube -- runs after reduce(). Waits for predict_asteroids()'s
+        own jobs to actually finish (via prediction_status, its returned
+        status dict) before submitting a cut's lightcurves job, the same
+        way calibrate() waits on reduction_status. Pass prediction_status
+        =False to skip waiting entirely (predictions already exist / are
+        being managed separately).
         """
+
+        from datetime import timedelta
 
         _Save_space(f'{self.working_path}/asteroid_lightcurves_scripts')
 
@@ -2732,44 +2776,93 @@ python {self.working_path}/reduction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_sc
             if (self.overwrite == 'all') | ('lightcurves' in self.overwrite):
                 delete_files('asteroid_lightcurves',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts,part=self.part)
 
+        lightcurve_status = {}
         for cam in self.cam:
             for ccd in self.ccd:
                 print(_Print_buff(60,f'Building Asteroid Lightcurves for Sector{self.sector} Cam{cam} Ccd{ccd}'))
                 print('\n')
 
                 for cut in self.cuts:
-                    go = False
                     if self.part:
                         check1 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part1/Cut{cut}of{self.n**2}/asteroid_lightcurves.txt'
                         check2 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part2/Cut{cut}of{self.n**2}/asteroid_lightcurves.txt'
-                        if (os.path.exists(check1)) & (os.path.exists(check2)):
-                            print(f'Cam {cam} CCD {ccd} cut {cut} asteroid lightcurves already built!')
-                            print('\n')
-                        else:
-                            go = True
+                        done = (os.path.exists(check1)) & (os.path.exists(check2))
                     else:
                         check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/asteroid_lightcurves.txt'
-                        if os.path.exists(check):
-                            print(f'Cam {cam} CCD {ccd} cut {cut} asteroid lightcurves already built!')
-                            print('\n')
+                        done = os.path.exists(check)
+
+                    if done:
+                        print(f'Cam {cam} CCD {ccd} cut {cut} asteroid lightcurves already built!')
+                        print('\n')
+                    else:
+                        lightcurve_status[(cam, ccd, cut)] = 'INCOMPLETE'
+
+        i = 0
+        while len(lightcurve_status.keys()) > 0:
+
+            for key in list(lightcurve_status.keys()):
+                cam, ccd, cut = key
+                if prediction_status == False or prediction_status[key]['status'] == 'COMPLETED':
+                    self._cut_asteroid_lightcurves(cam=cam,ccd=ccd,cut=cut)
+                    del(lightcurve_status[key])
+
+                else:
+                    job_id = prediction_status[key]['job_id']
+                    job_status = _Check_job_status(job_id)
+                    if job_status == 'FAILED':
+                        print(f'Asteroid Prediction Failed for Cam {cam} CCD {ccd} Cut {cut}')
+                        print('\n')
+                        del(lightcurve_status[key])
+                    elif job_status == 'TIMEOUT':
+                        parts = list(map(int, prediction_status[key]['job_time'].split(':')))
+                        if len(parts) == 3:
+                            h, m, s = parts
                         else:
-                            go = True
-                    if go:
-                        # -- Create python file for building asteroid lightcurves on a cut -- #
-                        print(f'Creating Asteroid Lightcurves Python File for Sector{self.sector} Cam{cam} Ccd{ccd} Cut{cut}')
-                        python_text = f"\
+                            h = 0
+                            m, s = parts
+
+                        td = timedelta(hours=h, minutes=m, seconds=s)
+                        td += timedelta(minutes=30) # add 30 minutes to the job time
+                        total = int(td.total_seconds())
+                        h = total // 3600
+                        m = (total % 3600) // 60
+                        s = total % 60
+                        result = f"{h}:{m:02}:{s:02}"
+
+                        print(f'Restarting Asteroid Prediction for Cam {cam} CCD {ccd} Cut {cut} with new time limit of {result}')
+                        job_id = self._cut_predict_asteroids(cam=cam,ccd=ccd,cut=cut,time=result)
+                        prediction_status[key]['job_id'] = job_id
+                        prediction_status[key]['job_time'] = result
+
+                    elif job_status == 'COMPLETED':
+                        prediction_status[key]['status'] = job_status
+
+                    elif job_status not in ['RUNNING','PENDING','COMPLETING','CONFIGURING','SUSPENDED']:
+                        e = f'Job {job_id} for asteroid prediction of Cam {cam} CCD {ccd} Cut {cut} has unexpected status: {job_status}\n'
+                        raise ValueError(e)
+
+            if prediction_status != False and len(lightcurve_status.keys()) > 0:
+                print('Waiting for Asteroid Predictions' + i*'.', end='\r')
+                sleep(120)
+                i += 1
+
+    def _cut_asteroid_lightcurves(self,cam,ccd,cut):
+
+        # -- Create python file for building asteroid lightcurves on a cut -- #
+        print(f'Creating Asteroid Lightcurves Python File for Sector{self.sector} Cam{cam} Ccd{ccd} Cut{cut}')
+        python_text = f"\
 from tessellate import DataProcessor\n\
 \n\
 part = {self.part}\n\
 processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=2)\n\
 processor.asteroid_lightcurves(cam={cam},ccd={ccd},n={self.n},cut={cut},part=part)"
 
-                        with open(f"{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py", "w") as python_file:
-                            python_file.write(python_text)
+        with open(f"{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py", "w") as python_file:
+            python_file.write(python_text)
 
-                        # -- Create bash file to submit job -- #
-                        #print('Creating Asteroid Lightcurves Batch File')
-                        batch_text = f'\
+        # -- Create bash file to submit job -- #
+        #print('Creating Asteroid Lightcurves Batch File')
+        batch_text = f'\
 #!/bin/bash\n\
 #\n\
 #SBATCH --job-name=TESS_S{self.sector}_Cam{cam}_Ccd{ccd}_Cut{cut}_AsteroidLightcurves\n\
@@ -2786,12 +2879,12 @@ PYTHONUNBUFFERED=1\n\
 source {VENV_PATH}/bin/activate\n\
 python {self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
-                        with open(f"{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
-                            batch_file.write(batch_text)
+        with open(f"{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
+            batch_file.write(batch_text)
 
-                        #print('Submitting Asteroid Lightcurves Batch File')
-                        os.system(f'sbatch {self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh')
-                        print('\n')
+        #print('Submitting Asteroid Lightcurves Batch File')
+        os.system(f'sbatch {self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh')
+        print('\n')
 
     def _cut_calibrate(self, cam, ccd, cut):
 

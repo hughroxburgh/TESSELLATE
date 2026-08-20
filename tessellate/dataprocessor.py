@@ -527,15 +527,22 @@ class DataProcessor():
             cutFolder = f'{file_path}/Part{i+1}/Cut{cut}of{n**2}' if part else f'{file_path}/Cut{cut}of{n**2}'
             cutName = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}.fits'
             cutPath = f'{cutFolder}/{cutName}'
+            base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
+            times_path = f'{cutFolder}/{base}_Times.npy'
 
-            if not os.path.exists(cutPath):
-                print(f'No cut found to predict asteroids for (Cam {cam} Ccd {ccd} Cut {cut}{part_label})!')
+            if os.path.exists(cutPath):
+                mjd = lk.read(cutPath).time.mjd
+            elif os.path.exists(times_path):
+                # raw cut TPF already cleaned up post-reduce() -- reduce()'s own saved frame
+                # times cover the same thing (a strict subset if bad-quality frames were dropped)
+                mjd = np.load(times_path)
+            else:
+                print(f'No cut or reduced times found to predict asteroids for '
+                      f'(Cam {cam} Ccd {ccd} Cut {cut}{part_label})!')
                 continue
 
             if self.verbose > 0:
                 print(f'Predicting Asteroids for Cam {cam} CCD {ccd} Cut {cut} (of {n**2}){part_label}')
-
-            mjd = lk.read(cutPath).time.mjd
 
             try:
                 # allow_download=False: this runs as a SLURM job on a compute node with no
@@ -558,9 +565,8 @@ class DataProcessor():
             else:
                 in_fov = ephemeris.index
 
-            save_table(ephemeris,f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_Asteroids.csv')
-            plot_asteroid_trails(ephemeris[in_fov],
-                                  f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_AsteroidTrails.png')
+            save_table(ephemeris,f'{cutFolder}/{base}_Asteroids.csv')
+            plot_asteroid_trails(ephemeris[in_fov],f'{cutFolder}/{base}_AsteroidTrails.png')
 
             with open(f'{cutFolder}/asteroids.txt', 'w') as file:
                 file.write('Predicted!')

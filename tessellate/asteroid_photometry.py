@@ -58,6 +58,11 @@ def forced_aperture_photometry(cube, ephemeris_df, radius_px=APERTURE_RADIUS_PX)
         sig = flux / (np.sqrt(npix) * sky_std) if sky_std and np.isfinite(sky_std) and sky_std > 0 else np.nan
         rows.append(dict(designation=row.designation, frame=int(row.frame), mjd=row.mjd,
                           x=row.x, y=row.y, flux=flux, sky_std=sky_std, sig=sig))
+    # pd.DataFrame([]) has no columns at all (not even 'x') -- a fully out-of-bounds track
+    # (e.g. every frame lands within STAMP_SIZE/2 of a cut's edge) would otherwise silently
+    # break every downstream column access instead of just contributing zero rows
+    if not rows:
+        return pd.DataFrame(columns=["designation", "frame", "mjd", "x", "y", "flux", "sky_std", "sig"])
     return pd.DataFrame(rows)
 
 
@@ -96,6 +101,11 @@ def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
         sig = flux / e_flux if e_flux and np.isfinite(e_flux) and e_flux > 0 else np.nan
         rows.append(dict(designation=row.designation, frame=int(row.frame), mjd=row.mjd,
                           x=row.x, y=row.y, flux=flux, e_flux=e_flux, background=bg, sig=sig))
+    # pd.DataFrame([]) has no columns at all (not even 'x') -- a fully out-of-bounds track
+    # (e.g. every frame lands within STAMP_SIZE/2 of a cut's edge) or one where every frame's
+    # PRF fit raised would otherwise silently break every downstream column access
+    if not rows:
+        return pd.DataFrame(columns=["designation", "frame", "mjd", "x", "y", "flux", "e_flux", "background", "sig"])
     return pd.DataFrame(rows)
 
 
@@ -282,16 +292,23 @@ def flag_star_contamination(df, stars, flux_col="flux"):
     proximity alone is not sufficient (see _local_excess_mask's
     docstring). Adds contaminating_star_dist_px / _mag and
     near_bright_star columns."""
-    sx, sy, smag = stars["x"].values, stars["y"].values, stars["mag"].values
-    sr = flag_radius_px(smag)
-    d = np.hypot(df["x"].values[:, None] - sx[None, :], df["y"].values[:, None] - sy[None, :])
-
-    margin = d - sr[None, :]
-    worst = np.argmin(margin, axis=1)
     out = df.copy()
-    out["near_star_proximity"] = margin[np.arange(len(df)), worst] < 0
-    out["contaminating_star_dist_px"] = d[np.arange(len(df)), worst]
-    out["contaminating_star_mag"] = smag[worst]
+    if len(stars) == 0:
+        # no known stars for this cut (e.g. no local_gaia_cat.csv) -- nothing can be flagged as
+        # near one, but np.argmin(..., axis=1) below would otherwise raise on the empty axis
+        out["near_star_proximity"] = False
+        out["contaminating_star_dist_px"] = np.nan
+        out["contaminating_star_mag"] = np.nan
+    else:
+        sx, sy, smag = stars["x"].values, stars["y"].values, stars["mag"].values
+        sr = flag_radius_px(smag)
+        d = np.hypot(df["x"].values[:, None] - sx[None, :], df["y"].values[:, None] - sy[None, :])
+
+        margin = d - sr[None, :]
+        worst = np.argmin(margin, axis=1)
+        out["near_star_proximity"] = margin[np.arange(len(df)), worst] < 0
+        out["contaminating_star_dist_px"] = d[np.arange(len(df)), worst]
+        out["contaminating_star_mag"] = smag[worst]
 
     out["local_flux_excess"] = False
     out["near_bright_star"] = False
@@ -369,7 +386,11 @@ def stack_lightcurves(psf_df, sig_target=STACK_SIG_TARGET):
                                   stacking_needed=True, n_stack=n_needed,
                                   n_frames=len(track), achieved_sig=stacked["sig"].max()))
 
-    summary = pd.DataFrame(summary_rows).set_index("designation")
+    if summary_rows:
+        summary = pd.DataFrame(summary_rows).set_index("designation")
+    else:
+        summary = pd.DataFrame(columns=["designation", "avg_sig", "stacking_needed", "n_stack",
+                                          "n_frames", "achieved_sig"]).set_index("designation")
     stacked_df = pd.concat(stacked_all, ignore_index=True) if stacked_all else pd.DataFrame(
         columns=["mjd", "mjd_err", "flux", "e_flux", "sig", "n_frames", "bin_index", "designation"])
     return summary, stacked_df

@@ -388,31 +388,43 @@ def _expand_flag_over_excess_runs(mjd, local_excess, proximity):
     return flagged
 
 
-def _long_proximity_runs_mask(mjd, proximity, min_run_length=MIN_PROXIMITY_RUN_LENGTH):
+def _long_proximity_runs_mask(mjd, proximity, star_idx, min_run_length=MIN_PROXIMITY_RUN_LENGTH):
     """Catches contamination events too long for _local_excess_mask to see --
     once a contiguous proximity run spans a large enough fraction of
     LOCAL_EXCESS_WINDOW, the rolling-median baseline gets pulled up by the
     event itself and local_excess never fires for most of it (confirmed on
-    a real 85+ frame event). A near_star_proximity run sustained this long
-    is strong evidence of real contamination on its own -- two
-    independently-moving objects staying this close for this many
-    consecutive frames by pure chance is implausible -- so it is flagged
-    directly, independent of local_excess."""
+    a real 85+ frame event, one fixed Gmag=8.0 star throughout).
+
+    Critically, a run only counts if it is continuous proximity to the SAME
+    cataloged star (star_idx constant throughout) -- near_star_proximity
+    alone is frequently true almost continuously in dense fields simply
+    because some star or other is always within RADIUS_MAX_PX, as the
+    object sweeps past many different field stars in quick succession
+    (confirmed: one real track had near_star_proximity=True 85% of the time
+    while its nearest-star magnitude varied from 4th to 22nd mag -- normal
+    field density, not contamination). Requiring one fixed star_idx for the
+    whole run is what distinguishes a genuine sustained contaminator from
+    ordinary dense-field crossing."""
     order = np.argsort(mjd)
     prox_sorted = proximity[order]
-    flagged_sorted = np.zeros(len(mjd), dtype=bool)
+    idx_sorted = star_idx[order]
+    n = len(mjd)
+    flagged_sorted = np.zeros(n, dtype=bool)
 
-    run_start = None
-    for i in range(len(prox_sorted) + 1):
-        in_run = i < len(prox_sorted) and prox_sorted[i]
-        if in_run and run_start is None:
-            run_start = i
-        elif not in_run and run_start is not None:
-            if i - run_start >= min_run_length:
-                flagged_sorted[run_start:i] = True
-            run_start = None
+    i = 0
+    while i < n:
+        if not prox_sorted[i]:
+            i += 1
+            continue
+        this_star = idx_sorted[i]
+        j = i
+        while j < n and prox_sorted[j] and idx_sorted[j] == this_star:
+            j += 1
+        if j - i >= min_run_length:
+            flagged_sorted[i:j] = True
+        i = j
 
-    flagged = np.empty(len(mjd), dtype=bool)
+    flagged = np.empty(n, dtype=bool)
     flagged[order] = flagged_sorted
     return flagged
 
@@ -427,6 +439,7 @@ def flag_star_contamination(df, stars, flux_col="flux"):
     (see _long_proximity_runs_mask's docstring). Adds
     contaminating_star_dist_px / _mag and near_bright_star columns."""
     out = df.copy()
+    contaminating_star_idx = np.full(len(out), -1, dtype=int)
     if len(stars) == 0:
         # no known stars for this cut (e.g. no local_gaia_cat.csv) -- nothing can be flagged as
         # near one, but the KDTree query below would otherwise raise on zero input points
@@ -462,6 +475,7 @@ def flag_star_contamination(df, stars, flux_col="flux"):
             j = np.argmin(margin_local)
             contaminating_star_dist_px[i] = d_local[j]
             contaminating_star_mag[i] = smag[idxs[j]]
+            contaminating_star_idx[i] = idxs[j]
             near_star_proximity[i] = margin_local[j] < 0
 
         out["near_star_proximity"] = near_star_proximity
@@ -470,14 +484,16 @@ def flag_star_contamination(df, stars, flux_col="flux"):
 
     out["local_flux_excess"] = False
     out["near_bright_star"] = False
+    contaminating_star_idx = pd.Series(contaminating_star_idx, index=out.index)
     for designation, idx in out.groupby("designation").groups.items():
         idx = np.asarray(idx)
         mjd_g = out.loc[idx, "mjd"].values
         excess_g = _local_excess_mask(mjd_g, out.loc[idx, flux_col].values)
         prox_g = out.loc[idx, "near_star_proximity"].values
+        star_idx_g = contaminating_star_idx.loc[idx].values
         out.loc[idx, "local_flux_excess"] = excess_g
         out.loc[idx, "near_bright_star"] = (_expand_flag_over_excess_runs(mjd_g, excess_g, prox_g)
-                                             | _long_proximity_runs_mask(mjd_g, prox_g))
+                                             | _long_proximity_runs_mask(mjd_g, prox_g, star_idx_g))
 
     return out
 

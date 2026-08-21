@@ -312,6 +312,7 @@ RADIUS_MIN_PX = 2.0
 RADIUS_MAX_PX = 20.0
 LOCAL_EXCESS_WINDOW = 151
 LOCAL_EXCESS_NSIGMA = 3.0
+MIN_PROXIMITY_RUN_LENGTH = 15
 
 
 def flag_radius_px(mag):
@@ -387,13 +388,44 @@ def _expand_flag_over_excess_runs(mjd, local_excess, proximity):
     return flagged
 
 
+def _long_proximity_runs_mask(mjd, proximity, min_run_length=MIN_PROXIMITY_RUN_LENGTH):
+    """Catches contamination events too long for _local_excess_mask to see --
+    once a contiguous proximity run spans a large enough fraction of
+    LOCAL_EXCESS_WINDOW, the rolling-median baseline gets pulled up by the
+    event itself and local_excess never fires for most of it (confirmed on
+    a real 85+ frame event). A near_star_proximity run sustained this long
+    is strong evidence of real contamination on its own -- two
+    independently-moving objects staying this close for this many
+    consecutive frames by pure chance is implausible -- so it is flagged
+    directly, independent of local_excess."""
+    order = np.argsort(mjd)
+    prox_sorted = proximity[order]
+    flagged_sorted = np.zeros(len(mjd), dtype=bool)
+
+    run_start = None
+    for i in range(len(prox_sorted) + 1):
+        in_run = i < len(prox_sorted) and prox_sorted[i]
+        if in_run and run_start is None:
+            run_start = i
+        elif not in_run and run_start is not None:
+            if i - run_start >= min_run_length:
+                flagged_sorted[run_start:i] = True
+            run_start = None
+
+    flagged = np.empty(len(mjd), dtype=bool)
+    flagged[order] = flagged_sorted
+    return flagged
+
+
 def flag_star_contamination(df, stars, flux_col="flux"):
-    """near_bright_star is True only when BOTH hold: a cataloged star falls
-    within its own brightness-scaled radius (proximity) AND the light
-    curve shows a genuine local excess there (see _local_excess_mask) --
-    proximity alone is not sufficient (see _local_excess_mask's
-    docstring). Adds contaminating_star_dist_px / _mag and
-    near_bright_star columns."""
+    """near_bright_star is True when a cataloged star falls within its own
+    brightness-scaled radius (proximity) AND either the light curve shows a
+    genuine local excess there (see _local_excess_mask), or the proximity
+    itself is sustained long enough to be implausible as chance coincidence
+    (see _long_proximity_runs_mask) -- proximity alone triggers on plain
+    coincidence in a dense field, but a long sustained run of it does not
+    (see _long_proximity_runs_mask's docstring). Adds
+    contaminating_star_dist_px / _mag and near_bright_star columns."""
     out = df.copy()
     if len(stars) == 0:
         # no known stars for this cut (e.g. no local_gaia_cat.csv) -- nothing can be flagged as
@@ -444,7 +476,8 @@ def flag_star_contamination(df, stars, flux_col="flux"):
         excess_g = _local_excess_mask(mjd_g, out.loc[idx, flux_col].values)
         prox_g = out.loc[idx, "near_star_proximity"].values
         out.loc[idx, "local_flux_excess"] = excess_g
-        out.loc[idx, "near_bright_star"] = _expand_flag_over_excess_runs(mjd_g, excess_g, prox_g)
+        out.loc[idx, "near_bright_star"] = (_expand_flag_over_excess_runs(mjd_g, excess_g, prox_g)
+                                             | _long_proximity_runs_mask(mjd_g, prox_g))
 
     return out
 

@@ -138,6 +138,7 @@ def _Check_job_status(job_id):
     """
 
     import subprocess
+    from time import sleep as _sleep
 
     # squeue only shows active/queued jobs
     sq = subprocess.run(
@@ -149,14 +150,19 @@ def _Check_job_status(job_id):
     if state:  # Job is still in the queue
         return state  # e.g. PENDING, RUNNING, COMPLETING
 
-    # Job has left the queue — check sacct for final state
-    sa = subprocess.run(
-        f'sacct -j {job_id} -o State -n -X',
-        shell=True, capture_output=True, text=True
-    )
-    state = sa.stdout.strip().split()[0] if sa.stdout.strip() else 'UNKNOWN'
-    # sacct states can be e.g. COMPLETED, FAILED, CANCELLED, TIMEOUT, OUT_OF_MEMORY
-    return state
+    # Job has left the queue -- check sacct for final state. A job that just left
+    # squeue can briefly be invisible to sacct too (accounting propagation lag),
+    # which would otherwise look identical to a genuinely unknown/bad job id and
+    # crash the caller -- retry a few times before conceding UNKNOWN.
+    for attempt in range(5):
+        sa = subprocess.run(
+            f'sacct -j {job_id} -o State -n -X',
+            shell=True, capture_output=True, text=True
+        )
+        if sa.stdout.strip():
+            return sa.stdout.strip().split()[0]
+        _sleep(3)
+    return 'UNKNOWN'
 
 
 def _remove_ffis(data_path,sector,n,cams,ccds,cuts,part):

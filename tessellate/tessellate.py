@@ -2950,6 +2950,13 @@ python {self.working_path}/reduction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_sc
                     elif job_status == 'COMPLETED':
                         prediction_status[key]['status'] = job_status
 
+                    elif job_status == 'UNKNOWN':
+                        # _Check_job_status already retries internally -- a residual UNKNOWN
+                        # here is rare but not worth crashing the whole driver over (one bad
+                        # cut shouldn't take down every other cut's already-submitted jobs);
+                        # just keep polling, same as PENDING/RUNNING
+                        pass
+
                     elif job_status not in ['RUNNING','PENDING','COMPLETING','CONFIGURING','SUSPENDED']:
                         e = f'Job {job_id} for asteroid prediction of Cam {cam} CCD {ccd} Cut {cut} has unexpected status: {job_status}\n'
                         raise ValueError(e)

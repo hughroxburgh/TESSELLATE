@@ -2292,7 +2292,7 @@ with open(f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/cubed.txt', '
 #SBATCH --mem-per-cpu={self.cube_mem}G\n\
 #SBATCH --account=oz335\n\
 \n\
-PYTHONUNBUFFERED=1\n\
+export PYTHONUNBUFFERED=1\n\
 source {VENV_PATH}/bin/activate\n\
 python {self.working_path}/cubing_scripts/S{self.sector}C{cam}C{ccd}_script.py'
             
@@ -2627,7 +2627,7 @@ if not part:\n\
 #SBATCH --mem-per-cpu={self.cut_mem}G\n\
 #SBATCH --account=oz335\n\
 \n\
-PYTHONUNBUFFERED=1\n\
+export PYTHONUNBUFFERED=1\n\
 source {VENV_PATH}/bin/activate\n\
 python {self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
@@ -2733,7 +2733,7 @@ processor.predict_asteroids(cam={cam},ccd={ccd},n={self.n},cut={cut},part=part)"
 #SBATCH --mem-per-cpu={self.predict_asteroids_mem}G\n\
 #SBATCH --account=oz335\n\
 \n\
-PYTHONUNBUFFERED=1\n\
+export PYTHONUNBUFFERED=1\n\
 source {VENV_PATH}/bin/activate\n\
 python {self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
@@ -2782,7 +2782,7 @@ if not part:\n\
 #SBATCH --mem-per-cpu={self.reduce_mem}G\n\
 #SBATCH --account=oz335\n\
 \n\
-PYTHONUNBUFFERED=1\n\
+export PYTHONUNBUFFERED=1\n\
 source {VENV_PATH}/bin/activate\n\
 python {self.working_path}/reduction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
@@ -3039,7 +3039,7 @@ processor.asteroid_lightcurves(cam={cam},ccd={ccd},n={self.n},cut={cut},part=par
 #SBATCH --mem-per-cpu={mem}G\n\
 #SBATCH --account=oz335\n\
 \n\
-PYTHONUNBUFFERED=1\n\
+export PYTHONUNBUFFERED=1\n\
 source {VENV_PATH}/bin/activate\n\
 python {self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
@@ -3126,7 +3126,7 @@ with open(f'{{cal_folder}}/calibrated.txt', 'w') as file:\n\
 #SBATCH --mem-per-cpu={self.calibrate_mem}G\n\
 #SBATCH --account=oz335\n\
 \n\
-PYTHONUNBUFFERED=1\n\
+export PYTHONUNBUFFERED=1\n\
 source {VENV_PATH}/bin/activate\n\
 python {script_py}'
 
@@ -3317,7 +3317,7 @@ else:\n\
 #SBATCH --mem-per-cpu={self.search_mem}G\n\
 #SBATCH --account=oz335\n\
 \n\
-PYTHONUNBUFFERED=1\n\
+export PYTHONUNBUFFERED=1\n\
 source {VENV_PATH}/bin/activate\n\
 python {self.working_path}/detection_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
@@ -3613,7 +3613,7 @@ else:\n\
 #SBATCH --mem-per-cpu={self.plot_mem}G\n\
 #SBATCH --account=oz335\n\
 \n\
-PYTHONUNBUFFERED=1\n\
+export PYTHONUNBUFFERED=1\n\
 source {VENV_PATH}/bin/activate\n\
 python {self.working_path}/plotting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 

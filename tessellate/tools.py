@@ -109,6 +109,28 @@ def _Check_dirs(save_path):
         except:
             pass
 
+def _Submit_sbatch(script_path, retries=5, delay=3):
+    """Submit a SLURM batch script via sbatch, retrying on transient submission
+    failures instead of silently dropping the job or crashing on an empty/
+    malformed sbatch response -- at the scale of tens of thousands of
+    submissions across many sectors, an occasional busy-slurmctld hiccup is
+    expected and shouldn't take down the whole driver run. Returns the job id
+    as a string, or raises RuntimeError if every attempt fails.
+    """
+    import subprocess
+    from time import sleep as _sleep
+
+    last_err = None
+    for attempt in range(retries):
+        result = subprocess.run(f'sbatch {script_path}', shell=True, capture_output=True, text=True)
+        parts = result.stdout.strip().split()
+        if parts and parts[-1].isdigit():
+            return parts[-1]
+        last_err = result.stderr.strip() or result.stdout.strip() or '(no output)'
+        _sleep(delay)
+    raise RuntimeError(f'sbatch failed after {retries} attempts for {script_path}: {last_err}')
+
+
 def _Check_job_status(job_id):
     """
     Returns one of: PENDING, RUNNING, COMPLETED, FAILED, CANCELLED, UNKNOWN

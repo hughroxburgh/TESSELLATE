@@ -13,7 +13,7 @@ import numpy as np
 # print(f'Imported easy functions ({ts-t():.0f}s)')
 
 # ts = t()
-from .tools import delete_files, _Print_buff, _Save_space, _Check_job_status
+from .tools import delete_files, _Print_buff, _Save_space, _Check_job_status, _Submit_sbatch
 # print(f'Imported .tools functions ({ts-t():.0f}s)')
 
 class Tessellate():
@@ -2706,8 +2706,6 @@ python {self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_scri
 
     def _cut_predict_asteroids(self,cam,ccd,cut,time=None):
 
-        import subprocess
-
         # -- Create python file for predicting asteroids on a cut -- #
         print(f'Creating Asteroid Prediction Python File for Sector{self.sector} Cam{cam} Ccd{ccd} Cut{cut}')
         python_text = f"\
@@ -2742,12 +2740,7 @@ python {self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd
         with open(f"{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
             batch_file.write(batch_text)
 
-        result = subprocess.run(
-            f'sbatch {self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh',
-            shell=True, capture_output=True, text=True
-        )
-
-        job_id = result.stdout.strip().split()[-1]
+        job_id = _Submit_sbatch(f'{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh')
         print(f'Submitted batch job {job_id}')
         print('\n')
 
@@ -3054,7 +3047,8 @@ python {self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{cc
             batch_file.write(batch_text)
 
         #print('Submitting Asteroid Lightcurves Batch File')
-        os.system(f'sbatch {self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh')
+        job_id = _Submit_sbatch(f'{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh')
+        print(f'Submitted batch job {job_id}')
         print('\n')
 
     def _cut_calibrate(self, cam, ccd, cut):

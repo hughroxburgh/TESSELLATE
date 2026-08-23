@@ -67,7 +67,16 @@ def _run_parallel_by_track(cube, ephemeris_df, track_worker, worker_args, empty_
     """Shared dispatch: one task per track (designation), against a shared-memory copy of
     cube, via track_worker(track_df, *worker_args) run in each subprocess (must be a
     module-level function so ProcessPoolExecutor can pickle it). Falls back to sequential
-    (no subprocess/shared-memory overhead) for a single track or n_workers<=1."""
+    (no subprocess/shared-memory overhead) for a single track or n_workers<=1.
+
+    Tracks are dispatched in bounded batches rather than submitting every track's future
+    up front and holding every individual result DataFrame in memory simultaneously until
+    one final all-at-once concat -- on an exceptionally dense cut (confirmed: one field
+    with several thousand predicted tracks) that peak, not the shared cube itself, was
+    what pushed jobs to OOM even at 224GB. A batch a few dozen tracks deep per worker keeps
+    every worker fed without that unbounded peak; each batch's small set of results gets
+    concatenated and freed before the next batch starts, so peak memory scales with batch
+    size and worker count, not total track count."""
     if len(ephemeris_df) == 0:
         return pd.DataFrame(columns=empty_columns)
 
@@ -78,23 +87,31 @@ def _run_parallel_by_track(cube, ephemeris_df, track_worker, worker_args, empty_
     if n_workers <= 1 or len(designations) <= 1:
         return None  # signal: caller should run its own sequential _core directly
 
+    batch_size = max(n_workers * 20, 100)
+
     shm = shared_memory.SharedMemory(create=True, size=cube.nbytes)
     try:
         shared_cube = np.ndarray(cube.shape, dtype=cube.dtype, buffer=shm.buf)
         shared_cube[:] = cube[:]
+        batch_results = []
         with ProcessPoolExecutor(max_workers=n_workers, initializer=_photometry_worker_init,
                                   initargs=(shm.name, cube.shape, cube.dtype)) as pool:
-            futures = [pool.submit(track_worker, ephemeris_df[ephemeris_df["designation"] == d].copy(), *worker_args)
-                       for d in designations]
-            results = [fut.result() for fut in as_completed(futures)]
+            for start in range(0, len(designations), batch_size):
+                batch = designations[start:start + batch_size]
+                futures = [pool.submit(track_worker, ephemeris_df[ephemeris_df["designation"] == d].copy(), *worker_args)
+                           for d in batch]
+                results = [fut.result() for fut in as_completed(futures)]
+                results = [r for r in results if len(r)]
+                if results:
+                    batch_results.append(pd.concat(results, ignore_index=True))
+                del results
     finally:
         shm.close()
         shm.unlink()
 
-    results = [r for r in results if len(r)]
-    if not results:
+    if not batch_results:
         return pd.DataFrame(columns=empty_columns)
-    return pd.concat(results, ignore_index=True)
+    return pd.concat(batch_results, ignore_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -461,22 +478,35 @@ def flag_star_contamination(df, stars, flux_col="flux"):
         sr = flag_radius_px(smag)
         tree = cKDTree(np.column_stack([sx, sy]))
         points = np.column_stack([out["x"].values, out["y"].values])
-        candidates = tree.query_ball_point(points, r=RADIUS_MAX_PX)
 
         near_star_proximity = np.zeros(len(out), dtype=bool)
         contaminating_star_dist_px = np.full(len(out), np.nan)
         contaminating_star_mag = np.full(len(out), np.nan)
-        for i, idxs in enumerate(candidates):
-            if not idxs:
-                continue
-            idxs = np.asarray(idxs)
-            d_local = np.hypot(points[i, 0] - sx[idxs], points[i, 1] - sy[idxs])
-            margin_local = d_local - sr[idxs]
-            j = np.argmin(margin_local)
-            contaminating_star_dist_px[i] = d_local[j]
-            contaminating_star_mag[i] = smag[idxs[j]]
-            contaminating_star_idx[i] = idxs[j]
-            near_star_proximity[i] = margin_local[j] < 0
+
+        # query_ball_point's candidate list is one Python list per row -- fine at a normal
+        # cut's star density, but a genuinely dense field (confirmed: one cut's local star
+        # catalog held 2.5 million Gaia sources) means most of ~180,000+ rows carry dozens to
+        # hundreds of candidate indices each, and building every row's list in one call before
+        # any of it is consumed is what actually drove OOM well past what the shared photometry
+        # cube itself needs. Querying in chunks bounds the live candidate-list memory to one
+        # chunk at a time regardless of total row count.
+        chunk_size = 20000
+        for start in range(0, len(points), chunk_size):
+            end = start + chunk_size
+            chunk_candidates = tree.query_ball_point(points[start:end], r=RADIUS_MAX_PX)
+            for local_i, idxs in enumerate(chunk_candidates):
+                if not idxs:
+                    continue
+                i = start + local_i
+                idxs = np.asarray(idxs)
+                d_local = np.hypot(points[i, 0] - sx[idxs], points[i, 1] - sy[idxs])
+                margin_local = d_local - sr[idxs]
+                j = np.argmin(margin_local)
+                contaminating_star_dist_px[i] = d_local[j]
+                contaminating_star_mag[i] = smag[idxs[j]]
+                contaminating_star_idx[i] = idxs[j]
+                near_star_proximity[i] = margin_local[j] < 0
+            del chunk_candidates
 
         out["near_star_proximity"] = near_star_proximity
         out["contaminating_star_dist_px"] = contaminating_star_dist_px

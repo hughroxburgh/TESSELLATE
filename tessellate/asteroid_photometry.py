@@ -476,8 +476,12 @@ def flag_star_contamination(df, stars, flux_col="flux"):
 
         sx, sy, smag = stars["x"].values, stars["y"].values, stars["mag"].values
         sr = flag_radius_px(smag)
-        tree = cKDTree(np.column_stack([sx, sy]))
         points = np.column_stack([out["x"].values, out["y"].values])
+
+        near_star_proximity = np.zeros(len(out), dtype=bool)
+        contaminating_star_dist_px = np.full(len(out), np.nan)
+        contaminating_star_mag = np.full(len(out), np.nan)
+        best_margin = np.full(len(out), np.inf)
 
         # query_ball_point's per-point candidate list scales with LOCAL STAR DENSITY, not a
         # fixed size -- fine at a normal cut's density, but confirmed live on one cut whose
@@ -485,29 +489,49 @@ def flag_star_contamination(df, stars, flux_col="flux"):
         # within-radius candidate list ran into the tens of thousands of entries each, and
         # even querying in row-chunks still built each chunk's full lists before any were
         # consumed, driving measured RSS past 36GB and still climbing regardless of chunk
-        # size. A fixed-k nearest-neighbour query bounds memory to O(n_points x k) regardless
-        # of field density instead: distance_upper_bound=RADIUS_MAX_PX lets cKDTree stop early
-        # once genuine neighbours run out, and the true most-contaminating star (by margin,
-        # not raw distance) is essentially always among the nearest handful by raw distance
-        # since RADIUS_MAX_PX already caps how far any star's own flag radius can reach.
-        k_nearest = min(32, len(sx))
-        dist, idx = tree.query(points, k=k_nearest, distance_upper_bound=RADIUS_MAX_PX)
-        if k_nearest == 1:
-            dist = dist[:, None]
-            idx = idx[:, None]
+        # size. A single fixed-k nearest-neighbour query was tried and reverted: it isn't
+        # correctness-preserving in a field this dense -- a bright, large-radius star at a
+        # moderate distance can genuinely have a worse (more negative) margin than dozens of
+        # much closer but small-radius stars, so it can rank outside any fixed k by raw
+        # distance and get silently missed.
+        #
+        # Instead, bin stars by their OWN flag radius into tiers and search each tier only
+        # out to that tier's own max radius, against only that tier's stars -- provably
+        # correct (every star gets a properly radius-bounded check against its real sr,
+        # nothing is approximated) while still bounding memory: brighter/large-radius tiers
+        # search a bigger area but hold far fewer stars (the luminosity function), and the
+        # numerous faint tier (most real Gaia catalogs sit near GAIA_MAG_LIMIT, i.e. at or
+        # near RADIUS_MIN_PX) only needs a small search radius, cutting its candidate density
+        # by orders of magnitude versus searching every star out to RADIUS_MAX_PX.
+        chunk_size = 20000
+        tier_edges = np.geomspace(RADIUS_MIN_PX, RADIUS_MAX_PX, 7)
+        for lo, hi in zip(tier_edges[:-1], tier_edges[1:]):
+            tier_mask = (sr >= lo) & (sr <= hi) if lo == tier_edges[0] else (sr > lo) & (sr <= hi)
+            if not tier_mask.any():
+                continue
+            tier_global_idx = np.nonzero(tier_mask)[0]
+            tier_sx, tier_sy = sx[tier_mask], sy[tier_mask]
+            tier_smag, tier_sr = smag[tier_mask], sr[tier_mask]
+            tier_tree = cKDTree(np.column_stack([tier_sx, tier_sy]))
 
-        valid = idx < len(sx)  # cKDTree marks an exhausted/missing neighbour with index == n
-        safe_idx = np.where(valid, idx, 0)
-        margin = np.where(valid, dist - sr[safe_idx], np.inf)
-        best = np.argmin(margin, axis=1)
-        rows = np.arange(len(points))
-        best_valid = valid[rows, best]
-        best_idx = safe_idx[rows, best]
-
-        contaminating_star_dist_px = np.where(best_valid, dist[rows, best], np.nan)
-        contaminating_star_mag = np.where(best_valid, smag[best_idx], np.nan)
-        contaminating_star_idx[best_valid] = best_idx[best_valid]
-        near_star_proximity = best_valid & (margin[rows, best] < 0)
+            for start in range(0, len(points), chunk_size):
+                end = start + chunk_size
+                chunk_candidates = tier_tree.query_ball_point(points[start:end], r=hi)
+                for local_i, idxs in enumerate(chunk_candidates):
+                    if not idxs:
+                        continue
+                    i = start + local_i
+                    idxs = np.asarray(idxs)
+                    d_local = np.hypot(points[i, 0] - tier_sx[idxs], points[i, 1] - tier_sy[idxs])
+                    margin_local = d_local - tier_sr[idxs]
+                    j = np.argmin(margin_local)
+                    if margin_local[j] < best_margin[i]:
+                        best_margin[i] = margin_local[j]
+                        contaminating_star_dist_px[i] = d_local[j]
+                        contaminating_star_mag[i] = tier_smag[idxs[j]]
+                        contaminating_star_idx[i] = tier_global_idx[idxs[j]]
+                        near_star_proximity[i] = margin_local[j] < 0
+                del chunk_candidates
 
         out["near_star_proximity"] = near_star_proximity
         out["contaminating_star_dist_px"] = contaminating_star_dist_px

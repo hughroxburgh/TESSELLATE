@@ -545,6 +545,7 @@ class SourceInjector():
 
         injections['frame_max'] = 0
         injections['mjd_max'] = 0
+        injections['source_mask'] = 0
         cadence_min = np.nanmedian(np.diff(self._true_nav.time)) * 1440
         lcs = []
         for i in tqdm(range(n_events), desc='    injecting events into cube', position=0, leave=True, dynamic_ncols=False, ascii=True):
@@ -569,6 +570,8 @@ class SourceInjector():
             
             xint = RoundToInt(source.xcentroid)
             yint = RoundToInt(source.ycentroid)
+
+            injections.iloc[i,injections.columns.get_loc('source_mask')] = self._true_nav.mask[yint,xint]
 
             half_big = big_size // 2
             h, w = self._true_nav.flux.shape[1], self._true_nav.flux.shape[2]
@@ -703,7 +706,7 @@ class SourceInjector():
             return
 
         self._true_nav.gather_results(cut=cut, sources=False, events=True, objects=True)
-        self._true_nav.gather_data(cut=cut, flux=True, time=True, bkg=True, verbose=False)
+        self._true_nav.gather_data(cut=cut, flux=True, time=True, bkg=True, verbose=False,mask=True)
         raw_cube, processed = self.load_raw_cube(cut, cube_mode)
 
         if processed:

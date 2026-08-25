@@ -86,7 +86,6 @@ def submit_sector_search(sector, cams=(1, 2, 3, 4), ccds=(1, 2, 3, 4), cuts=None
     import sys
     import subprocess
 
-    venv = sys.prefix
     cuts = list(cuts) if cuts is not None else list(range(1, n ** 2 + 1))
     script_dir = script_dir or f'{data_path}/Sector{sector}/bazin_search_scripts'
     log_dir = log_dir or f'{data_path}/Sector{sector}/bazin_search_logs'
@@ -125,8 +124,7 @@ def submit_sector_search(sector, cams=(1, 2, 3, 4), ccds=(1, 2, 3, 4), cuts=None
                         f'#SBATCH --mem-per-cpu={mem}G\n'
                         f'#SBATCH --account={account}\n\n'
                         'PYTHONUNBUFFERED=1\n'
-                        f'source {venv}/bin/activate\n'
-                        f'python {base}.py\n'
+                        f'{sys.executable} {base}.py\n'
                     )
                 if submit:
                     r = subprocess.run(f'sbatch {base}.sh', shell=True,

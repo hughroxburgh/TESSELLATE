@@ -15,8 +15,6 @@ from scipy.spatial import cKDTree
 
 import sys
 
-VENV_PATH = sys.prefix
-
 from tessellate.tessellate import Tessellate
 from tessellate.dataprocessor import DataProcessor
 from tessellate.navigator import Navigator
@@ -820,8 +818,7 @@ injector._inject_cut(\n\
 #SBATCH --account=oz335\n\
 \n\
 PYTHONUNBUFFERED=1\n\
-source {VENV_PATH}/bin/activate\n\
-python {script_py}'
+{sys.executable} {script_py}'
 
         with open(script_sh, 'w') as f:
             f.write(batch_text)

@@ -7,8 +7,6 @@ import os
 import re
 import sys
 
-VENV_PATH = sys.prefix
-
 import numpy as np
 # print(f'Imported easy functions ({ts-t():.0f}s)')
 
@@ -2293,8 +2291,7 @@ with open(f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/cubed.txt', '
 #SBATCH --account=oz335\n\
 \n\
 export PYTHONUNBUFFERED=1\n\
-source {VENV_PATH}/bin/activate\n\
-python {self.working_path}/cubing_scripts/S{self.sector}C{cam}C{ccd}_script.py'
+{sys.executable} {self.working_path}/cubing_scripts/S{self.sector}C{cam}C{ccd}_script.py'
             
             with open(f"{self.working_path}/cubing_scripts/S{self.sector}C{cam}C{ccd}_script.sh", "w") as batch_file:
                 batch_file.write(batch_text)
@@ -2628,8 +2625,7 @@ if not part:\n\
 #SBATCH --account=oz335\n\
 \n\
 export PYTHONUNBUFFERED=1\n\
-source {VENV_PATH}/bin/activate\n\
-python {self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
+{sys.executable} {self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
                         with open(f"{self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
                             batch_file.write(batch_text)
@@ -2734,8 +2730,7 @@ processor.predict_asteroids(cam={cam},ccd={ccd},n={self.n},cut={cut},part=part)"
 #SBATCH --account=oz335\n\
 \n\
 export PYTHONUNBUFFERED=1\n\
-source {VENV_PATH}/bin/activate\n\
-python {self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
+{sys.executable} {self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
         with open(f"{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
             batch_file.write(batch_text)
@@ -2783,8 +2778,7 @@ if not part:\n\
 #SBATCH --account=oz335\n\
 \n\
 export PYTHONUNBUFFERED=1\n\
-source {VENV_PATH}/bin/activate\n\
-python {self.working_path}/reduction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
+{sys.executable} {self.working_path}/reduction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
         with open(f"{self.working_path}/reduction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
             batch_file.write(batch_text)
@@ -3055,8 +3049,7 @@ processor.asteroid_lightcurves(cam={cam},ccd={ccd},n={self.n},cut={cut},part=par
 #SBATCH --account=oz335\n\
 \n\
 export PYTHONUNBUFFERED=1\n\
-source {VENV_PATH}/bin/activate\n\
-python {self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
+{sys.executable} {self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
         with open(f"{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
             batch_file.write(batch_text)
@@ -3142,8 +3135,7 @@ with open(f'{{cal_folder}}/calibrated.txt', 'w') as file:\n\
 #SBATCH --account=oz335\n\
 \n\
 export PYTHONUNBUFFERED=1\n\
-source {VENV_PATH}/bin/activate\n\
-python {script_py}'
+{sys.executable} {script_py}'
 
         with open(script_sh, 'w') as f:
             f.write(batch_text)
@@ -3333,8 +3325,7 @@ else:\n\
 #SBATCH --account=oz335\n\
 \n\
 export PYTHONUNBUFFERED=1\n\
-source {VENV_PATH}/bin/activate\n\
-python {self.working_path}/detection_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
+{sys.executable} {self.working_path}/detection_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
         with open(f"{self.working_path}/detection_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
             batch_file.write(batch_text)
@@ -3629,8 +3620,7 @@ else:\n\
 #SBATCH --account=oz335\n\
 \n\
 export PYTHONUNBUFFERED=1\n\
-source {VENV_PATH}/bin/activate\n\
-python {self.working_path}/plotting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
+{sys.executable} {self.working_path}/plotting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
         with open(f"{self.working_path}/plotting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
             batch_file.write(batch_text)

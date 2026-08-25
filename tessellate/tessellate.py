@@ -2976,8 +2976,16 @@ python {self.working_path}/reduction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_sc
     # flag_star_contamination's old matrix was the real per-track cost, not anything else.
     # Constants below verified to give >=1.18x (mem) / >=1.30x (time) margin against every one
     # of the 50 real data points individually, not just the fitted line
-    _LIGHTCURVES_TIME_PER_TRACK_S = 2.0
-    _LIGHTCURVES_TIME_FLOOR_S = 200
+    # Bumped from 2.0/200 after a real northern-ecliptic (Cycle 4, TESS sector 44) cut with
+    # ~440 tracks timed out at the 2.0 s/track scaling's own 18-minute estimate -- the fit
+    # above was against southern-sector (Cycle 3) data, which rarely exceeds ~35 tracks/cut;
+    # northern cuts commonly run 300-400+ tracks/cut (an order of magnitude denser), a regime
+    # the original fit never sampled and its claimed 1.30x margin doesn't safely extrapolate
+    # into. No real data yet to refit the northern-regime slope, so this is a conservative
+    # multiplier (2.5x time, matching floor bump) pending enough completed northern jobs to
+    # refit properly -- revisit once that data exists.
+    _LIGHTCURVES_TIME_PER_TRACK_S = 5.0
+    _LIGHTCURVES_TIME_FLOOR_S = 300
     _LIGHTCURVES_MEM_PER_TRACK_GB = 0.01
     _LIGHTCURVES_MEM_FLOOR_GB = 22
 

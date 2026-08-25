@@ -526,7 +526,7 @@ def flag_star_contamination(df, stars, flux_col="flux"):
                 # formats can silently drop explicit zeros; this one doesn't) -- and gives
                 # distances directly, so the separate np.hypot pass below is gone too.
                 point_tree = cKDTree(points[start:end])
-                sdm = tier_tree.sparse_distance_matrix(point_tree, max_distance=hi, output_type='coo_array')
+                sdm = tier_tree.sparse_distance_matrix(point_tree, max_distance=hi, output_type='coo_matrix')
                 if sdm.nnz == 0:
                     continue
                 row_idx = sdm.col + start
@@ -827,8 +827,9 @@ def pool_offset_from_stacks(ephemeris, cube, sector, cam, ccd, ccd_x0, ccd_y0, p
     asteroid_photometry.identify_known_asteroids's own detected-source
     pooling) rather than trust too few points.
 
-    Also returns a per-track diagnostics DataFrame (every track evaluated,
-    not just the ones that qualified) with designation, offset_x, offset_y,
+    Also returns a per-track diagnostics DataFrame (every track with at
+    least one usable stamp, not just the ones that qualified) with
+    designation, offset_x, offset_y,
     sig, flux, and n_stamps, plus mag/mag_err converted from flux via
     zp_ab if a zeropoint is given (mag_err from the standard
     1.0857/sig error-propagation relation -- exact given sig is flux/e_flux
@@ -845,6 +846,8 @@ def pool_offset_from_stacks(ephemeris, cube, sector, cam, ccd, ccd_x0, ccd_y0, p
         else:
             mag = np.nan
         mag_err = 1.0857 / sig if np.isfinite(sig) and sig > 0 else np.nan
+        if n_stamps == 0:
+            continue
         rows.append(dict(designation=designation, offset_x=ox, offset_y=oy, sig=sig,
                           flux=flux, mag=mag, mag_err=mag_err, n_stamps=n_stamps, used=used))
     diagnostics = pd.DataFrame(rows)

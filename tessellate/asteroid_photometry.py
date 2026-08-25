@@ -515,23 +515,47 @@ def flag_star_contamination(df, stars, flux_col="flux"):
             tier_tree = cKDTree(np.column_stack([tier_sx, tier_sy]))
 
             for start in range(0, len(points), chunk_size):
-                end = start + chunk_size
+                end = min(start + chunk_size, len(points))
                 chunk_candidates = tier_tree.query_ball_point(points[start:end], r=hi)
-                for local_i, idxs in enumerate(chunk_candidates):
-                    if not idxs:
-                        continue
-                    i = start + local_i
-                    idxs = np.asarray(idxs)
-                    d_local = np.hypot(points[i, 0] - tier_sx[idxs], points[i, 1] - tier_sy[idxs])
-                    margin_local = d_local - tier_sr[idxs]
-                    j = np.argmin(margin_local)
-                    if margin_local[j] < best_margin[i]:
-                        best_margin[i] = margin_local[j]
-                        contaminating_star_dist_px[i] = d_local[j]
-                        contaminating_star_mag[i] = tier_smag[idxs[j]]
-                        contaminating_star_idx[i] = tier_global_idx[idxs[j]]
-                        near_star_proximity[i] = margin_local[j] < 0
+                # Flatten the ragged per-row candidate lists into one set of (row, star)
+                # pairs and evaluate distance/margin for all of them in one vectorised
+                # pass, instead of a Python-level loop calling np.hypot/np.argmin
+                # separately per row -- correctness-identical (every candidate within
+                # this tier's radius of a row is still checked, nothing approximated),
+                # but this loop was the module's dominant cost by a wide margin (memray
+                # profiling on a real dense cut: ~93,000 allocations per track from this
+                # exact loop, ~166M total across one job).
+                lengths = np.fromiter((len(c) for c in chunk_candidates), dtype=np.int64,
+                                       count=len(chunk_candidates))
+                if lengths.sum() == 0:
+                    del chunk_candidates
+                    continue
+                row_idx = np.repeat(np.arange(start, end), lengths)
+                col_idx = np.concatenate([np.asarray(c, dtype=np.int64)
+                                           for c in chunk_candidates if len(c)])
                 del chunk_candidates
+
+                d_all = np.hypot(points[row_idx, 0] - tier_sx[col_idx],
+                                  points[row_idx, 1] - tier_sy[col_idx])
+                margin_all = d_all - tier_sr[col_idx]
+
+                # best (minimum-margin) candidate per row -- pandas' groupby/idxmin picks
+                # the first occurrence on ties, matching np.argmin's own tie-break, and is
+                # well-tested rather than a hand-rolled scatter-reduction here
+                best_pos = pd.Series(margin_all).groupby(row_idx).idxmin()
+                rows_with_cand = best_pos.index.values
+                pair_pos = best_pos.values
+
+                cand_margin = margin_all[pair_pos]
+                improved = cand_margin < best_margin[rows_with_cand]
+                upd_rows = rows_with_cand[improved]
+                upd_pos = pair_pos[improved]
+
+                best_margin[upd_rows] = margin_all[upd_pos]
+                contaminating_star_dist_px[upd_rows] = d_all[upd_pos]
+                contaminating_star_mag[upd_rows] = tier_smag[col_idx[upd_pos]]
+                contaminating_star_idx[upd_rows] = tier_global_idx[col_idx[upd_pos]]
+                near_star_proximity[upd_rows] = margin_all[upd_pos] < 0
 
         out["near_star_proximity"] = near_star_proximity
         out["contaminating_star_dist_px"] = contaminating_star_dist_px

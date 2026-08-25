@@ -1030,9 +1030,14 @@ python {script_py}'
         temporal_iou_o = np.full(n, np.nan)
         duration_rat_o = np.full(n, np.nan)
         peak_off_o     = np.full(n, np.nan)
+        snr_psf_o      = np.full(n, np.nan)
         snr_det_o      = np.full(n, np.nan)
         snr_rat_o      = np.full(n, np.nan)
         match_score_o  = np.full(n, np.nan)
+        dx_o          = np.full(n, np.nan)
+        dy_o          = np.full(n, np.nan)
+        xcentroid_err_o = np.full(n, np.nan)
+        ycentroid_err_o = np.full(n, np.nan)
         z_x_o          = np.full(n, np.nan)
         z_y_o          = np.full(n, np.nan)
 
@@ -1118,11 +1123,16 @@ python {script_py}'
                 temporal_iou_o[i] = tiou[b]
                 duration_rat_o[i] = dur_ratio[b]
                 peak_off_o[i]     = peak_off[b]
+                snr_psf_o[i]      = best.snr_psf
                 snr_det_o[i]      = best.lc_sig_max
                 snr_rat_o[i]      = best.lc_sig_max / i_snr
                 match_score_o[i]  = score[b]
-                z_x_o[i]          = (best.xcentroid - x0) / best.xcentroid_err
-                z_y_o[i]          = (best.ycentroid - y0) / best.ycentroid_err
+                dx_o[i]             = (best.xcentroid - x0)
+                dy_o[i]             = (best.ycentroid - y0)
+                xcentroid_err_o[i]  = best.xcentroid_err_psf
+                ycentroid_err_o[i]  = best.ycentroid_err_psf
+                z_x_o[i]          = (best.xcentroid - x0) / best.xcentroid_err_psf
+                z_y_o[i]          = (best.ycentroid - y0) / best.ycentroid_err_psf
 
                 found = True
                 break
@@ -1138,6 +1148,7 @@ python {script_py}'
                 if np.any(d <= centroid_match_radius):
                     detected[i] = "iso"
 
+        non_vars["cut"]           = self.cut
         non_vars["detected"]      = detected
         non_vars["ev_match"]      = ev_match
         non_vars["centroid_sep"]  = centroid_sep_o
@@ -1146,7 +1157,12 @@ python {script_py}'
         non_vars["peak_offset_min"] = peak_off_o
         non_vars["snr_detected"]  = snr_det_o
         non_vars["snr_ratio"]     = snr_rat_o
+        non_vars["snr_psf"]       = snr_psf_o
         non_vars["match_score"]   = match_score_o
+        non_vars["dx"]            = dx_o
+        non_vars["dy"]            = dy_o
+        non_vars["xcentroid_err_psf"] = xcentroid_err_o
+        non_vars["ycentroid_err_psf"] = ycentroid_err_o
         non_vars["z_xcentroid"]   = z_x_o
         non_vars["z_ycentroid"]   = z_y_o
 

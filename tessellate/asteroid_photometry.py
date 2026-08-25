@@ -701,7 +701,11 @@ def measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0,
     if len(stamps) < min_stamps:
         return np.nan, np.nan, len(stamps)
 
-    stacked_mean = np.mean(stamps, axis=0)
+    # median, not mean -- a plain mean lets a handful of contaminated frames (cosmic rays,
+    # background artifacts) among possibly hundreds bias the stacked image's apparent shape;
+    # confirmed visually on a real track where the mean-stacked image showed a spurious
+    # secondary feature the PRF search was chasing, absent from the median-stacked version
+    stacked_mean = np.median(stamps, axis=0)
     stamp_size = 2 * half + 1
 
     # flux-weighted centroid in a small central window -- initial guess for the PRF
@@ -725,13 +729,18 @@ def measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0,
         ccd_x, ccd_y = ccd_x0 + last.x, ccd_y0 + last.y
         prf_dir = f'{prf_path}/Sectors4+' if sector >= 4 else f'{prf_path}/Sectors1_2_3'
         prf = _get_prf(cam, ccd, sector, ccd_x, ccd_y, prf_dir)
-    except Exception:
+    except Exception as ex:
+        # falls back to the flux-weighted centroid, but silently -- a wrong prf_path or
+        # any other PRF-loading failure would otherwise degrade to the old behaviour with
+        # no visible sign anything was wrong (caught a real instance of exactly this during
+        # development: a stale default prf_path made every single call fail this way)
+        import warnings
+        warnings.warn(f"measure_stack_centroid_offset: PRF unavailable ({ex!r}), "
+                       f"falling back to flux-weighted centroid", RuntimeWarning)
         return cx0, cy0, len(stamps)
 
     def _residual(offset):
         dx, dy = offset
-        if abs(dx) > search_radius_px or abs(dy) > search_radius_px:
-            return np.inf
         template = prf.locate(half + dx, half + dy, (stamp_size, stamp_size))
         s = np.nansum(template)
         if not (np.isfinite(s) and s > 0):
@@ -743,7 +752,13 @@ def measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0,
         return float(np.sum((d - A @ coeffs) ** 2))
 
     from scipy.optimize import minimize
-    res = minimize(_residual, x0=[cx0, cy0], method="Nelder-Mead",
+    # bounds=, not a manual np.inf wall outside the box -- an inf-return gives Nelder-Mead's
+    # simplex a flat cliff instead of a real constraint, and it was confirmed pinning
+    # multiple real tracks' fits exactly at the wall (e.g. (2.0, 2.0)) rather than finding
+    # a genuine interior optimum. scipy's own bounds handling reflects/clips the simplex
+    # properly instead.
+    bounds = [(-search_radius_px, search_radius_px)] * 2
+    res = minimize(_residual, x0=[cx0, cy0], method="Nelder-Mead", bounds=bounds,
                     options={"xatol": 0.01, "fatol": 1e-6})
     if res.success and _residual(res.x) < _residual([cx0, cy0]):
         return float(res.x[0]), float(res.x[1]), len(stamps)

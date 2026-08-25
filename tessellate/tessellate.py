@@ -7,13 +7,11 @@ import os
 import re
 import sys
 
-VENV_PATH = sys.prefix
-
 import numpy as np
 # print(f'Imported easy functions ({ts-t():.0f}s)')
 
 # ts = t()
-from .tools import delete_files, _Print_buff, _Save_space, _Check_job_status
+from .tools import delete_files, _Print_buff, _Save_space, _Check_job_status, _Submit_sbatch
 # print(f'Imported .tools functions ({ts-t():.0f}s)')
 
 class Tessellate():
@@ -26,12 +24,14 @@ class Tessellate():
                  job_output_path=None,working_path=None,injection_dir='source_injection',
                  download_number=None,cube_time=None,cube_mem=None,cube_cpu=None,
                  cuts=None,cut_time=None,cut_mem=None,cut_cpu=None,
+                 predict_asteroids_time=None,predict_asteroids_cpu=None,predict_asteroids_mem=None,
                  reduce_time=None,reduce_cpu=None,reduce_mem=None,
+                 asteroid_lightcurves_time=None,asteroid_lightcurves_cpu=None,asteroid_lightcurves_mem=None,
                  calibrate_time=None,calibrate_cpu=None,calibrate_mem=None,
                  search_time=None,search_cpu=None,search_mem=None,detect_mode='both',time_bins=None,
                  plot_time=None,plot_cpu=None,plot_mem=None,
-                 download=None,make_cube=None,fix_wcs=None,make_cuts=None,
-                 reduce=None,calibrate=None,search=None,plot=None,delete=None,
+                 download=None,make_cube=None,fix_wcs=None,make_cuts=None,predict_asteroids=None,
+                 reduce=None,asteroid_lightcurves=None,calibrate=None,search=None,plot=None,delete=None,
                  injection=False,overwrite=None,reset_logs=None,use_suggestions=False,
                  go=True):
         
@@ -76,8 +76,12 @@ class Tessellate():
             if True, make cube
         make_cuts : bool
             if True, make cuts
+        predict_asteroids : bool
+            if True, predict catalogued asteroids crossing each cut's footprint
         reduce : bool
             if True, reduce cuts
+        asteroid_lightcurves : bool
+            if True, build forced photometry lightcurves for predicted asteroids
         search : bool
             if True, run search pipeline
         delete : bool
@@ -101,12 +105,26 @@ class Tessellate():
         cut_mem : int
             memory/cpu for cut generation (in GB)
 
+        predict_asteroids_time : str
+            time allowed for asteroid prediction, form = 'hh:mm:ss'
+        predict_asteroids_cpu : int
+            number of cpu to request for asteroid prediction
+        predict_asteroids_mem : int
+            memory/cpu for asteroid prediction (in GB)
+
         reduce_time : str
             time allowed for cut reduction, form = 'hh:mm:ss'
         reduce_cpu : int
             number of cpu to request for cut reduction
         reduce_mem : int
             memory/cpu for cut reduction (in GB)
+
+        asteroid_lightcurves_time : str
+            time allowed for asteroid lightcurve generation, form = 'hh:mm:ss'
+        asteroid_lightcurves_cpu : int
+            number of cpu to request for asteroid lightcurve generation
+        asteroid_lightcurves_mem : int
+            memory/cpu for asteroid lightcurve generation (in GB)
 
         search_time : str
             time allowed for transient event search, form = 'hh:mm:ss'
@@ -143,12 +161,20 @@ class Tessellate():
         self.cut_mem = cut_mem
         self.cut_cpu = cut_cpu
 
+        self.predict_asteroids_time = predict_asteroids_time
+        self.predict_asteroids_mem = predict_asteroids_mem
+        self.predict_asteroids_cpu = predict_asteroids_cpu
+
         self.injection = injection
         self._inj_dir = injection_dir if injection else '.'
 
         self.reduce_time = reduce_time
         self.reduce_cpu = reduce_cpu
         self.reduce_mem = reduce_mem
+
+        self.asteroid_lightcurves_time = asteroid_lightcurves_time
+        self.asteroid_lightcurves_cpu = asteroid_lightcurves_cpu
+        self.asteroid_lightcurves_mem = asteroid_lightcurves_mem
 
         self.calibrate_time = calibrate_time
         self.calibrate_cpu = calibrate_cpu
@@ -169,10 +195,10 @@ class Tessellate():
 
         # -- Allows for no actual initialisation (TessTransient) -- #
         if go:
-            self.run_tessellate(download,make_cube,fix_wcs,make_cuts,reduce,calibrate,search,plot,delete,
+            self.run_tessellate(download,make_cube,fix_wcs,make_cuts,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot,delete,
                                 overwrite,reset_logs,save_config,use_suggestions)
 
-    def run_tessellate(self,download,make_cube,fix_wcs,make_cuts,reduce,calibrate,search,plot,delete,
+    def run_tessellate(self,download,make_cube,fix_wcs,make_cuts,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot,delete,
                        overwrite,reset_logs,save_config,use_suggestions):
 
         # -- Initialise and check for previous config file -- #
@@ -181,17 +207,17 @@ class Tessellate():
         if load_prev:
 
             # -- Load config -- #
-            download, make_cube, fix_wcs, make_cuts, reduce, calibrate, search, plot, delete = self._load_config()
-        
+            download, make_cube, fix_wcs, make_cuts, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot, delete = self._load_config()
+
         else:
             # -- Confirm Run Properties -- #
-            self._run_properties() 
+            self._run_properties()
 
             # -- Get time/cpu/memory suggestions depending on sector -- #
-            suggestions = self._sector_suggestions()  
+            suggestions = self._sector_suggestions()
 
             # -- Ask for which tessellation steps to perform -- #
-            download, make_cube, fix_wcs, make_cuts, reduce, calibrate, search, plot, delete = self._which_processes(download, make_cube, fix_wcs, make_cuts, reduce, calibrate, search, plot, delete)
+            download, make_cube, fix_wcs, make_cuts, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot, delete = self._which_processes(download, make_cube, fix_wcs, make_cuts, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot, delete)
 
             # -- Ask for inputs -- #
             if download:
@@ -205,9 +231,17 @@ class Tessellate():
                 self._cut_properties(suggestions[1],use_suggestions)
                 _Save_space(f'{self.job_output_path}/tessellate_cutting_logs')
 
+            if predict_asteroids:
+                self._predict_asteroids_properties(make_cuts,suggestions[6],use_suggestions)
+                _Save_space(f'{self.job_output_path}/tessellate_asteroid_prediction_logs')
+
             if reduce:
                 self._reduce_properties(make_cuts,suggestions[2],use_suggestions)
                 _Save_space(f'{self.job_output_path}/tessellate_reduction_logs')
+
+            if asteroid_lightcurves:
+                self._asteroid_lightcurves_properties(make_cuts or predict_asteroids,suggestions[7],use_suggestions)
+                _Save_space(f'{self.job_output_path}/tessellate_asteroid_lightcurves_logs')
 
             if calibrate:
                 self._calibrate_properties(reduce, suggestions[5],use_suggestions)
@@ -223,17 +257,17 @@ class Tessellate():
                 _Save_space(f'{self.job_output_path}/tessellate_plotting_logs')
 
             if save_config:
-                self._write_config(download,make_cube, fix_wcs, make_cuts, reduce, calibrate, search, plot, delete)
+                self._write_config(download,make_cube, fix_wcs, make_cuts, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot, delete)
 
         # -- Check for overwriting -- #
         if overwrite != False:
-            self._overwrite_suggestions(make_cube, make_cuts, reduce, calibrate, search, plot)
+            self._overwrite_suggestions(make_cube, make_cuts, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot)
         else:
             self.overwrite = None
 
         # -- Reset Job Logs -- #
         if reset_logs != False:
-            self._reset_logs(make_cube,make_cuts,reduce,calibrate,search,plot)
+            self._reset_logs(make_cube,make_cuts,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot)
 
         # -- Run Processes -- #
         if download:
@@ -244,12 +278,18 @@ class Tessellate():
 
         if fix_wcs:
             self.fix_wcs(cube_status=make_cube)
-        
+
         if make_cuts:
             self.make_cuts()
 
+        if predict_asteroids:
+            predict_asteroids = self.predict_asteroids()   # returns prediction slurm job ids for use in asteroid_lightcurves
+
         if reduce:
             reduce = self.reduce()     # returns reduction slurm job ids for use in transient search
+
+        if asteroid_lightcurves:
+            self.asteroid_lightcurves(prediction_status=predict_asteroids)
 
         if calibrate:
             self.calibrate(reduction_status=reduce)
@@ -368,7 +408,18 @@ class Tessellate():
         else:
             make_cuts = False
             print(f'   - Make Cut(s)? [y/n] = n')
-        
+
+        # Predict Asteroids
+        if 'predict_asteroids' in parser:
+            predict_asteroids = parse_value(parser['predict_asteroids'].get('predict_asteroids', False))
+            self.predict_asteroids_time = parse_value(parser['predict_asteroids'].get('predict_asteroids job time', None))
+            self.predict_asteroids_mem = parse_value(parser['predict_asteroids'].get('predict_asteroids job memory', None))
+            self.predict_asteroids_cpu = parse_value(parser['predict_asteroids'].get('predict_asteroids job cpu', None))
+            print(f'   - Predict Asteroids on Cut(s)? [y/n] = y')
+        else:
+            predict_asteroids = False
+            print(f'   - Predict Asteroids on Cut(s)? [y/n] = n')
+
         # Reduce
         if 'reduce' in parser:
             reduce = parse_value(parser['reduce'].get('reduce', False))
@@ -379,6 +430,17 @@ class Tessellate():
         else:
             reduce = False
             print(f'   - Reduce Cut(s)? [y/n] = n')
+
+        # Asteroid Lightcurves
+        if 'asteroid_lightcurves' in parser:
+            asteroid_lightcurves = parse_value(parser['asteroid_lightcurves'].get('asteroid_lightcurves', False))
+            self.asteroid_lightcurves_time = parse_value(parser['asteroid_lightcurves'].get('asteroid_lightcurves job time', None))
+            self.asteroid_lightcurves_mem = parse_value(parser['asteroid_lightcurves'].get('asteroid_lightcurves job memory', None))
+            self.asteroid_lightcurves_cpu = parse_value(parser['asteroid_lightcurves'].get('asteroid_lightcurves job cpu', None))
+            print(f'   - Build Asteroid Lightcurves on Cut(s)? [y/n] = y')
+        else:
+            asteroid_lightcurves = False
+            print(f'   - Build Asteroid Lightcurves on Cut(s)? [y/n] = n')
 
         # Calibrate
         if 'calibrate' in parser:
@@ -458,10 +520,22 @@ class Tessellate():
             print(f"   - Cut Num CPUs Needed = {self.cut_cpu}")
             print('\n')
 
+        if predict_asteroids:
+            print(f"   - Predict Asteroids Batch Time ['h:mm:ss'] = {self.predict_asteroids_time}")
+            print(f"   - Predict Asteroids Num CPUs = {self.predict_asteroids_cpu}")
+            print(f"   - Predict Asteroids Mem/CPU = {self.predict_asteroids_mem}")
+            print('\n')
+
         if reduce:
             print(f"   - Reduce Batch Time ['h:mm:ss'] = {self.reduce_time}")
             print(f"   - Reduce Mem/CPU = {self.reduce_mem}")
             print(f"   - Reduce Num CPUs Needed = {self.reduce_cpu}")
+            print('\n')
+
+        if asteroid_lightcurves:
+            print(f"   - Asteroid Lightcurves Batch Time ['h:mm:ss'] = {self.asteroid_lightcurves_time}")
+            print(f"   - Asteroid Lightcurves Num CPUs = {self.asteroid_lightcurves_cpu}")
+            print(f"   - Asteroid Lightcurves Mem/CPU = {self.asteroid_lightcurves_mem}")
             print('\n')
 
         if search:
@@ -477,7 +551,7 @@ class Tessellate():
             print(f"   - Plotting Num CPUs Needed = {self.plot_cpu}")
             print('\n')
 
-        go = input('   Ready? [y/n] = ')  
+        go = input('   Ready? [y/n] = ')
         done = False
         while not done:
             if go.lower() == 'y':
@@ -485,7 +559,7 @@ class Tessellate():
                 done=True
             elif go.lower() == 'n':
                 srs = input('      Cancel? [y/n] = ')
-                innerdone = False  
+                innerdone = False
                 while not innerdone:
                     if srs.lower() == 'y':
                         print('\n')
@@ -494,12 +568,12 @@ class Tessellate():
                         srs = input('         Invalid choice! Cancel? [y/n] = ')
                     else:
                         innerdone = True
-                go = input('   Ready? [y/n] = ')  
+                go = input('   Ready? [y/n] = ')
             else:
                 go = input('      Invalid choice! Ready? [y/n] = ')
 
 
-        return download,make_cube,fix_wcs,make_cuts,reduce,calibrate,search,plot,delete
+        return download,make_cube,fix_wcs,make_cuts,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot,delete
 
     def _sector_suggestions(self):
         """
@@ -520,9 +594,27 @@ class Tessellate():
             cut_mem_sug = '20G'
             cut_mem_req = 20
 
+            # scaled from the secondary tier's real benchmark by frame count -- ~1200 vs ~3600
+            # FFIs/sector (30min vs 10min cadence, same ~27-day window) is the actual driver of
+            # both stages' runtime (precise_ephemeris's per-frame loop; one PSF fit per frame
+            # per track), a ~0.33x ratio -- not itself benchmarked on a primary-mission sector
+            predict_asteroids_time_sug = '5:00'
+            predict_asteroids_cpu_sug = '8'
+            predict_asteroids_mem_req = 24
+
             reduce_time_sug = '30:00'
             reduce_cpu_sug = '8'
             reduce_mem_req = 64
+
+            # forced aperture/PSF photometry is now parallelised across tracks (shared-memory
+            # cube, see asteroid_photometry.py's _run_parallel_by_track), so cpu is worth
+            # scaling again -- time halved from the previous single-threaded suggestion as a
+            # conservative estimate of the real speedup, not yet directly re-benchmarked in
+            # parallel; mem bumped for each worker's own PRF cache (bounded, but duplicated
+            # per worker) on top of the shared (not duplicated) cube
+            asteroid_lightcurves_time_sug = '8:00'
+            asteroid_lightcurves_cpu_sug = '8'
+            asteroid_lightcurves_mem_req = 16
 
             calibrate_time_sug = '10:00'
             calibrate_cpu_sug = '8'
@@ -550,6 +642,14 @@ class Tessellate():
             cut_mem_sug = '20G'
             cut_mem_req = 60
 
+            # real-benchmarked (Sector 32, the only tier actually tested): max observed
+            # 3 min / 3.6GB peak (Cam1 Ccd1 Cut57, 54 crossing tracks, 215 stage-2
+            # survivors -- a genuinely dense, near-ecliptic cut) with cpu_sug=8 at ~70%
+            # average utilisation, vs. the previous unbenchmarked 30:00/128G guess
+            predict_asteroids_time_sug = '10:00'
+            predict_asteroids_cpu_sug = '8'
+            predict_asteroids_mem_req = 24
+
             # reduce_time_sug = '1:15:00'
             # reduce_cpu_sug = '32'
             # reduce_mem_req = 160
@@ -557,6 +657,18 @@ class Tessellate():
             reduce_time_sug = '45:00'
             reduce_cpu_sug = '8'
             reduce_mem_req = 64
+
+            # revised after a real Sector 32 full-run: the 2-cut benchmark (15:00/8G) undershot
+            # badly on the sector's denser CCDs -- OOM-killed jobs peaked (by periodic sampling)
+            # at only 3.8/8GB, meaning real transient spikes exceed what the sampling caught, and
+            # TIMEOUTs hit cuts with far more tracks than Cut57's 54 (e.g. Cam1 Ccd3, a much
+            # lower-ecliptic-latitude CCD). Widened with real margin rather than re-trimming.
+            # Now also parallelised across tracks -- cpu scaled back up (see primary tier),
+            # time halved as a conservative not-yet-benchmarked-in-parallel estimate, and
+            # _cut_asteroid_lightcurves additionally scales both per-cut by real track count
+            asteroid_lightcurves_time_sug = '15:00'
+            asteroid_lightcurves_cpu_sug = '8'
+            asteroid_lightcurves_mem_req = 28
 
             calibrate_time_sug = '10:00'
             calibrate_cpu_sug = '8'
@@ -586,9 +698,23 @@ class Tessellate():
             cut_mem_sug = '20G'
             cut_mem_req = 100
 
+            # not itself benchmarked on a tertiary-mission sector. Scaled from the secondary
+            # tier's real 3min/7:11 worst case by frame count -- ~12000 vs ~3600 FFIs/sector
+            # (200sec vs 10min cadence, same ~27-day window), a ~3.3x ratio, the actual driver
+            # of both stages' runtime (precise_ephemeris's per-frame loop; one PSF fit per
+            # frame per track)
+            predict_asteroids_time_sug = '30:00'
+            predict_asteroids_cpu_sug = '16'
+            predict_asteroids_mem_req = 72
+
             reduce_time_sug = '3:00:00'
             reduce_cpu_sug = '32'
             reduce_mem_req = 200
+
+            # scaled from the secondary tier's post-full-run-revision values (see there for why)
+            asteroid_lightcurves_time_sug = '45:00'
+            asteroid_lightcurves_cpu_sug = '16'
+            asteroid_lightcurves_mem_req = 64
 
             calibrate_time_sug = '10:00'
             calibrate_cpu_sug = '8'
@@ -608,8 +734,10 @@ class Tessellate():
                        [reduce_time_sug,reduce_cpu_sug,reduce_mem_req],
                        [search_time_sug,search_cpu_sug,search_mem_req,search_time_bins],
                        [plot_time_sug,plot_cpu_sug,plot_mem_req],
-                       [calibrate_time_sug,calibrate_cpu_sug,calibrate_mem_req]]
-        
+                       [calibrate_time_sug,calibrate_cpu_sug,calibrate_mem_req],
+                       [predict_asteroids_time_sug,predict_asteroids_cpu_sug,predict_asteroids_mem_req],
+                       [asteroid_lightcurves_time_sug,asteroid_lightcurves_cpu_sug,asteroid_lightcurves_mem_req]]
+
         return suggestions
 
     def _run_properties(self):
@@ -687,7 +815,7 @@ class Tessellate():
         
         print('\n')
     
-    def _which_processes(self,download,make_cube,fix_wcs,make_cuts,reduce,calibrate,search,plot,delete):
+    def _which_processes(self,download,make_cube,fix_wcs,make_cuts,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot,delete):
 
         if download is None:
             d = input('   - Download FFIs? [y/n] = ')
@@ -741,6 +869,19 @@ class Tessellate():
                 else:
                     d = input('      Invalid choice! Make Cut(s)? [y/n] = ')
 
+        if predict_asteroids is None:
+            d = input('   - Predict Asteroids on Cut(s)? [y/n] = ')
+            done = False
+            while not done:
+                if d.lower() == 'y':
+                    predict_asteroids = True
+                    done=True
+                elif d.lower() == 'n':
+                    predict_asteroids = False
+                    done=True
+                else:
+                    d = input('      Invalid choice! Predict Asteroids on Cut(s)? [y/n] = ')
+
         if reduce is None:
             d = input('   - Reduce Cut(s)? [y/n] = ')
             done = False
@@ -753,6 +894,19 @@ class Tessellate():
                     done=True
                 else:
                     d = input('      Invalid choice! Reduce Cut(s)? [y/n] = ')
+
+        if asteroid_lightcurves is None:
+            d = input('   - Build Asteroid Lightcurves on Cut(s)? [y/n] = ')
+            done = False
+            while not done:
+                if d.lower() == 'y':
+                    asteroid_lightcurves = True
+                    done=True
+                elif d.lower() == 'n':
+                    asteroid_lightcurves = False
+                    done=True
+                else:
+                    d = input('      Invalid choice! Build Asteroid Lightcurves on Cut(s)? [y/n] = ')
 
         if calibrate is None:
             d = input('   - Flux Calibrate Cut(s)? [y/n] = ')
@@ -808,7 +962,7 @@ class Tessellate():
 
         print('\n')
 
-        return download, make_cube, fix_wcs, make_cuts, reduce, calibrate, search, plot, delete
+        return download, make_cube, fix_wcs, make_cuts, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot, delete
     
     def _download_properties(self):
         """
@@ -1035,6 +1189,139 @@ class Tessellate():
 
         print('\n')
 
+    def _predict_asteroids_properties(self,making_cuts,suggestions,use_suggestions):
+        """
+        Confirm asteroid prediction process properties. CPU is set directly
+        (not derived from a mem/cpu ratio like cube/cut) since asteroid
+        prediction parallelises via a fixed worker-process pool, matching
+        reduce/search's convention rather than cube/cut's.
+
+        predict_asteroids runs ahead of reduce() and can be the very first
+        cut-consuming stage in a run (e.g. reduce=False, make_cuts=False --
+        already-reduced data), so unlike reduce/calibrate/search it can't
+        assume self.n/self.cuts were already resolved from 'all' by an
+        earlier stage's properties method; resolves them itself here
+        (mirroring _reduce_properties's own if not cutting: block) when
+        make_cuts won't. Confirmed the hard way: leaving this out let
+        self.cuts stay the literal string 'all', and `for cut in self.cuts`
+        silently iterated its characters ('a', 'l', 'l') instead of raising.
+        """
+
+        if not making_cuts:
+            if self.n is None:
+                n = input('   - n (Number of Cuts = n^2) = ')
+                done = False
+                while not done:
+                    try:
+                        n = int(n)
+                        if n > 0:
+                            self.n = n
+                            done = True
+                        else:
+                            n = input('      Invalid choice! n (Number of Cuts = n^2) =  ')
+                    except:
+                        n = input('      Invalid choice! n (Number of Cuts = n^2) =  ')
+            elif self.n > 0:
+                print(f'   - n (Number of Cuts = n^2) = {self.n}')
+            else:
+                e = f"Invalid 'n' value Input of {self.n}\n"
+                raise ValueError(e)
+
+
+            if self.cuts is None:
+                cut = input(f'   - Cut [1-{self.n**2},all] = ')
+                done = False
+                while not done:
+                    if cut == 'all':
+                        self.cuts = range(1,self.n**2+1)
+                        done = True
+                    elif cut in np.array(range(1,self.n**2+1)).astype(str):
+                        self.cuts = [int(cut)]
+                        done = True
+                    else:
+                        cut = input(f'      Invalid choice! Cut [1-{self.n**2},all] =  ')
+            elif self.cuts == 'all':
+                print(f'   - Cut = all')
+                self.cuts = range(1,self.n**2+1)
+            elif self.cuts in range(1,self.n**2+1):
+                print(f'   - Cut = {self.cuts}')
+                self.cuts = [self.cuts]
+            elif type(self.cuts) == list:
+                print(f'   - Cut = {self.cuts}')
+            else:
+                e = f"Invalid Cut Input of {self.cuts} with 'n' of {self.n}\n"
+                raise ValueError(e)
+
+            print('\n')
+
+        if self.predict_asteroids_time is None:
+            if use_suggestions:
+                self.predict_asteroids_time = suggestions[0]
+                print(f'   - Predict Asteroids Batch Time = {self.predict_asteroids_time}')
+            else:
+                predict_asteroids_time = input(f"   - Predict Asteroids Batch Time ['h:mm:ss'] ({suggestions[0]} suggested) = ")
+                done = False
+                while not done:
+                    if ':' in predict_asteroids_time:
+                        self.predict_asteroids_time = predict_asteroids_time
+                        done = True
+                    else:
+                        predict_asteroids_time = input(f"      Invalid format! Predict Asteroids Batch Time ['h:mm:ss'] ({suggestions[0]} suggested) = ")
+        else:
+            print(f'   - Predict Asteroids Batch Time = {self.predict_asteroids_time}')
+
+
+        if self.predict_asteroids_cpu is None:
+            if use_suggestions:
+                self.predict_asteroids_cpu = int(suggestions[1])
+                print(f'   - Predict Asteroids Num CPUs = {self.predict_asteroids_cpu}')
+            else:
+                predict_asteroids_cpu = input(f"   - Predict Asteroids Num CPUs [1-32] ({suggestions[1]} suggested) = ")
+                done = False
+                while not done:
+                    try:
+                        predict_asteroids_cpu = int(predict_asteroids_cpu)
+                        if 0 < predict_asteroids_cpu < 33:
+                            self.predict_asteroids_cpu = predict_asteroids_cpu
+                            done = True
+                        else:
+                            predict_asteroids_cpu = input(f"      Invalid format! Predict Asteroids Num CPUs [1-32] ({suggestions[1]} suggested) = ")
+                    except:
+                        predict_asteroids_cpu = input(f"      Invalid format! Predict Asteroids Num CPUs [1-32] ({suggestions[1]} suggested) = ")
+        elif 0 < self.predict_asteroids_cpu < 33:
+            print(f'   - Predict Asteroids Num CPUs = {self.predict_asteroids_cpu}')
+        else:
+            e = f"Invalid Predict Asteroids CPUs Input of {self.predict_asteroids_cpu}\n"
+            raise ValueError(e)
+
+        if self.predict_asteroids_mem is None:
+            if type(self.download_number) == int:
+                predict_asteroids_mem = input(f"   - Predict Asteroids Mem/CPU = ")
+                done = False
+                while not done:
+                    try:
+                        predict_asteroids_mem = int(predict_asteroids_mem)
+                        if 0<predict_asteroids_mem < 500:
+                            self.predict_asteroids_mem = predict_asteroids_mem
+                            done=True
+                        else:
+                            predict_asteroids_mem = input(f"      Invalid format! Predict Asteroids Mem/CPU = ")
+                    except:
+                        if predict_asteroids_mem[-1].lower() == 'g':
+                            self.predict_asteroids_mem = predict_asteroids_mem[:-1]
+                            done = True
+                        else:
+                            predict_asteroids_mem = input(f"      Invalid format! Predict Asteroids Mem/CPU = ")
+            else:
+                self.predict_asteroids_mem = np.ceil(suggestions[2]/self.predict_asteroids_cpu).astype(int)
+                print(f'   - Predict Asteroids Mem/CPU Needed = {self.predict_asteroids_mem}')
+        elif 0 < self.predict_asteroids_mem < 500:
+            print(f'   - Predict Asteroids Mem/CPU = {self.predict_asteroids_mem}G')
+        else:
+            e = f"Invalid Predict Asteroids Mem/CPU Input of {self.predict_asteroids_mem}\n"
+            raise ValueError(e)
+        print('\n')
+
     def _reduce_properties(self,cutting,suggestions,use_suggestions):
         """
         Confirm reduction process properties.
@@ -1154,7 +1441,136 @@ class Tessellate():
             e = f"Invalid Reduce Mem/CPU Input of {self.reduce_mem}\n"
             raise ValueError(e)
         print('\n')
-    
+
+    def _asteroid_lightcurves_properties(self,making_cuts_or_predicting,suggestions,use_suggestions):
+        """
+        Confirm asteroid lightcurve generation process properties. CPU is
+        set directly (not derived from a mem/cpu ratio), matching
+        reduce/predict_asteroids' convention.
+
+        Like _predict_asteroids_properties, resolves self.n/self.cuts from
+        'all' itself when neither make_cuts nor predict_asteroids will --
+        asteroid_lightcurves can run standalone against already-reduced,
+        already-predicted data (reduce=False, predict_asteroids=False),
+        the same gap that let self.cuts stay the literal string 'all' and
+        silently iterate its characters instead of raising.
+        """
+
+        if not making_cuts_or_predicting:
+            if self.n is None:
+                n = input('   - n (Number of Cuts = n^2) = ')
+                done = False
+                while not done:
+                    try:
+                        n = int(n)
+                        if n > 0:
+                            self.n = n
+                            done = True
+                        else:
+                            n = input('      Invalid choice! n (Number of Cuts = n^2) =  ')
+                    except:
+                        n = input('      Invalid choice! n (Number of Cuts = n^2) =  ')
+            elif self.n > 0:
+                print(f'   - n (Number of Cuts = n^2) = {self.n}')
+            else:
+                e = f"Invalid 'n' value Input of {self.n}\n"
+                raise ValueError(e)
+
+
+            if self.cuts is None:
+                cut = input(f'   - Cut [1-{self.n**2},all] = ')
+                done = False
+                while not done:
+                    if cut == 'all':
+                        self.cuts = range(1,self.n**2+1)
+                        done = True
+                    elif cut in np.array(range(1,self.n**2+1)).astype(str):
+                        self.cuts = [int(cut)]
+                        done = True
+                    else:
+                        cut = input(f'      Invalid choice! Cut [1-{self.n**2},all] =  ')
+            elif self.cuts == 'all':
+                print(f'   - Cut = all')
+                self.cuts = range(1,self.n**2+1)
+            elif self.cuts in range(1,self.n**2+1):
+                print(f'   - Cut = {self.cuts}')
+                self.cuts = [self.cuts]
+            elif type(self.cuts) == list:
+                print(f'   - Cut = {self.cuts}')
+            else:
+                e = f"Invalid Cut Input of {self.cuts} with 'n' of {self.n}\n"
+                raise ValueError(e)
+
+            print('\n')
+
+        if self.asteroid_lightcurves_time is None:
+            if use_suggestions:
+                self.asteroid_lightcurves_time = suggestions[0]
+                print(f'   - Asteroid Lightcurves Batch Time = {self.asteroid_lightcurves_time}')
+            else:
+                asteroid_lightcurves_time = input(f"   - Asteroid Lightcurves Batch Time ['h:mm:ss'] ({suggestions[0]} suggested) = ")
+                done = False
+                while not done:
+                    if ':' in asteroid_lightcurves_time:
+                        self.asteroid_lightcurves_time = asteroid_lightcurves_time
+                        done = True
+                    else:
+                        asteroid_lightcurves_time = input(f"      Invalid format! Asteroid Lightcurves Batch Time ['h:mm:ss'] ({suggestions[0]} suggested) = ")
+        else:
+            print(f'   - Asteroid Lightcurves Batch Time = {self.asteroid_lightcurves_time}')
+
+
+        if self.asteroid_lightcurves_cpu is None:
+            if use_suggestions:
+                self.asteroid_lightcurves_cpu = int(suggestions[1])
+                print(f'   - Asteroid Lightcurves Num CPUs = {self.asteroid_lightcurves_cpu}')
+            else:
+                asteroid_lightcurves_cpu = input(f"   - Asteroid Lightcurves Num CPUs [1-32] ({suggestions[1]} suggested) = ")
+                done = False
+                while not done:
+                    try:
+                        asteroid_lightcurves_cpu = int(asteroid_lightcurves_cpu)
+                        if 0 < asteroid_lightcurves_cpu < 33:
+                            self.asteroid_lightcurves_cpu = asteroid_lightcurves_cpu
+                            done = True
+                        else:
+                            asteroid_lightcurves_cpu = input(f"      Invalid format! Asteroid Lightcurves Num CPUs [1-32] ({suggestions[1]} suggested) = ")
+                    except:
+                        asteroid_lightcurves_cpu = input(f"      Invalid format! Asteroid Lightcurves Num CPUs [1-32] ({suggestions[1]} suggested) = ")
+        elif 0 < self.asteroid_lightcurves_cpu < 33:
+            print(f'   - Asteroid Lightcurves Num CPUs = {self.asteroid_lightcurves_cpu}')
+        else:
+            e = f"Invalid Asteroid Lightcurves CPUs Input of {self.asteroid_lightcurves_cpu}\n"
+            raise ValueError(e)
+
+        if self.asteroid_lightcurves_mem is None:
+            if type(self.download_number) == int:
+                asteroid_lightcurves_mem = input(f"   - Asteroid Lightcurves Mem/CPU = ")
+                done = False
+                while not done:
+                    try:
+                        asteroid_lightcurves_mem = int(asteroid_lightcurves_mem)
+                        if 0<asteroid_lightcurves_mem < 500:
+                            self.asteroid_lightcurves_mem = asteroid_lightcurves_mem
+                            done=True
+                        else:
+                            asteroid_lightcurves_mem = input(f"      Invalid format! Asteroid Lightcurves Mem/CPU = ")
+                    except:
+                        if asteroid_lightcurves_mem[-1].lower() == 'g':
+                            self.asteroid_lightcurves_mem = asteroid_lightcurves_mem[:-1]
+                            done = True
+                        else:
+                            asteroid_lightcurves_mem = input(f"      Invalid format! Asteroid Lightcurves Mem/CPU = ")
+            else:
+                self.asteroid_lightcurves_mem = np.ceil(suggestions[2]/self.asteroid_lightcurves_cpu).astype(int)
+                print(f'   - Asteroid Lightcurves Mem/CPU Needed = {self.asteroid_lightcurves_mem}')
+        elif 0 < self.asteroid_lightcurves_mem < 500:
+            print(f'   - Asteroid Lightcurves Mem/CPU = {self.asteroid_lightcurves_mem}G')
+        else:
+            e = f"Invalid Asteroid Lightcurves Mem/CPU Input of {self.asteroid_lightcurves_mem}\n"
+            raise ValueError(e)
+        print('\n')
+
     def _calibrate_properties(self, reducing, suggestions, use_suggestions):
         """
         Confirm flux calibration process properties.
@@ -1526,15 +1942,19 @@ class Tessellate():
 
         print('\n')
     
-    def _overwrite_suggestions(self, make_cube, make_cuts, reduce, calibrate, search, plot):
+    def _overwrite_suggestions(self, make_cube, make_cuts, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot):
 
         options = []
         if make_cube:
             options.append('cube')
         if make_cuts:
             options.append('cut')
+        if predict_asteroids:
+            options.append('asteroids')
         if reduce:
             options.append('reduce')
+        if asteroid_lightcurves:
+            options.append('lightcurves')
         if calibrate:
             options.append('calibrate')
         if search:
@@ -1556,7 +1976,7 @@ class Tessellate():
                 self.overwrite = (over.replace(' ','')).split(',')
                 good = True
                 for thing in self.overwrite:
-                    if thing not in ['cube','cut','reduce','calibrate','search','plot']:
+                    if thing not in ['cube','cut','asteroids','reduce','lightcurves','calibrate','search','plot']:
                         good = False
                 if good:
                     done = True
@@ -1566,7 +1986,7 @@ class Tessellate():
         
         print('\n')
     
-    def _write_config(self,download,make_cube, fix_wcs, make_cuts, reduce, calibrate, search, plot,delete):
+    def _write_config(self,download,make_cube, fix_wcs, make_cuts, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot,delete):
 
         config = {
             "base": {
@@ -1574,7 +1994,7 @@ class Tessellate():
                 "cam": self.cam,
                 "ccd": self.ccd,
             }}
-        
+
         if download:
             config['download'] = {
                 'download' : True,
@@ -1586,12 +2006,12 @@ class Tessellate():
                 'cube job time' : self.cube_time,
                 'cube job memory' : self.cube_mem,
                 'cube job cpu' : self.cube_cpu}
-            
+
         if fix_wcs:
             config['fix_wcs'] = {
                 'fix_wcs' : True}
 
-        if make_cuts | reduce | calibrate | search | plot:
+        if make_cuts | predict_asteroids | reduce | asteroid_lightcurves | calibrate | search | plot:
             config['cut_properties'] = {
                 'n' : self.n,
                 'cuts' : list(self.cuts)}
@@ -1603,12 +2023,26 @@ class Tessellate():
                 'cut job memory' : self.cut_mem,
                 'cut job cpu' : self.cut_cpu}
 
+        if predict_asteroids:
+            config['predict_asteroids'] = {
+                'predict_asteroids' : True,
+                'predict_asteroids job time' : self.predict_asteroids_time,
+                'predict_asteroids job memory' : self.predict_asteroids_mem,
+                'predict_asteroids job cpu' : self.predict_asteroids_cpu}
+
         if reduce:
             config['reduce'] = {
                 'reduce' : True,
                 'reduce job time' : self.reduce_time,
                 'reduce job memory' : self.reduce_mem,
                 'reduce job cpu' : self.reduce_cpu}
+
+        if asteroid_lightcurves:
+            config['asteroid_lightcurves'] = {
+                'asteroid_lightcurves' : True,
+                'asteroid_lightcurves job time' : self.asteroid_lightcurves_time,
+                'asteroid_lightcurves job memory' : self.asteroid_lightcurves_mem,
+                'asteroid_lightcurves job cpu' : self.asteroid_lightcurves_cpu}
 
         if calibrate:
             config['calibrate'] = {
@@ -1650,7 +2084,7 @@ class Tessellate():
                 f.write("\n")
 
         
-    def _reset_logs(self,make_cube,make_cuts,reduce,calibrate,search,plot):
+    def _reset_logs(self,make_cube,make_cuts,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot):
         """
         Reset slurm job logs in provided output path.
         """
@@ -1660,8 +2094,12 @@ class Tessellate():
                 os.system(f'rm -f {self.job_output_path}/tessellate_cubing_logs/*')
             if make_cuts:
                 os.system(f'rm -f {self.job_output_path}/tessellate_cutting_logs/*')
+            if predict_asteroids:
+                os.system(f'rm -f {self.job_output_path}/tessellate_asteroid_prediction_logs/*')
             if reduce:
                 os.system(f'rm -f {self.job_output_path}/tessellate_reduction_logs/*')
+            if asteroid_lightcurves:
+                os.system(f'rm -f {self.job_output_path}/tessellate_asteroid_lightcurves_logs/*')
             if calibrate:
                 os.system(f'rm -f {self.job_output_path}/tessellate_calibration_logs/*')
             if search:
@@ -1852,9 +2290,8 @@ with open(f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/cubed.txt', '
 #SBATCH --mem-per-cpu={self.cube_mem}G\n\
 #SBATCH --account=oz335\n\
 \n\
-PYTHONUNBUFFERED=1\n\
-source {VENV_PATH}/bin/activate\n\
-python {self.working_path}/cubing_scripts/S{self.sector}C{cam}C{ccd}_script.py'
+export PYTHONUNBUFFERED=1\n\
+{sys.executable} {self.working_path}/cubing_scripts/S{self.sector}C{cam}C{ccd}_script.py'
             
             with open(f"{self.working_path}/cubing_scripts/S{self.sector}C{cam}C{ccd}_script.sh", "w") as batch_file:
                 batch_file.write(batch_text)
@@ -2187,9 +2624,8 @@ if not part:\n\
 #SBATCH --mem-per-cpu={self.cut_mem}G\n\
 #SBATCH --account=oz335\n\
 \n\
-PYTHONUNBUFFERED=1\n\
-source {VENV_PATH}/bin/activate\n\
-python {self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
+export PYTHONUNBUFFERED=1\n\
+{sys.executable} {self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
                         with open(f"{self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
                             batch_file.write(batch_text)
@@ -2211,6 +2647,99 @@ python {self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_scri
                     print('Restarting Cutting')
                     print('\n')
                     self.make_cuts(overwrite=False)
+
+    def predict_asteroids(self,overwrite=True):
+        """
+        Predict Asteroids!
+
+        Predicts every catalogued minor planet (MPCORB) crossing each cut's
+        footprint across its observing window -- runs ahead of reduce(),
+        needing only the cut's sky footprint and frame times (both already
+        available once make_cuts() has produced the cut's TPF).
+
+        Returns a prediction_status dict (mirroring reduce()'s
+        reduction_status) so asteroid_lightcurves() can wait for these
+        jobs to actually finish before running, the same way
+        calibrate() waits on reduction_status -- otherwise a lightcurves
+        job can start (and silently skip, "run predict_asteroids first!")
+        before its cut's prediction has actually written the ephemeris
+        it depends on.
+        """
+
+        _Save_space(f'{self.working_path}/asteroid_prediction_scripts')
+
+        if overwrite & (self.overwrite is not None):
+            if (self.overwrite == 'all') | ('asteroids' in self.overwrite):
+                delete_files('asteroids',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts,part=self.part)
+
+        prediction_status = {}
+        for cam in self.cam:
+            for ccd in self.ccd:
+                print(_Print_buff(60,f'Predicting Asteroids for Sector{self.sector} Cam{cam} Ccd{ccd}'))
+                print('\n')
+
+                for cut in self.cuts:
+                    prediction_status[(cam, ccd, cut)] = {'status': None, 'job_id': None, 'job_time': None}
+                    if self.part:
+                        asteroids_check1 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part1/Cut{cut}of{self.n**2}/asteroids.txt'
+                        asteroids_check2 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part2/Cut{cut}of{self.n**2}/asteroids.txt'
+                        done = (os.path.exists(asteroids_check1)) & (os.path.exists(asteroids_check2))
+                    else:
+                        asteroids_check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/asteroids.txt'
+                        done = os.path.exists(asteroids_check)
+
+                    if done:
+                        print(f'Cam {cam} CCD {ccd} cut {cut} asteroids already predicted!')
+                        print('\n')
+                        prediction_status[(cam, ccd, cut)]['status'] = 'COMPLETED'
+                    else:
+                        job_id = self._cut_predict_asteroids(cam=cam,ccd=ccd,cut=cut)
+                        prediction_status[(cam, ccd, cut)]['status'] = 'INCOMPLETE'
+                        prediction_status[(cam, ccd, cut)]['job_id'] = job_id
+                        prediction_status[(cam, ccd, cut)]['job_time'] = self.predict_asteroids_time
+
+        return prediction_status
+
+    def _cut_predict_asteroids(self,cam,ccd,cut,time=None):
+
+        # -- Create python file for predicting asteroids on a cut -- #
+        print(f'Creating Asteroid Prediction Python File for Sector{self.sector} Cam{cam} Ccd{ccd} Cut{cut}')
+        python_text = f"\
+from tessellate import DataProcessor\n\
+\n\
+part = {self.part}\n\
+processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=2)\n\
+processor.predict_asteroids(cam={cam},ccd={ccd},n={self.n},cut={cut},part=part)"
+
+        with open(f"{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py", "w") as python_file:
+            python_file.write(python_text)
+
+        # -- Create bash file to submit job -- #
+        #print('Creating Asteroid Prediction Batch File')
+        batch_text = f'\
+#!/bin/bash\n\
+#\n\
+#SBATCH --job-name=TESS_S{self.sector}_Cam{cam}_Ccd{ccd}_Cut{cut}_PredictAsteroids\n\
+#SBATCH --output={self.job_output_path}/tessellate_asteroid_prediction_logs/%A_%x_job_output.txt\n\
+#SBATCH --error={self.job_output_path}/tessellate_asteroid_prediction_logs/%A_%x_errors.txt\n\
+#\n\
+#SBATCH --ntasks=1\n\
+#SBATCH --time={self.predict_asteroids_time if time is None else time}\n\
+#SBATCH --cpus-per-task={self.predict_asteroids_cpu}\n\
+#SBATCH --mem-per-cpu={self.predict_asteroids_mem}G\n\
+#SBATCH --account=oz335\n\
+\n\
+export PYTHONUNBUFFERED=1\n\
+{sys.executable} {self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
+
+        with open(f"{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
+            batch_file.write(batch_text)
+
+        job_id = _Submit_sbatch(f'{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh')
+        print(f'Submitted batch job {job_id}')
+        print('\n')
+
+        return job_id
 
     def _cut_reduce(self,cam,ccd,cut,time=None):
 
@@ -2248,9 +2777,8 @@ if not part:\n\
 #SBATCH --mem-per-cpu={self.reduce_mem}G\n\
 #SBATCH --account=oz335\n\
 \n\
-PYTHONUNBUFFERED=1\n\
-source {VENV_PATH}/bin/activate\n\
-python {self.working_path}/reduction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
+export PYTHONUNBUFFERED=1\n\
+{sys.executable} {self.working_path}/reduction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
         with open(f"{self.working_path}/reduction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
             batch_file.write(batch_text)
@@ -2332,6 +2860,205 @@ python {self.working_path}/reduction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_sc
                     
         return reduction_status
 
+    def asteroid_lightcurves(self, prediction_status, overwrite=True):
+        """
+        Build Asteroid Lightcurves!
+
+        Forced aperture + PSF photometry, pixel-phase detrending, star-
+        contamination flagging, and shift-and-stack for every asteroid
+        predict_asteroids() found crossing each cut, using the REDUCED
+        flux cube -- runs after reduce(). Waits for predict_asteroids()'s
+        own jobs to actually finish (via prediction_status, its returned
+        status dict) before submitting a cut's lightcurves job, the same
+        way calibrate() waits on reduction_status. Pass prediction_status
+        =False to skip waiting entirely (predictions already exist / are
+        being managed separately).
+        """
+
+        from datetime import timedelta
+
+        _Save_space(f'{self.working_path}/asteroid_lightcurves_scripts')
+
+        if overwrite & (self.overwrite is not None):
+            if (self.overwrite == 'all') | ('lightcurves' in self.overwrite):
+                delete_files('asteroid_lightcurves',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts,part=self.part)
+
+        lightcurve_status = {}
+        for cam in self.cam:
+            for ccd in self.ccd:
+                print(_Print_buff(60,f'Building Asteroid Lightcurves for Sector{self.sector} Cam{cam} Ccd{ccd}'))
+                print('\n')
+
+                for cut in self.cuts:
+                    if self.part:
+                        check1 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part1/Cut{cut}of{self.n**2}/asteroid_lightcurves.txt'
+                        check2 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part2/Cut{cut}of{self.n**2}/asteroid_lightcurves.txt'
+                        done = (os.path.exists(check1)) & (os.path.exists(check2))
+                    else:
+                        check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/asteroid_lightcurves.txt'
+                        done = os.path.exists(check)
+
+                    if done:
+                        print(f'Cam {cam} CCD {ccd} cut {cut} asteroid lightcurves already built!')
+                        print('\n')
+                    else:
+                        lightcurve_status[(cam, ccd, cut)] = 'INCOMPLETE'
+
+        i = 0
+        while len(lightcurve_status.keys()) > 0:
+
+            for key in list(lightcurve_status.keys()):
+                cam, ccd, cut = key
+                if prediction_status == False or prediction_status[key]['status'] == 'COMPLETED':
+                    self._cut_asteroid_lightcurves(cam=cam,ccd=ccd,cut=cut)
+                    del(lightcurve_status[key])
+
+                else:
+                    job_id = prediction_status[key]['job_id']
+                    job_status = _Check_job_status(job_id)
+                    if job_status == 'FAILED':
+                        print(f'Asteroid Prediction Failed for Cam {cam} CCD {ccd} Cut {cut}')
+                        print('\n')
+                        del(lightcurve_status[key])
+                    elif job_status == 'TIMEOUT':
+                        parts = list(map(int, prediction_status[key]['job_time'].split(':')))
+                        if len(parts) == 3:
+                            h, m, s = parts
+                        else:
+                            h = 0
+                            m, s = parts
+
+                        td = timedelta(hours=h, minutes=m, seconds=s)
+                        td += timedelta(minutes=30) # add 30 minutes to the job time
+                        total = int(td.total_seconds())
+                        h = total // 3600
+                        m = (total % 3600) // 60
+                        s = total % 60
+                        result = f"{h}:{m:02}:{s:02}"
+
+                        print(f'Restarting Asteroid Prediction for Cam {cam} CCD {ccd} Cut {cut} with new time limit of {result}')
+                        job_id = self._cut_predict_asteroids(cam=cam,ccd=ccd,cut=cut,time=result)
+                        prediction_status[key]['job_id'] = job_id
+                        prediction_status[key]['job_time'] = result
+
+                    elif job_status == 'COMPLETED':
+                        prediction_status[key]['status'] = job_status
+
+                    elif job_status == 'UNKNOWN':
+                        # _Check_job_status already retries internally -- a residual UNKNOWN
+                        # here is rare but not worth crashing the whole driver over (one bad
+                        # cut shouldn't take down every other cut's already-submitted jobs);
+                        # just keep polling, same as PENDING/RUNNING
+                        pass
+
+                    elif job_status not in ['RUNNING','PENDING','COMPLETING','CONFIGURING','SUSPENDED']:
+                        e = f'Job {job_id} for asteroid prediction of Cam {cam} CCD {ccd} Cut {cut} has unexpected status: {job_status}\n'
+                        raise ValueError(e)
+
+            if prediction_status != False and len(lightcurve_status.keys()) > 0:
+                print('Waiting for Asteroid Predictions' + i*'.', end='\r')
+                sleep(120)
+                i += 1
+
+    # Final calibration, refit against the full completed Sector 32 run under the current code
+    # (parallel forced photometry + KDTree-based flag_star_contamination) -- 50 completed jobs
+    # spanning 51-563 tracks, isolated from the same sector's earlier (parallel-but-pre-KDTree
+    # -fix) completions by their peak memory alone (<20GB vs. 55-130GB -- the two code
+    # generations are that cleanly separated). Least-squares: time slope=1.489 s/track,
+    # intercept=65.7s (residual std 42.6s); mem slope=-0.012 GB/track, intercept=11.9GB
+    # (residual std 3.8GB) -- memory is genuinely flat with track count now, confirming
+    # flag_star_contamination's old matrix was the real per-track cost, not anything else.
+    # Constants below verified to give >=1.18x (mem) / >=1.30x (time) margin against every one
+    # of the 50 real data points individually, not just the fitted line
+    # Bumped from 2.0/200 after a real northern-ecliptic (Cycle 4, TESS sector 44) cut with
+    # ~440 tracks timed out at the 2.0 s/track scaling's own 18-minute estimate -- the fit
+    # above was against southern-sector (Cycle 3) data, which rarely exceeds ~35 tracks/cut;
+    # northern cuts commonly run 300-400+ tracks/cut (an order of magnitude denser), a regime
+    # the original fit never sampled and its claimed 1.30x margin doesn't safely extrapolate
+    # into. No real data yet to refit the northern-regime slope, so this is a conservative
+    # multiplier (2.5x time, matching floor bump) pending enough completed northern jobs to
+    # refit properly -- revisit once that data exists.
+    _LIGHTCURVES_TIME_PER_TRACK_S = 5.0
+    _LIGHTCURVES_TIME_FLOOR_S = 300
+    _LIGHTCURVES_MEM_PER_TRACK_GB = 0.01
+    _LIGHTCURVES_MEM_FLOOR_GB = 22
+
+    def _lightcurves_resources_for_cut(self,cam,ccd,cut):
+        """Size asteroid_lightcurves' time/mem request from this cut's actual predicted track
+        count, read from predict_asteroids' own already-completed output (available by the
+        time this is called, since asteroid_lightcurves() only submits a cut's job once its
+        prediction_status shows COMPLETED) -- rather than using one static, sector-wide guess
+        for every cut regardless of how crowded it is (real per-cut track counts can vary by
+        an order of magnitude or more within a single sector; density depends on ecliptic
+        latitude). Falls back to the plain suggested time/cpu/mem if the ephemeris can't be
+        read for any reason (e.g. genuinely zero tracks, or an unexpected layout)."""
+        from .tools import load_table, table_exists
+
+        base_time, cpu, base_mem = self.asteroid_lightcurves_time, self.asteroid_lightcurves_cpu, self.asteroid_lightcurves_mem
+        try:
+            cutFolder = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}'
+            base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{self.n**2}'
+            path = f'{cutFolder}/asteroids/{base}_Asteroids.csv'
+            if not table_exists(path):
+                return base_time, cpu, base_mem
+            n_tracks = load_table(path)['designation'].nunique()
+        except Exception:
+            return base_time, cpu, base_mem
+
+        total = int(self._LIGHTCURVES_TIME_PER_TRACK_S * n_tracks + self._LIGHTCURVES_TIME_FLOOR_S)
+        scaled_time = f"{total // 3600}:{(total % 3600) // 60:02}:{total % 60:02}"
+        # _LIGHTCURVES_MEM_PER_TRACK_GB/_FLOOR_GB were fit against each job's TOTAL peak memory
+        # (job reports show peak/total, e.g. "57.9 GB peak / 176 GB"), but the SBATCH template
+        # uses this return value directly as --mem-per-cpu, not divided by cpu count -- caught
+        # after a real relaunch got "Max memory per core exceeded" sbatch errors on every dense
+        # cut (e.g. 105GB total requested *per core* across 8 cores instead of ~13GB/core)
+        total_mem = self._LIGHTCURVES_MEM_PER_TRACK_GB * n_tracks + self._LIGHTCURVES_MEM_FLOOR_GB
+        scaled_mem = int(np.ceil(total_mem / cpu))
+
+        return scaled_time, cpu, scaled_mem
+
+    def _cut_asteroid_lightcurves(self,cam,ccd,cut):
+
+        time, cpu, mem = self._lightcurves_resources_for_cut(cam,ccd,cut)
+
+        # -- Create python file for building asteroid lightcurves on a cut -- #
+        print(f'Creating Asteroid Lightcurves Python File for Sector{self.sector} Cam{cam} Ccd{ccd} Cut{cut}')
+        python_text = f"\
+from tessellate import DataProcessor\n\
+\n\
+part = {self.part}\n\
+processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=2)\n\
+processor.asteroid_lightcurves(cam={cam},ccd={ccd},n={self.n},cut={cut},part=part)"
+
+        with open(f"{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py", "w") as python_file:
+            python_file.write(python_text)
+
+        # -- Create bash file to submit job -- #
+        #print('Creating Asteroid Lightcurves Batch File')
+        batch_text = f'\
+#!/bin/bash\n\
+#\n\
+#SBATCH --job-name=TESS_S{self.sector}_Cam{cam}_Ccd{ccd}_Cut{cut}_AsteroidLightcurves\n\
+#SBATCH --output={self.job_output_path}/tessellate_asteroid_lightcurves_logs/%A_%x_job_output.txt\n\
+#SBATCH --error={self.job_output_path}/tessellate_asteroid_lightcurves_logs/%A_%x_errors.txt\n\
+#\n\
+#SBATCH --ntasks=1\n\
+#SBATCH --time={time}\n\
+#SBATCH --cpus-per-task={cpu}\n\
+#SBATCH --mem-per-cpu={mem}G\n\
+#SBATCH --account=oz335\n\
+\n\
+export PYTHONUNBUFFERED=1\n\
+{sys.executable} {self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
+
+        with open(f"{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
+            batch_file.write(batch_text)
+
+        #print('Submitting Asteroid Lightcurves Batch File')
+        job_id = _Submit_sbatch(f'{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh')
+        print(f'Submitted batch job {job_id}')
+        print('\n')
+
     def _cut_calibrate(self, cam, ccd, cut):
 
         import subprocess
@@ -2407,9 +3134,8 @@ with open(f'{{cal_folder}}/calibrated.txt', 'w') as file:\n\
 #SBATCH --mem-per-cpu={self.calibrate_mem}G\n\
 #SBATCH --account=oz335\n\
 \n\
-PYTHONUNBUFFERED=1\n\
-source {VENV_PATH}/bin/activate\n\
-python {script_py}'
+export PYTHONUNBUFFERED=1\n\
+{sys.executable} {script_py}'
 
         with open(script_sh, 'w') as f:
             f.write(batch_text)
@@ -2598,9 +3324,8 @@ else:\n\
 #SBATCH --mem-per-cpu={self.search_mem}G\n\
 #SBATCH --account=oz335\n\
 \n\
-PYTHONUNBUFFERED=1\n\
-source {VENV_PATH}/bin/activate\n\
-python {self.working_path}/detection_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
+export PYTHONUNBUFFERED=1\n\
+{sys.executable} {self.working_path}/detection_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
         with open(f"{self.working_path}/detection_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
             batch_file.write(batch_text)
@@ -2894,9 +3619,8 @@ else:\n\
 #SBATCH --mem-per-cpu={self.plot_mem}G\n\
 #SBATCH --account=oz335\n\
 \n\
-PYTHONUNBUFFERED=1\n\
-source {VENV_PATH}/bin/activate\n\
-python {self.working_path}/plotting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
+export PYTHONUNBUFFERED=1\n\
+{sys.executable} {self.working_path}/plotting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
 
         with open(f"{self.working_path}/plotting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
             batch_file.write(batch_text)

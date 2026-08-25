@@ -13,7 +13,14 @@ REQUIRED = ['astrocut @ git+https://github.com/CheerfulUser/astrocut.git',
             'shapely',
             'mastcasjobs',
             'astro-datalab',
-            'duckdb'
+            'duckdb',
+            'pyarrow',
+            'scipy',
+            'requests',
+            'skyfield',
+            'spiceypy',
+            'rebound',
+            'assist',
             ]
 
 

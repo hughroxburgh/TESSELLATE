@@ -7,7 +7,7 @@ import warnings
 warnings.filterwarnings("ignore")
 warnings.filterwarnings("ignore", category=RuntimeWarning) 
 
-from .tools import RoundToInt
+from .tools import RoundToInt, load_table, table_exists
 
 
 # ----------------------------------------------------------------------------------------------------------------------------- #
@@ -95,15 +95,15 @@ def _Negative_pixel_extent(data_sub, sources, r=2.0):
     return np.maximum(0.0, -min_vals) / std
 
 def _TESS_sourcefinder(image, frame_number, thresh = 0.3, bw=24,fwhm_min=0.7,fwhm_max=2.0, n_scales=10,deblend_nthresh=128,
-                       deblend_cont= 5e-5,dedup_radius= 1.0):#,boundary_buffer= 2.0,boundary_near= 5.0):
-    
+                       deblend_cont= 5e-5,dedup_radius= 1.0,flux_signs=(-1,1)):#,boundary_buffer= 2.0,boundary_near= 5.0):
+
     import sep
-    
+
     fwhms = np.linspace(fwhm_min, fwhm_max, n_scales)
     kernels = [_Mexhat_kernels(f) for f in fwhms]
 
     allsources = pd.DataFrame()
-    for flux_sign in [-1,1]:
+    for flux_sign in flux_signs:
         data = np.asarray(image*flux_sign, dtype=np.float32)
         bkg = sep.Background(data, bw=bw, bh=bw)
         data_sub = data - bkg.back()
@@ -1224,14 +1224,14 @@ class Detector():
         self.objects = None
         path = f'{self.path}/Cut{cut}of{self.n**2}/{self._inj_path}'
 
-        if os.path.exists(f'{path}/detected_sources.csv'):
-            self.sources = pd.read_csv(f'{path}/detected_sources.csv')    # raw detection results
+        if table_exists(f'{path}/detected_sources.csv'):
+            self.sources = load_table(f'{path}/detected_sources.csv')    # raw detection results
         else:
             print('No detected sources file found',flush=True)
             self.sources = None
 
-        if os.path.exists(f'{path}/detected_events.csv'):
-            self.events = pd.read_csv(f'{path}/detected_events.csv')    # raw detection results
+        if table_exists(f'{path}/detected_events.csv'):
+            self.events = load_table(f'{path}/detected_events.csv')    # raw detection results
         else:
             print('No detected events file found',flush=True)
             self.events = None
@@ -1689,6 +1689,72 @@ class Detector():
 
         self.events = evs
 
+    def _flag_known_asteroids(self):
+        """
+        Cross-match detected sources against this cut's predicted asteroid
+        ephemeris (predict_asteroids(), from asteroid_prediction.py), if
+        one exists -- grounds classification in a real, orbit-propagated
+        identity rather than only the drift-shape heuristic _flag_asteroids
+        uses. A no-op (skipped) if predict_asteroids hasn't been run for
+        this cut, so this stays optional rather than a hard dependency.
+
+        Simple closest-approach proximity match (identify_known_asteroids),
+        not a motion/offset fit: TESSELLATE's own per-frame detected
+        centroids aren't reliable enough for a multi-frame residual check
+        to be trustworthy, so a single closest-approach distance is used
+        instead. The predicted-vs-measured offset applied before that
+        check is loaded from asteroid_lightcurves()'s precomputed
+        shift-and-stack centroid measurement (_AsteroidCutOffset, far more
+        precise than anything derivable from the detected centroids here)
+        when available, falling back to identify_known_asteroids' own
+        detected-position pooling otherwise.
+
+        Matched events are upgraded to classification='Asteroid' even if
+        _flag_asteroids' drift heuristic missed them (a real orbital match
+        is stronger evidence than centroid-drift shape alone); asteroid_id
+        (Tag_Asteroids' internal integer track group) is left untouched --
+        the real MPC designation goes in new known_asteroid_* columns
+        instead, so downstream code relying on asteroid_id being an int
+        keeps working unchanged.
+        """
+        from .tools import load_table, table_exists
+        from .asteroid_photometry import identify_known_asteroids
+
+        ephemeris_path = f'{self.path}/Cut{self.cut}of{self.n**2}/asteroids/sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{self.cut}_of{self.n**2}_Asteroids.csv'
+        if not table_exists(ephemeris_path) or self.sources is None or len(self.sources) == 0:
+            self.events['known_asteroid_designation'] = None
+            self.events['known_asteroid_dist_px'] = np.nan
+            self.events['known_asteroid_frame'] = None
+            return
+
+        ephemeris = load_table(ephemeris_path)
+        if len(ephemeris) == 0:
+            self.events['known_asteroid_designation'] = None
+            self.events['known_asteroid_dist_px'] = np.nan
+            self.events['known_asteroid_frame'] = None
+            return
+
+        offset_path = f'{self.path}/Cut{self.cut}of{self.n**2}/asteroids/sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{self.cut}_of{self.n**2}_AsteroidCutOffset.csv'
+        offset_x = offset_y = None
+        if table_exists(offset_path):
+            offset_row = load_table(offset_path)
+            if len(offset_row):
+                offset_x = offset_row['offset_x'].iloc[0]
+                offset_y = offset_row['offset_y'].iloc[0]
+
+        matches = identify_known_asteroids(self.sources, ephemeris, offset_x=offset_x, offset_y=offset_y)
+        matches = matches.rename(columns={
+            'designation': 'known_asteroid_designation',
+            'dist_px': 'known_asteroid_dist_px',
+            'frame': 'known_asteroid_frame'})[
+            ['objid','known_asteroid_designation','known_asteroid_dist_px',
+             'known_asteroid_frame','matched_known_asteroid']]
+
+        self.events = self.events.merge(matches,on='objid',how='left')
+        matched = self.events['matched_known_asteroid'].fillna(False)
+        self.events.loc[matched,'classification'] = 'Asteroid'
+        self.events = self.events.drop(columns=['matched_known_asteroid'])
+
     def _catalogue_crossmatch(self,sigma=3):
         """
         Crossmatch events with stars / variables.
@@ -2044,7 +2110,8 @@ class Detector():
             # 'peak_freq', 'peak_power',
 
             # Secondary Identification
-            'source_mask', 'gaia_id', 'crossbin_ids','asteroid_id', # 'prob', 'GaaID', 'cf_class', 'cf_prob', 
+            'source_mask', 'gaia_id', 'crossbin_ids','asteroid_id', # 'prob', 'GaaID', 'cf_class', 'cf_prob',
+            'known_asteroid_designation','known_asteroid_dist_px','known_asteroid_frame',
 
             # Miscellaneous
             'n_detections','total_events','frame_bin', 'TSS Catalogue'
@@ -2100,6 +2167,11 @@ class Detector():
         self._flag_asteroids()
         print(f'   Checking for asteroids -- done! ({(clock()-ts):.0f}s)',flush=True)
 
+        # -- Cross-match against predicted (orbit-propagated) asteroids, if available -- #
+        ts = clock()
+        self._flag_known_asteroids()
+        print(f'   Checking against predicted asteroids -- done! ({(clock()-ts):.0f}s)',flush=True)
+
         self.events = self.events.drop_duplicates(subset=['frame_bin','xint','yint','frame_max'],keep='first')
 
         # -- Crossmatch with catalogues -- #
@@ -2140,7 +2212,8 @@ class Detector():
             'lc_sig_max', 'flux_maxsig', 'frame_maxsig',
             'mjd_maxsig','psf_maxsig','flux_sign', 'n_events',
             'min_eventlength_frame', 'max_eventlength_frame',
-            'min_eventlength_mjd','max_eventlength_mjd','gaia_id','classification','TSS Catalogue'
+            'min_eventlength_mjd','max_eventlength_mjd','gaia_id','classification','TSS Catalogue',
+            'known_asteroid_designation','known_asteroid_dist_px','known_asteroid_frame'
         ]
         objects = pd.DataFrame(columns=columns)
 
@@ -2192,6 +2265,9 @@ class Detector():
                 'flux_sign': np.sum(obj['flux_sign'].unique()).astype(int),
                 'n_events': len(obj),
                 'TSS Catalogue' : maxevent['TSS Catalogue'],
+                'known_asteroid_designation': maxevent.get('known_asteroid_designation'),
+                'known_asteroid_dist_px': maxevent.get('known_asteroid_dist_px'),
+                'known_asteroid_frame': maxevent.get('known_asteroid_frame'),
             }
 
             obj_row = pd.DataFrame([row_data])

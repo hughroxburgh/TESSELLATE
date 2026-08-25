@@ -1,10 +1,51 @@
 import numpy as np
 import os
+import pandas as pd
 
 fig_width_pt = 240.0  # Get this from LaTeX using \showthe\columnwidth
 inches_per_pt = 1.0/72.27			   # Convert pt to inches
 golden_mean = (np.sqrt(5)-1.0)/2.0		 # Aesthetic ratio
 fig_width = fig_width_pt*inches_per_pt  # width in inches
+
+def save_compact_array(path,arr):
+    """
+    Save an ndarray with np.save, downcasting float64 to float32 first.
+    Reduces on-disk size for large reduction products (flux/background cubes)
+    with no precision loss that matters for photometry. Non-float64 arrays
+    (bool masks, int arrays, existing float32) pass through unchanged.
+    """
+    arr = np.asarray(arr)
+    if arr.dtype == np.float64:
+        arr = arr.astype(np.float32)
+    np.save(path,arr)
+
+def save_table(df,path):
+    """
+    Save a DataFrame as Parquet instead of CSV to reduce on-disk size.
+    `path` should be the '.csv' path used historically by callers; the file
+    is actually written alongside it with a '.parquet' extension.
+    """
+    parquet_path = path[:-4]+'.parquet' if path.endswith('.csv') else path+'.parquet'
+    df.to_parquet(parquet_path,index=False)
+
+def load_table(path):
+    """
+    Load a DataFrame saved with save_table. Looks for the Parquet file first,
+    falling back to the legacy '.csv' path so pre-existing outputs on disk
+    remain readable without needing to be regenerated.
+    """
+    parquet_path = path[:-4]+'.parquet' if path.endswith('.csv') else path
+    if os.path.exists(parquet_path):
+        return pd.read_parquet(parquet_path)
+    return pd.read_csv(path)
+
+def table_exists(path):
+    """
+    True if a table saved with save_table exists, checking both the
+    '.parquet' path and the legacy '.csv' path.
+    """
+    parquet_path = path[:-4]+'.parquet' if path.endswith('.csv') else path
+    return os.path.exists(parquet_path) or os.path.exists(path)
 
 def _Save_space(Save,delete=False):
     """
@@ -68,6 +109,28 @@ def _Check_dirs(save_path):
         except:
             pass
 
+def _Submit_sbatch(script_path, retries=5, delay=3):
+    """Submit a SLURM batch script via sbatch, retrying on transient submission
+    failures instead of silently dropping the job or crashing on an empty/
+    malformed sbatch response -- at the scale of tens of thousands of
+    submissions across many sectors, an occasional busy-slurmctld hiccup is
+    expected and shouldn't take down the whole driver run. Returns the job id
+    as a string, or raises RuntimeError if every attempt fails.
+    """
+    import subprocess
+    from time import sleep as _sleep
+
+    last_err = None
+    for attempt in range(retries):
+        result = subprocess.run(f'sbatch {script_path}', shell=True, capture_output=True, text=True)
+        parts = result.stdout.strip().split()
+        if parts and parts[-1].isdigit():
+            return parts[-1]
+        last_err = result.stderr.strip() or result.stdout.strip() or '(no output)'
+        _sleep(delay)
+    raise RuntimeError(f'sbatch failed after {retries} attempts for {script_path}: {last_err}')
+
+
 def _Check_job_status(job_id):
     """
     Returns one of: PENDING, RUNNING, COMPLETED, FAILED, CANCELLED, UNKNOWN
@@ -75,6 +138,7 @@ def _Check_job_status(job_id):
     """
 
     import subprocess
+    from time import sleep as _sleep
 
     # squeue only shows active/queued jobs
     sq = subprocess.run(
@@ -86,14 +150,19 @@ def _Check_job_status(job_id):
     if state:  # Job is still in the queue
         return state  # e.g. PENDING, RUNNING, COMPLETING
 
-    # Job has left the queue — check sacct for final state
-    sa = subprocess.run(
-        f'sacct -j {job_id} -o State -n -X',
-        shell=True, capture_output=True, text=True
-    )
-    state = sa.stdout.strip().split()[0] if sa.stdout.strip() else 'UNKNOWN'
-    # sacct states can be e.g. COMPLETED, FAILED, CANCELLED, TIMEOUT, OUT_OF_MEMORY
-    return state
+    # Job has left the queue -- check sacct for final state. A job that just left
+    # squeue can briefly be invisible to sacct too (accounting propagation lag),
+    # which would otherwise look identical to a genuinely unknown/bad job id and
+    # crash the caller -- retry a few times before conceding UNKNOWN.
+    for attempt in range(5):
+        sa = subprocess.run(
+            f'sacct -j {job_id} -o State -n -X',
+            shell=True, capture_output=True, text=True
+        )
+        if sa.stdout.strip():
+            return sa.stdout.strip().split()[0]
+        _sleep(3)
+    return 'UNKNOWN'
 
 
 def _remove_ffis(data_path,sector,n,cams,ccds,cuts,part):
@@ -141,6 +210,32 @@ def _remove_cuts(data_path,sector,n,cams,ccds,cuts,part):
                 else:
                     os.system(f'rm -r -f {data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
 
+def _remove_asteroids(data_path,sector,n,cams,ccds,cuts,part):
+
+    home_path = os.getcwd()
+    for cam in cams:
+        for ccd in ccds:
+            for cut in cuts:
+                if part:
+                    for i in range(1,3):
+                        try:
+                            os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Part{i}/Cut{cut}of{n**2}')
+                            os.system(f'rm -f asteroids/*_Asteroids.parquet')
+                            os.system(f'rm -f asteroids/*_AsteroidTrails.png')
+                            os.system(f'rm -f asteroids.txt')
+                        except:
+                            pass
+                else:
+                    try:
+                        os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
+                        os.system(f'rm -f asteroids/*_Asteroids.parquet')
+                        os.system(f'rm -f asteroids/*_AsteroidTrails.png')
+                        os.system(f'rm -f asteroids.txt')
+                    except:
+                        pass
+
+    os.chdir(home_path)
+
 def _remove_reductions(data_path,sector,n,cams,ccds,cuts,part):
 
     home_path = os.getcwd()
@@ -172,6 +267,38 @@ def _remove_reductions(data_path,sector,n,cams,ccds,cuts,part):
                         os.system('rm -f lcs.zip')  
                     except:
                         pass   
+
+    os.chdir(home_path)
+
+def _remove_asteroid_lightcurves(data_path,sector,n,cams,ccds,cuts,part):
+
+    home_path = os.getcwd()
+    for cam in cams:
+        for ccd in ccds:
+            for cut in cuts:
+                if part:
+                    for i in range(1,3):
+                        try:
+                            os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Part{i}/Cut{cut}of{n**2}')
+                            os.system(f'rm -f asteroids/*_AsteroidAperturePhotometry.parquet')
+                            os.system(f'rm -f asteroids/*_AsteroidPSFPhotometry.parquet')
+                            os.system(f'rm -f asteroids/*_AsteroidStackSummary.parquet')
+                            os.system(f'rm -f asteroids/*_AsteroidStackedPhotometry.parquet')
+                            os.system(f'rm -f asteroids/*_AsteroidCutOffset.parquet')
+                            os.system(f'rm -f asteroid_lightcurves.txt')
+                        except:
+                            pass
+                else:
+                    try:
+                        os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
+                        os.system(f'rm -f asteroids/*_AsteroidAperturePhotometry.parquet')
+                        os.system(f'rm -f asteroids/*_AsteroidPSFPhotometry.parquet')
+                        os.system(f'rm -f asteroids/*_AsteroidStackSummary.parquet')
+                        os.system(f'rm -f asteroids/*_AsteroidStackedPhotometry.parquet')
+                        os.system(f'rm -f asteroids/*_AsteroidCutOffset.parquet')
+                        os.system(f'rm -f asteroid_lightcurves.txt')
+                    except:
+                        pass
 
     os.chdir(home_path)
 
@@ -264,16 +391,18 @@ def delete_files(filetype,data_path,sector,n=4,cams='all',ccds='all',cuts='all',
     possibleFiles = {'ffis':_remove_ffis,
                         'cubes':_remove_cubes,
                         'cuts':_remove_cuts,
+                        'asteroids':_remove_asteroids,
                         'reductions':_remove_reductions,
+                        'asteroid_lightcurves':_remove_asteroid_lightcurves,
                         'calibrations':_remove_calibrations,
                         'search':_remove_search,
                         'plot':_remove_plots}
-    
+
     if filetype.lower() in possibleFiles.keys():
         function = possibleFiles[filetype.lower()]
         function(data_path,sector,n,cams,ccds,cuts,part)
     else:
-        e = 'Invalid filetype! Valid types: "ffis" , "cubes" , "cuts" , "reductions" , "calibrations" , "search", "plot". '
+        e = 'Invalid filetype! Valid types: "ffis" , "cubes" , "cuts" , "asteroids" , "reductions" , "asteroid_lightcurves" , "calibrations" , "search", "plot". '
         raise AttributeError(e)
     
     

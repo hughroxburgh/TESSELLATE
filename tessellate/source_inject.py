@@ -1530,7 +1530,7 @@ PYTHONUNBUFFERED=1\n\
         xmax = self.nav.time[(lc[0][-1]+frame_buffer).astype(int)]
 
         visible_cube = (self.nav.time >= xmin) & (self.nav.time <= xmax)
-        visible_lc = (lc[0] >= xmin) & (lc[0] <= xmax)
+        visible_lc = (self.nav.time[lc[0].astype(int)] >= xmin) & (self.nav.time[lc[0].astype(int)] <= xmax)
 
         y1_visible = cube_lc[visible_cube]
         y2_visible = lc[1][visible_lc]

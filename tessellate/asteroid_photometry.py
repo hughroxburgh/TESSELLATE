@@ -678,8 +678,27 @@ def measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0,
     Seeded from the flux-weighted centroid (cheap, and a robust fallback if
     the PRF search fails to find anything better) as the starting guess.
 
-    Returns (offset_x, offset_y, n_stamps) -- offset is NaN if fewer than
-    min_stamps frames had a usable in-bounds stamp."""
+    The same joint fit that finds the offset (template amplitude + flat
+    background, solved by linear least-squares at the best-fit position)
+    also yields a flux estimate and, from the fit residuals, its
+    uncertainty -- the identical error convention psf_flux_calibration's
+    _psf_lc_core uses (1.4826 * median absolute residual). That fitted
+    significance is returned alongside the offset, so a caller can decide
+    whether to trust THIS track's own offset without needing a separate
+    photometry pass to measure SNR first -- unlike a per-frame forced
+    photometry run, which this function never touches at all (only raw
+    cube stamps, extracted directly from the predicted ephemeris
+    positions).
+
+    Returns (offset_x, offset_y, sig, flux, n_stamps) -- offset/sig/flux
+    are NaN if fewer than min_stamps frames had a usable in-bounds stamp,
+    or if the stack has no usable signal at all. flux is the fitted PRF
+    template amplitude (raw counts) at the adopted offset when the PRF fit
+    ran, or the background-subtracted window flux sum as a cruder fallback
+    when it couldn't -- either way, the same quantity that sig is derived
+    from, so a caller can convert it to a magnitude (with a known
+    zeropoint) for a direct sanity check against the ephemeris's own
+    predicted mag_expected."""
     from scipy.ndimage import shift as ndshift
     from .psf_flux_calibration import PRF_PATH_DEFAULT, _get_prf
     prf_path = prf_path or PRF_PATH_DEFAULT
@@ -694,7 +713,7 @@ def measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0,
         stamps.append(ndshift(stamp, (-dy, -dx), order=1, mode="nearest"))
 
     if len(stamps) < min_stamps:
-        return np.nan, np.nan, len(stamps)
+        return np.nan, np.nan, np.nan, np.nan, len(stamps)
 
     # median, not mean -- a plain mean lets a handful of contaminated frames (cosmic rays,
     # background artifacts) among possibly hundreds bias the stacked image's apparent shape;
@@ -706,18 +725,26 @@ def measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0,
     # flux-weighted centroid in a small central window -- initial guess for the PRF
     # search below, and the fallback if that search can't be run/doesn't improve on it
     window = STACK_CENTROID_WINDOW
+    bg = np.median(stacked_mean)
     sub = stacked_mean[half - window:half + window + 1, half - window:half + window + 1]
     yy, xx = np.mgrid[half - window:half + window + 1, half - window:half + window + 1]
-    w = np.clip(sub - np.median(stacked_mean), 0, None)
+    w = np.clip(sub - bg, 0, None)
     if w.sum() <= 0:
-        return np.nan, np.nan, len(stamps)
+        return np.nan, np.nan, np.nan, np.nan, len(stamps)
     cx0 = (xx * w).sum() / w.sum() - half
     cy0 = (yy * w).sum() / w.sum() - half
+    # crude fallback significance/flux (no PRF shape assumed) -- used only if the PRF fit
+    # below can't run at all; a background-subtracted window sum over the robust
+    # pixel-to-pixel scatter, the same style of estimator _psf_lc_core uses for its own
+    # uncertainty
+    flux0 = float(w.sum())
+    noise = 1.4826 * np.median(np.abs(stacked_mean - bg))
+    sig0 = float(flux0 / (noise * np.sqrt(w.size))) if noise > 0 else np.nan
 
     data = stacked_mean.ravel()
     finite = np.isfinite(data)
     if finite.sum() < 3:
-        return cx0, cy0, len(stamps)
+        return cx0, cy0, sig0, flux0, len(stamps)
 
     try:
         last = track.iloc[-1]
@@ -725,26 +752,36 @@ def measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0,
         prf_dir = f'{prf_path}/Sectors4+' if sector >= 4 else f'{prf_path}/Sectors1_2_3'
         prf = _get_prf(cam, ccd, sector, ccd_x, ccd_y, prf_dir)
     except Exception as ex:
-        # falls back to the flux-weighted centroid, but silently -- a wrong prf_path or
+        # falls back to the flux-weighted centroid, but not silently -- a wrong prf_path or
         # any other PRF-loading failure would otherwise degrade to the old behaviour with
         # no visible sign anything was wrong (caught a real instance of exactly this during
         # development: a stale default prf_path made every single call fail this way)
         import warnings
         warnings.warn(f"measure_stack_centroid_offset: PRF unavailable ({ex!r}), "
                        f"falling back to flux-weighted centroid", RuntimeWarning)
-        return cx0, cy0, len(stamps)
+        return cx0, cy0, sig0, flux0, len(stamps)
 
-    def _residual(offset):
-        dx, dy = offset
+    def _fit_at(dx, dy):
+        """Joint [template amplitude, flat background] linear fit at one candidate
+        offset. Returns (sse, flux, e_flux) -- e_flux/flux are None if the template
+        itself is degenerate at this offset (kept out of the search via inf sse)."""
         template = prf.locate(half + dx, half + dy, (stamp_size, stamp_size))
         s = np.nansum(template)
         if not (np.isfinite(s) and s > 0):
-            return np.inf
+            return np.inf, None, None
         template = (template / s).ravel()[finite]
         A = np.column_stack([template, np.ones(finite.sum())])
         d = data[finite]
         coeffs, *_ = np.linalg.lstsq(A, d, rcond=None)
-        return float(np.sum((d - A @ coeffs) ** 2))
+        resid = d - A @ coeffs
+        sse = float(np.sum(resid ** 2))
+        sigma = 1.4826 * np.median(np.abs(resid - np.median(resid)))
+        try:
+            ATA_inv = np.linalg.inv(A.T @ A)
+            e_flux = sigma * np.sqrt(ATA_inv[0, 0])
+        except np.linalg.LinAlgError:
+            e_flux = np.nan
+        return sse, float(coeffs[0]), float(e_flux)
 
     from scipy.optimize import minimize
     # bounds=, not a manual np.inf wall outside the box -- an inf-return gives Nelder-Mead's
@@ -753,39 +790,70 @@ def measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0,
     # a genuine interior optimum. scipy's own bounds handling reflects/clips the simplex
     # properly instead.
     bounds = [(-search_radius_px, search_radius_px)] * 2
-    res = minimize(_residual, x0=[cx0, cy0], method="Nelder-Mead", bounds=bounds,
-                    options={"xatol": 0.01, "fatol": 1e-6})
-    if res.success and _residual(res.x) < _residual([cx0, cy0]):
-        return float(res.x[0]), float(res.x[1]), len(stamps)
-    return cx0, cy0, len(stamps)
+    res = minimize(lambda off: _fit_at(*off)[0], x0=[cx0, cy0], method="Nelder-Mead",
+                    bounds=bounds, options={"xatol": 0.01, "fatol": 1e-6})
+
+    sse_fit, flux_fit, e_flux_fit = _fit_at(*res.x)
+    sse_naive, flux_naive, e_flux_naive = _fit_at(cx0, cy0)
+    ox, oy, flux, e_flux = ((res.x[0], res.x[1], flux_fit, e_flux_fit) if res.success and sse_fit < sse_naive
+                            else (cx0, cy0, flux_naive, e_flux_naive))
+    # clamped at 0, not left negative -- the fitted amplitude can come out negative for a
+    # noise-dominated fit (no real signal, not "negatively significant"), and a negative sig
+    # is meaningless as a trust measure -- 0 is the correct floor, not a value to discard
+    sig = max(0.0, float(flux / e_flux)) if (e_flux is not None and np.isfinite(e_flux) and e_flux > 0) else sig0
+    return float(ox), float(oy), sig, float(flux), len(stamps)
 
 
-def pool_offset_from_stacks(psf_df, stack_summary, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=None,
+def pool_offset_from_stacks(ephemeris, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=None, zp_ab=None,
                               sig_threshold=STACK_CENTROID_SIG_THRESHOLD, min_tracks=2, **stamp_kwargs):
     """Robust per-cut (dx, dy) offset, pooled (median) from the individual
     shift-and-stack centroid offsets (measure_stack_centroid_offset) of
-    every track that reached at least sig_threshold -- these are the only
-    tracks whose position is measured precisely enough to trust
-    individually, unlike a single detected-source centroid. Falls back to
-    (nan, nan, 0) if fewer than min_tracks qualify, so callers can fall
-    back to a different estimate (e.g. asteroid_photometry.identify_known_asteroids's
-    own detected-source pooling) rather than trust too few points."""
-    clean = psf_df[~psf_df["near_bright_star"]]
-    offsets_x, offsets_y = [], []
-    for designation, track in clean.groupby("designation"):
-        row = stack_summary.loc[designation] if designation in stack_summary.index else None
-        achieved_sig = row["achieved_sig"] if row is not None else np.nan
-        if not np.isfinite(achieved_sig) or achieved_sig < sig_threshold:
-            continue
-        ox, oy, n_stamps = measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0,
-                                                            prf_path=prf_path, **stamp_kwargs)
-        if np.isfinite(ox):
-            offsets_x.append(ox)
-            offsets_y.append(oy)
+    every track that reaches at least sig_threshold in ITS OWN joint
+    position+flux fit -- these are the only tracks whose position is
+    measured precisely enough to trust individually, unlike a single
+    detected-source centroid.
 
-    if len(offsets_x) < min_tracks:
-        return np.nan, np.nan, len(offsets_x)
-    return float(np.median(offsets_x)), float(np.median(offsets_y)), len(offsets_x)
+    Operates directly on the predicted ephemeris (already matched to the
+    reduced cube's own frame list -- see match_ephemeris_to_reduced_frames),
+    not on any forced-photometry output: measure_stack_centroid_offset
+    works from raw cube stamps and returns its own fit's significance, so
+    no photometry needs to run before the offset can be measured (see
+    asteroid_lightcurves, which now runs forced photometry exactly once,
+    at the corrected position this returns, rather than once to find the
+    offset and again to apply it).
+
+    Falls back to (nan, nan, 0) if fewer than min_tracks qualify, so
+    callers can fall back to a different estimate (e.g.
+    asteroid_photometry.identify_known_asteroids's own detected-source
+    pooling) rather than trust too few points.
+
+    Also returns a per-track diagnostics DataFrame (every track evaluated,
+    not just the ones that qualified) with designation, offset_x, offset_y,
+    sig, flux, and n_stamps, plus mag/mag_err converted from flux via
+    zp_ab if a zeropoint is given (mag_err from the standard
+    1.0857/sig error-propagation relation -- exact given sig is flux/e_flux
+    by construction, no separate uncertainty needed) and a `used` flag
+    marking which tracks fed the pooled offset -- so the trust decision is
+    inspectable after the fact instead of only the final pooled number."""
+    rows = []
+    for designation, track in ephemeris.groupby("designation"):
+        ox, oy, sig, flux, n_stamps = measure_stack_centroid_offset(
+            track, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=prf_path, **stamp_kwargs)
+        used = bool(np.isfinite(ox) and np.isfinite(sig) and sig >= sig_threshold)
+        if zp_ab is not None and flux is not None and np.isfinite(flux) and flux > 0:
+            mag = -2.5 * np.log10(flux) + zp_ab
+        else:
+            mag = np.nan
+        mag_err = 1.0857 / sig if np.isfinite(sig) and sig > 0 else np.nan
+        rows.append(dict(designation=designation, offset_x=ox, offset_y=oy, sig=sig,
+                          flux=flux, mag=mag, mag_err=mag_err, n_stamps=n_stamps, used=used))
+    diagnostics = pd.DataFrame(rows)
+
+    used_offsets = diagnostics[diagnostics["used"]]
+    if len(used_offsets) < min_tracks:
+        return np.nan, np.nan, len(used_offsets), diagnostics
+    return (float(used_offsets["offset_x"].median()), float(used_offsets["offset_y"].median()),
+            len(used_offsets), diagnostics)
 
 
 # ---------------------------------------------------------------------------

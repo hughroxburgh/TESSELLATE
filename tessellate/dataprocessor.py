@@ -820,21 +820,30 @@ class DataProcessor():
             else:
                 stars = pd.DataFrame(columns=['x','y','mag'])
 
-            def _run_photometry(eph):
-                ap = forced_aperture_photometry(cube, eph)
+            def _run_photometry_psf(eph):
                 psf = forced_psf_photometry(cube, eph, self.sector, cam, ccd, cut_corner[0], cut_corner[1])
                 psf = detrend_pixel_phase(psf)
-                ap = flag_star_contamination(ap, stars, flux_col='flux')
                 psf = flag_star_contamination(psf, stars, flux_col='flux_detrended')
                 summary, stacked = stack_lightcurves(psf)
+                return psf, summary, stacked
+
+            def _run_photometry(eph):
+                ap = forced_aperture_photometry(cube, eph)
+                ap = flag_star_contamination(ap, stars, flux_col='flux')
+                psf, summary, stacked = _run_photometry_psf(eph)
                 return ap, psf, summary, stacked
 
             # first pass, at the raw predicted position -- needed to measure the predicted-vs-
             # measured offset itself (pool_offset_from_stacks, from the shift-and-stack image
             # centroid of every high-SNR track) in the first place, a chicken-and-egg the offset
-            # can only be measured from an initial round of forced photometry
-            aperture_df, psf_df, stack_summary, stacked_df = _run_photometry(ephemeris)
-            offset_x, offset_y, n_offset_tracks = pool_offset_from_stacks(psf_df, stack_summary, cube)
+            # can only be measured from an initial round of forced photometry. PSF-only: neither
+            # pool_offset_from_stacks nor stack_lightcurves ever reads aperture photometry (only
+            # psf_df/stack_summary), and this pass's own aperture_df would be fully discarded
+            # once pass 2 (or the fallback below) produces the one actually saved -- running it
+            # here was pure waste, confirmed via memray profiling on a real dense cut.
+            psf_df, stack_summary, stacked_df = _run_photometry_psf(ephemeris)
+            offset_x, offset_y, n_offset_tracks = pool_offset_from_stacks(
+                psf_df, stack_summary, cube, self.sector, cam, ccd, cut_corner[0], cut_corner[1])
 
             if np.isfinite(offset_x) and np.isfinite(offset_y):
                 # re-run at the corrected position for the actual saved photometry -- both the
@@ -848,6 +857,13 @@ class DataProcessor():
                 corrected_ephemeris['x'] += offset_x
                 corrected_ephemeris['y'] += offset_y
                 aperture_df, psf_df, stack_summary, stacked_df = _run_photometry(corrected_ephemeris)
+            else:
+                # too few high-SNR tracks to trust a measured offset (pool_offset_from_stacks'
+                # own min_tracks fallback) -- save at the uncorrected position instead. Pass 1
+                # above only ran PSF photometry, so aperture photometry hasn't run at all yet
+                # in this path; do it once here rather than in every pass.
+                aperture_df = forced_aperture_photometry(cube, ephemeris)
+                aperture_df = flag_star_contamination(aperture_df, stars, flux_col='flux')
 
             offset_df = pd.DataFrame([{'offset_x': offset_x, 'offset_y': offset_y,
                                         'n_tracks_used': n_offset_tracks}])

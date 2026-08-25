@@ -660,24 +660,34 @@ STACK_CENTROID_WINDOW = 2
 STACK_CENTROID_MIN_STAMPS = 5
 
 
-def measure_stack_centroid_offset(track, cube, half=STACK_CENTROID_STAMP_HALF,
-                                    window=STACK_CENTROID_WINDOW, min_stamps=STACK_CENTROID_MIN_STAMPS):
+def measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=None,
+                                    half=STACK_CENTROID_STAMP_HALF, min_stamps=STACK_CENTROID_MIN_STAMPS,
+                                    search_radius_px=2.0):
     """Predicted-vs-measured offset for one track, from its own shift-and-
-    stack image -- the same measurement validated by hand on (45124) 1999
-    XS88 and (77999) 2002 JD48. Every frame's stamp is extracted at the
-    predicted position (already recorded per-frame in track's x, y, frame
-    columns) and sub-pixel shifted so the predicted position lands exactly
-    at the stamp centre in every frame; averaging then gives a much
-    higher-SNR image than any single frame, on which a real offset shows
-    up as a flux-weighted centroid displaced from that centre. Restricted
-    to a small window around the centre when measuring, since the full
-    stamp is dominated by unrelated background/noise pixels far from the
-    real source (confirmed: an unrelated corner noise spike shifted a
-    whole-stamp centroid by several px on a real case).
+    stack image. Every frame's stamp is extracted at the predicted position
+    (already recorded per-frame in track's x, y, frame columns) and
+    sub-pixel shifted so the predicted position lands exactly at the stamp
+    centre in every frame; averaging then gives a much higher-SNR image
+    than any single frame, on which a real offset shows up as a
+    displacement of the source from that centre.
+
+    The offset is measured by fitting the actual calibrated TESS PRF
+    template (the same model forced_psf_photometry uses for flux, via
+    psf_flux_calibration's PRF.locate) against the stacked image at a grid
+    of candidate sub-pixel offsets, picking whichever gives the best
+    (least-squares) fit -- not a naive flux-weighted centroid. TESS's PRF
+    is measurably asymmetric, so a real source displaced from centre isn't
+    just "brighter on one side": matching the actual PRF shape at each
+    candidate offset is a materially better position estimate than
+    treating the local flux distribution as if it had no assumed shape.
+    Seeded from the flux-weighted centroid (cheap, and a robust fallback if
+    the PRF search fails to find anything better) as the starting guess.
 
     Returns (offset_x, offset_y, n_stamps) -- offset is NaN if fewer than
     min_stamps frames had a usable in-bounds stamp."""
     from scipy.ndimage import shift as ndshift
+    from .psf_flux_calibration import PRF_PATH_DEFAULT, _get_prf
+    prf_path = prf_path or PRF_PATH_DEFAULT
 
     stamps = []
     for row in track.itertuples():
@@ -692,18 +702,56 @@ def measure_stack_centroid_offset(track, cube, half=STACK_CENTROID_STAMP_HALF,
         return np.nan, np.nan, len(stamps)
 
     stacked_mean = np.mean(stamps, axis=0)
+    stamp_size = 2 * half + 1
+
+    # flux-weighted centroid in a small central window -- initial guess for the PRF
+    # search below, and the fallback if that search can't be run/doesn't improve on it
+    window = STACK_CENTROID_WINDOW
     sub = stacked_mean[half - window:half + window + 1, half - window:half + window + 1]
     yy, xx = np.mgrid[half - window:half + window + 1, half - window:half + window + 1]
     w = np.clip(sub - np.median(stacked_mean), 0, None)
     if w.sum() <= 0:
         return np.nan, np.nan, len(stamps)
-    cx = (xx * w).sum() / w.sum()
-    cy = (yy * w).sum() / w.sum()
-    return cx - half, cy - half, len(stamps)
+    cx0 = (xx * w).sum() / w.sum() - half
+    cy0 = (yy * w).sum() / w.sum() - half
+
+    data = stacked_mean.ravel()
+    finite = np.isfinite(data)
+    if finite.sum() < 3:
+        return cx0, cy0, len(stamps)
+
+    try:
+        last = track.iloc[-1]
+        ccd_x, ccd_y = ccd_x0 + last.x, ccd_y0 + last.y
+        prf_dir = f'{prf_path}/Sectors4+' if sector >= 4 else f'{prf_path}/Sectors1_2_3'
+        prf = _get_prf(cam, ccd, sector, ccd_x, ccd_y, prf_dir)
+    except Exception:
+        return cx0, cy0, len(stamps)
+
+    def _residual(offset):
+        dx, dy = offset
+        if abs(dx) > search_radius_px or abs(dy) > search_radius_px:
+            return np.inf
+        template = prf.locate(half + dx, half + dy, (stamp_size, stamp_size))
+        s = np.nansum(template)
+        if not (np.isfinite(s) and s > 0):
+            return np.inf
+        template = (template / s).ravel()[finite]
+        A = np.column_stack([template, np.ones(finite.sum())])
+        d = data[finite]
+        coeffs, *_ = np.linalg.lstsq(A, d, rcond=None)
+        return float(np.sum((d - A @ coeffs) ** 2))
+
+    from scipy.optimize import minimize
+    res = minimize(_residual, x0=[cx0, cy0], method="Nelder-Mead",
+                    options={"xatol": 0.01, "fatol": 1e-6})
+    if res.success and _residual(res.x) < _residual([cx0, cy0]):
+        return float(res.x[0]), float(res.x[1]), len(stamps)
+    return cx0, cy0, len(stamps)
 
 
-def pool_offset_from_stacks(psf_df, stack_summary, cube, sig_threshold=STACK_CENTROID_SIG_THRESHOLD,
-                              min_tracks=2, **stamp_kwargs):
+def pool_offset_from_stacks(psf_df, stack_summary, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=None,
+                              sig_threshold=STACK_CENTROID_SIG_THRESHOLD, min_tracks=2, **stamp_kwargs):
     """Robust per-cut (dx, dy) offset, pooled (median) from the individual
     shift-and-stack centroid offsets (measure_stack_centroid_offset) of
     every track that reached at least sig_threshold -- these are the only
@@ -719,7 +767,8 @@ def pool_offset_from_stacks(psf_df, stack_summary, cube, sig_threshold=STACK_CEN
         achieved_sig = row["achieved_sig"] if row is not None else np.nan
         if not np.isfinite(achieved_sig) or achieved_sig < sig_threshold:
             continue
-        ox, oy, n_stamps = measure_stack_centroid_offset(track, cube, **stamp_kwargs)
+        ox, oy, n_stamps = measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0,
+                                                            prf_path=prf_path, **stamp_kwargs)
         if np.isfinite(ox):
             offsets_x.append(ox)
             offsets_y.append(oy)

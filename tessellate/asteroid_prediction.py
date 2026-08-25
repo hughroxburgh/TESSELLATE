@@ -549,7 +549,8 @@ def _vectorized_kepler_unit_vectors(mpcorb_df, epoch_mjd, sample_mjds, earth_hel
     return x / norm, y / norm, z / norm
 
 
-def coarse_position_mask(mpcorb_df, ra_center_deg, dec_center_deg, radius_deg, sample_mjds):
+def coarse_position_mask(mpcorb_df, ra_center_deg, dec_center_deg, radius_deg, sample_mjds,
+                          return_hit_samples=False):
     """Fully vectorised coarse 2-body position check across every object
     in mpcorb_df at once (see _vectorized_kepler_unit_vectors) -- keeps
     anything within radius_deg of the field centre at any sample epoch.
@@ -559,7 +560,23 @@ def coarse_position_mask(mpcorb_df, ra_center_deg, dec_center_deg, radius_deg, s
     between the catalogue epoch and the observing window (see
     predict_asteroids_for_footprint), not just the window's own span.
     Compares in ecliptic coordinates (matching the Kepler solve's native
-    frame) rather than converting every object to equatorial RA/Dec."""
+    frame) rather than converting every object to equatorial RA/Dec.
+
+    return_hit_samples=True also returns, per surviving row (keyed by its
+    index into the input mpcorb_df):
+      - hit_samples_by_row: the sample_mjds where that object was actually
+        near the footprint
+      - rate_by_row: that object's own observed angular rate (deg/day,
+        the largest great-circle step seen between any two consecutive
+        coarse samples). A fixed pad derived from the catalogue-wide
+        max_motion_deg_per_day assumption isn't safe for real close/fast
+        near-Earth objects, which can exceed it by several times (e.g. a
+        NEO at ~0.05 AU can move multiple deg/day, well past the ~1.5
+        deg/day the coarse margin assumes for the general population) --
+        the caller uses this per-object rate to size how much to pad
+        around each hit sample, so fast movers get a wider window instead
+        of silently losing frames a full, unrestricted scan would have
+        caught (see predict_asteroids_for_footprint)."""
     from astropy.coordinates import SkyCoord
     import astropy.units as u
 
@@ -577,11 +594,30 @@ def coarse_position_mask(mpcorb_df, ra_center_deg, dec_center_deg, radius_deg, s
     cos_radius = math.cos(math.radians(radius_deg))
 
     dot = x * tx + y * ty + z * tz  # (N, T)
-    hit_valid = (dot >= cos_radius).any(axis=1)
+    hit_matrix = dot >= cos_radius  # (N, T), per-object per-sample -- NOT collapsed
+    hit_valid = hit_matrix.any(axis=1)
 
     keep = np.zeros(len(mpcorb_df), dtype=bool)
     keep[np.where(valid)[0][hit_valid]] = True
-    return keep
+
+    if not return_hit_samples:
+        return keep
+
+    valid_idx = np.where(valid)[0]
+    # angular separation between EVERY consecutive pair of samples (great-circle, via the
+    # unit vectors already computed above), regardless of hit/miss -- a fast object can
+    # legitimately be a miss at one sample and a hit at the next, and the rate estimate
+    # needs the true motion between those two, not just motion between hit samples
+    dt = np.diff(sample_mjds)
+    cons_dot = np.clip(x[:, :-1] * x[:, 1:] + y[:, :-1] * y[:, 1:] + z[:, :-1] * z[:, 1:], -1.0, 1.0)
+    ang_sep_deg = np.degrees(np.arccos(cons_dot))  # (N, T-1)
+    rate_deg_per_day = ang_sep_deg / dt[None, :] if len(dt) else np.zeros((len(x), 0))
+
+    hit_idx = np.where(hit_valid)[0]
+    hit_samples_by_row = {int(valid_idx[i]): sample_mjds[hit_matrix[i]] for i in hit_idx}
+    rate_by_row = {int(valid_idx[i]): float(np.nanmax(rate_deg_per_day[i])) if rate_deg_per_day.shape[1] else 0.0
+                   for i in hit_idx}
+    return keep, hit_samples_by_row, rate_by_row
 
 
 # ---------------------------------------------------------------------------
@@ -642,7 +678,50 @@ def expected_apparent_magnitude(H, G, r_helio_au, delta_au, phase_angle_deg):
     return H + 5 * np.log10(r_helio_au * delta_au) - 2.5 * np.log10(phase_term)
 
 
-def precise_ephemeris(mpcorb_row, frame_mjds, data_dir=None, allow_download=True):
+def _precompute_frame_geometry(frame_mjds, data_dir=None, allow_download=True):
+    """TESS spacecraft barycentric position at each unique frame epoch --
+    a pure function of time (spkpos against the epoch alone, plus Earth's
+    barycentric position at that same epoch), identical regardless of
+    which asteroid is being predicted. precise_ephemeris previously
+    recomputed this independently for every (asteroid, frame) pair -- for
+    a dense cut with hundreds of survivors sharing the same frame_mjds,
+    that's hundreds of redundant identical SPICE/ASSIST lookups per frame.
+    Computed once per cut in the main process and shared read-only across
+    worker processes via the pool initializer, keyed by mjd.
+
+    Deliberately excludes the light-time-corrected Sun position used
+    inside precise_ephemeris's Newton loop (sun_em at t_em = t_target -
+    light_time): light_time is asteroid-specific (depends on that
+    object's own TESS distance), so t_em differs slightly per asteroid
+    even at the "same" frame -- sharing a single Sun lookup there would
+    trade this module's validated ~0.04 arcsec accuracy for speed, which
+    isn't the trade being made here.
+    """
+    import spiceypy as sp
+    from astropy.time import Time
+
+    data_dir = data_dir or default_data_dir()
+    ephem = load_assist_ephem(data_dir)
+    jd_ref = ephem.jd_ref
+
+    table = {}
+    for mjd in np.unique(np.asarray(frame_mjds)):
+        get_tess_kernel_for_epoch(mjd, data_dir, allow_download=allow_download)
+        t_obs = Time(mjd, format="mjd", scale="utc")
+        t_target_days = t_obs.tdb.jd - jd_ref
+        et = sp.str2et(t_obs.isot)
+        tess_off_km, _ = sp.spkpos("-95", et, "J2000", "NONE", "EARTH")
+        tess_off_au = np.array(tess_off_km) / AU_KM
+        earth_obs = ephem.get_particle("Earth", t_target_days)
+        tess_bary_pos = np.array([earth_obs.x, earth_obs.y, earth_obs.z]) + tess_off_au
+        table[float(mjd)] = (t_target_days, tess_bary_pos)
+    return table
+
+
+_frame_geometry_cache = None
+
+
+def precise_ephemeris(mpcorb_row, frame_mjds, data_dir=None, allow_download=True, frame_geometry=None):
     """Full ASSIST-perturbed, light-time corrected TESS-relative RA/Dec for
     one object at every given frame time. Returns a DataFrame with one row
     per frame: mjd, ra, dec.
@@ -685,17 +764,23 @@ def precise_ephemeris(mpcorb_row, frame_mjds, data_dir=None, allow_download=True
     order = np.argsort(frame_mjds)
     sorted_mjds = np.asarray(frame_mjds)[order]
 
+    geometry = frame_geometry if frame_geometry is not None else _frame_geometry_cache
+
     rows = [None] * len(sorted_mjds)
     light_time = 0.0
     for out_i, mjd in zip(order, sorted_mjds):
-        get_tess_kernel_for_epoch(mjd, data_dir, allow_download=allow_download)
-        t_obs = Time(mjd, format="mjd", scale="utc")
-        t_target_days = t_obs.tdb.jd - jd_ref
-        et = sp.str2et(t_obs.isot)
-        tess_off_km, _ = sp.spkpos("-95", et, "J2000", "NONE", "EARTH")
-        tess_off_au = np.array(tess_off_km) / AU_KM
-        earth_obs = ephem.get_particle("Earth", t_target_days)
-        tess_bary_pos = np.array([earth_obs.x, earth_obs.y, earth_obs.z]) + tess_off_au
+        cached = geometry.get(float(mjd)) if geometry is not None else None
+        if cached is not None:
+            t_target_days, tess_bary_pos = cached
+        else:
+            get_tess_kernel_for_epoch(mjd, data_dir, allow_download=allow_download)
+            t_obs = Time(mjd, format="mjd", scale="utc")
+            t_target_days = t_obs.tdb.jd - jd_ref
+            et = sp.str2et(t_obs.isot)
+            tess_off_km, _ = sp.spkpos("-95", et, "J2000", "NONE", "EARTH")
+            tess_off_au = np.array(tess_off_km) / AU_KM
+            earth_obs = ephem.get_particle("Earth", t_target_days)
+            tess_bary_pos = np.array([earth_obs.x, earth_obs.y, earth_obs.z]) + tess_off_au
 
         vec = None
         sun_vec = None
@@ -720,12 +805,19 @@ def precise_ephemeris(mpcorb_row, frame_mjds, data_dir=None, allow_download=True
     return pd.DataFrame(rows)
 
 
-def _pool_worker_init(data_dir):
+def _pool_worker_init(data_dir, frame_geometry=None):
     """Pre-load the ~1GB ASSIST ephemeris and SPICE leapseconds kernel once
     per worker process, so each of the (many) precise_ephemeris calls a
-    worker handles reuses them instead of reloading from disk every time."""
+    worker handles reuses them instead of reloading from disk every time.
+    Also caches the shared per-frame TESS/Earth geometry table (see
+    _precompute_frame_geometry) computed once in the main process, so
+    every survivor this worker handles reuses it instead of recomputing
+    the same time-only SPICE lookups redundantly."""
+    global _frame_geometry_cache
     load_assist_ephem(data_dir)
     furnish_spice_generic(data_dir)
+    if frame_geometry is not None:
+        _frame_geometry_cache = frame_geometry
 
 
 def _precise_ephemeris_worker(row, frame_mjds, data_dir, allow_download):
@@ -796,23 +888,59 @@ def predict_asteroids_for_footprint(ra_center_deg, dec_center_deg, radius_deg,
     # so far between adjacent samples, however long the overall window is)
     sample_spacing = sample_mjds[1] - sample_mjds[0] if n_coarse_samples > 1 else (mjd_end - mjd_start)
     margin = radius_deg + max_motion_deg_per_day * sample_spacing
-    stage2 = coarse_position_mask(stage2_input, ra_center_deg, dec_center_deg,
-                                    radius_deg + margin, sample_mjds)
+    stage2, hit_samples_by_row, rate_by_row = coarse_position_mask(
+        stage2_input, ra_center_deg, dec_center_deg, radius_deg + margin, sample_mjds,
+        return_hit_samples=True)
     survivors = stage2_input[stage2].reset_index(drop=True)
     print(f"  Stage 2 (coarse position): {len(survivors)} / {len(stage2_input)} survive", flush=True)
 
     mjd_to_frame = {mjd: i for i, mjd in enumerate(frame_mjds)}
 
+    # Per survivor, restrict the expensive precise ephemeris to frames near where the
+    # coarse stage actually saw it close to the footprint, instead of every frame in the
+    # observing window -- most survivors only cross the footprint briefly, but previously
+    # paid the full per-frame ASSIST/light-time cost for every frame regardless (see
+    # module docstring).
+    #
+    # Padding by a flat sample_spacing is NOT safe: the margin above (and sample_spacing
+    # itself) is sized against max_motion_deg_per_day, but real close near-Earth objects
+    # can move several times faster -- caught empirically (a real (348) May/(595) Polyxena-
+    # style validation run against this exact code found two NEOs at ~0.05 AU moving up to
+    # 4.9 deg/day, well past the 1.5 deg/day assumption, whose frames a flat pad silently
+    # dropped relative to the unrestricted baseline). Instead scale the pad by how much
+    # faster THIS object's own observed rate (rate_by_row, from coarse_position_mask) is
+    # than that assumption, plus a 2x safety factor since the rate is only an estimate from
+    # discrete coarse samples, not a true bound. Falls back to the full frame list if
+    # narrowing somehow leaves nothing -- must never silently drop a real detection.
+    frame_mjds_arr = np.asarray(frame_mjds, dtype=float)
+    survivor_orig_idx = np.where(stage2)[0]
+    narrowed_frames = []
+    for orig_i in survivor_orig_idx:
+        hit_t = hit_samples_by_row.get(int(orig_i))
+        rate = rate_by_row.get(int(orig_i), max_motion_deg_per_day)
+        pad = sample_spacing * max(1.0, rate / max_motion_deg_per_day) * 2.0
+        mask = np.zeros(len(frame_mjds_arr), dtype=bool)
+        if hit_t is not None and len(hit_t):
+            for t in hit_t:
+                mask |= (frame_mjds_arr >= t - pad) & (frame_mjds_arr <= t + pad)
+        subset = frame_mjds_arr[mask]
+        narrowed_frames.append(subset if len(subset) else frame_mjds_arr)
+
     all_rows = []
     if len(survivors):
+        # Shared per-frame TESS/Earth geometry (see _precompute_frame_geometry) -- a pure
+        # function of time, identical for every survivor, computed once here instead of
+        # redundantly inside precise_ephemeris for each of them.
+        frame_geometry = _precompute_frame_geometry(frame_mjds, data_dir, allow_download)
+
         # ProcessPoolExecutor rejects max_workers=0 -- a cut with zero stage-2 survivors (a real,
         # common case for high-ecliptic-latitude footprints) would otherwise crash here instead
         # of legitimately returning an empty result
         n_workers = min(len(survivors), max(1, (os.cpu_count() or 4) - 1))
         with ProcessPoolExecutor(max_workers=n_workers, initializer=_pool_worker_init,
-                                  initargs=(data_dir,)) as pool:
-            futures = {pool.submit(_precise_ephemeris_worker, row, frame_mjds, data_dir, allow_download): row
-                       for _, row in survivors.iterrows()}
+                                  initargs=(data_dir, frame_geometry)) as pool:
+            futures = {pool.submit(_precise_ephemeris_worker, row, narrowed_frames[k], data_dir, allow_download): row
+                       for k, (_, row) in enumerate(survivors.iterrows())}
             for fut in as_completed(futures):
                 row = futures[fut]
                 try:

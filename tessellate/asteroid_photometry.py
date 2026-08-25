@@ -516,27 +516,22 @@ def flag_star_contamination(df, stars, flux_col="flux"):
 
             for start in range(0, len(points), chunk_size):
                 end = min(start + chunk_size, len(points))
-                chunk_candidates = tier_tree.query_ball_point(points[start:end], r=hi)
-                # Flatten the ragged per-row candidate lists into one set of (row, star)
-                # pairs and evaluate distance/margin for all of them in one vectorised
-                # pass, instead of a Python-level loop calling np.hypot/np.argmin
-                # separately per row -- correctness-identical (every candidate within
-                # this tier's radius of a row is still checked, nothing approximated),
-                # but this loop was the module's dominant cost by a wide margin (memray
-                # profiling on a real dense cut: ~93,000 allocations per track from this
-                # exact loop, ~166M total across one job).
-                lengths = np.fromiter((len(c) for c in chunk_candidates), dtype=np.int64,
-                                       count=len(chunk_candidates))
-                if lengths.sum() == 0:
-                    del chunk_candidates
+                # sparse_distance_matrix instead of query_ball_point: the latter builds one
+                # Python list per query point (confirmed via memray on a real dense cut to be
+                # this module's dominant allocator by a wide margin -- ~166M allocations in
+                # one job, all from list construction, not from anything done with the
+                # candidates afterward). sparse_distance_matrix returns the identical set of
+                # (star, point, distance) triples as one flat sparse array instead -- verified
+                # matching pair counts and preserving exact-zero-distance pairs (sparse
+                # formats can silently drop explicit zeros; this one doesn't) -- and gives
+                # distances directly, so the separate np.hypot pass below is gone too.
+                point_tree = cKDTree(points[start:end])
+                sdm = tier_tree.sparse_distance_matrix(point_tree, max_distance=hi, output_type='coo_array')
+                if sdm.nnz == 0:
                     continue
-                row_idx = np.repeat(np.arange(start, end), lengths)
-                col_idx = np.concatenate([np.asarray(c, dtype=np.int64)
-                                           for c in chunk_candidates if len(c)])
-                del chunk_candidates
-
-                d_all = np.hypot(points[row_idx, 0] - tier_sx[col_idx],
-                                  points[row_idx, 1] - tier_sy[col_idx])
+                row_idx = sdm.col + start
+                col_idx = sdm.row
+                d_all = sdm.data
                 margin_all = d_all - tier_sr[col_idx]
 
                 # best (minimum-margin) candidate per row -- pandas' groupby/idxmin picks

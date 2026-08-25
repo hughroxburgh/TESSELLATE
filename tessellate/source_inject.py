@@ -546,6 +546,7 @@ class SourceInjector():
         injections['frame_max'] = 0
         injections['mjd_max'] = 0
         injections['source_mask'] = 0
+        injections['n_sig_frames'] = 0
         cadence_min = np.nanmedian(np.diff(self._true_nav.time)) * 1440
         lcs = []
         for i in tqdm(range(n_events), desc='    injecting events into cube', position=0, leave=True, dynamic_ncols=False, ascii=True):
@@ -622,6 +623,10 @@ class SourceInjector():
                 image_frame = image.copy() * f / np.nansum(image[1:4, 1:4])
 
                 raw_cube[frames[j], yint-2:yint+3, xint-2:xint+3] += image_frame
+
+            snr_lc = flux * source.snr / np.nanmax(flux) * source.flux_sign
+            injections.iloc[i, injections.columns.get_loc('n_sig_frames')] = len(np.where(snr_lc>3)[0])
+            
 
         injections.reset_index(names='injid',inplace=True)
 
@@ -1524,12 +1529,18 @@ PYTHONUNBUFFERED=1\n\
         xmin = self.nav.time[(lc[0][0]-frame_buffer).astype(int)]
         xmax = self.nav.time[(lc[0][-1]+frame_buffer).astype(int)]
 
-        visible = (self.nav.time >= xmin) & (self.nav.time <= xmax)
-        y_visible = cube_lc[visible]
-        padding = 0.05 * (np.nanmax(y_visible) - np.nanmin(y_visible))
+        visible_cube = (self.nav.time >= xmin) & (self.nav.time <= xmax)
+        visible_lc = (lc[0] >= xmin) & (lc[0] <= xmax)
 
-        plt.xlim(xmin,xmax)
-        plt.ylim(np.nanmin(y_visible) - padding,np.nanmax(y_visible) + padding)
+        y1_visible = cube_lc[visible_cube]
+        y2_visible = lc[1][visible_lc]
+
+        y_min = np.nanmin([np.nanmin(y1_visible), np.nanmin(y2_visible)])
+        y_max = np.nanmax([np.nanmax(y1_visible), np.nanmax(y2_visible)])
+        padding = 0.05 * (y_max - y_min)
+
+        plt.xlim(xmin, xmax)
+        plt.ylim(y_min - padding, y_max + padding)
 
         plt.legend()
         plt.xlabel('Time [MJD]')

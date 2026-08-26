@@ -67,8 +67,25 @@ _worker_shm = None
 _worker_sigma_clip_cache = None
 
 
-def _photometry_worker_init(shm_name, shape, dtype):
+def _photometry_worker_init(shm_name, shape, dtype, cpu_affinity=None):
     global _worker_cube, _worker_shm, _worker_sigma_clip_cache
+    # A forked worker process was found, on ozstar, to have its OWN cpu affinity silently
+    # narrowed down to a single core (confirmed live via taskset -pc: the main process kept
+    # its full 8-cpu SLURM allocation, but every one of its forked children ended up pinned
+    # to just cpu 0) -- the classic OpenBLAS/MKL behaviour of pinning a thread to one core
+    # on first use of a threaded BLAS call, which leaks out to the whole forked process here
+    # instead of staying scoped to BLAS's own internal thread pool. This is why 8 workers
+    # were confirmed (via /proc tick-sampling AND per-cpu mpstat) to collectively use only
+    # ~1 core's worth of aggregate CPU despite all showing "R" (runnable) -- they were all
+    # actually competing for time on that single shared core, not spread across the 8 real
+    # ones. Explicitly resetting affinity here, to the set captured from the (still
+    # correctly-allocated) main process before fork, undoes that regardless of which library
+    # caused it.
+    if cpu_affinity is not None:
+        try:
+            os.sched_setaffinity(0, cpu_affinity)
+        except AttributeError:
+            pass  # no sched_setaffinity (e.g. macOS) -- nothing to reset
     _worker_shm = shared_memory.SharedMemory(name=shm_name)
     _worker_cube = np.ndarray(shape, dtype=dtype, buffer=_worker_shm.buf)
     # fresh per worker process, i.e. per cube (a new pool -- and so a new call to this
@@ -140,13 +157,18 @@ def _run_parallel_by_track(cube, ephemeris_df, track_worker, worker_args, empty_
     order = ephemeris_df.groupby("designation").size().sort_values(ascending=False).index.to_numpy()
     batches = [order[i:i + batch_size] for i in range(0, len(order), batch_size)]
 
+    try:
+        main_affinity = os.sched_getaffinity(0)
+    except AttributeError:
+        main_affinity = None  # e.g. macOS -- _photometry_worker_init handles None as a no-op
+
     shm = shared_memory.SharedMemory(create=True, size=cube.nbytes)
     try:
         shared_cube = np.ndarray(cube.shape, dtype=cube.dtype, buffer=shm.buf)
         shared_cube[:] = cube[:]
         batch_results = []
         with ProcessPoolExecutor(max_workers=n_workers, initializer=_photometry_worker_init,
-                                  initargs=(shm.name, cube.shape, cube.dtype)) as pool:
+                                  initargs=(shm.name, cube.shape, cube.dtype, main_affinity)) as pool:
             for batch in batches:
                 futures = [pool.submit(track_worker, groups[d], *worker_args)
                            for d in batch]

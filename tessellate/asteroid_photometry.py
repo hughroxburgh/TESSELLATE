@@ -47,16 +47,24 @@ GAIA_MAG_LIMIT = 19.0
 
 _worker_cube = None
 _worker_shm = None
+_worker_sigma_clip_cache = None
 
 
 def _photometry_worker_init(shm_name, shape, dtype):
-    global _worker_cube, _worker_shm
+    global _worker_cube, _worker_shm, _worker_sigma_clip_cache
     _worker_shm = shared_memory.SharedMemory(name=shm_name)
     _worker_cube = np.ndarray(shape, dtype=dtype, buffer=_worker_shm.buf)
+    # fresh per worker process, i.e. per cube (a new pool -- and so a new call to this
+    # initializer -- is created for every forced_aperture_photometry call): a persistent
+    # dict here, reused across every track task this worker is dispatched over the pool's
+    # whole lifetime, is what makes the frame-level sigma-clip cache in
+    # _forced_aperture_photometry_core actually pay off in the parallel path -- see there
+    _worker_sigma_clip_cache = {}
 
 
 def _aperture_track_worker(track_df, radius_px):
-    return _forced_aperture_photometry_core(_worker_cube, track_df, radius_px)
+    return _forced_aperture_photometry_core(_worker_cube, track_df, radius_px,
+                                              sigma_clip_cache=_worker_sigma_clip_cache)
 
 
 def _psf_track_worker(track_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size):
@@ -139,26 +147,43 @@ def forced_aperture_photometry(cube, ephemeris_df, radius_px=APERTURE_RADIUS_PX,
     return _forced_aperture_photometry_core(cube, ephemeris_df, radius_px)
 
 
-def _forced_aperture_photometry_core(cube, ephemeris_df, radius_px):
+def _forced_aperture_photometry_core(cube, ephemeris_df, radius_px, sigma_clip_cache=None):
     from astropy.stats import sigma_clip
     from photutils.aperture import CircularAperture, CircularAnnulus, ApertureStats, aperture_photometry
+
+    # sigma_clip(frame, ...) below depends only on which frame this row is, never on the
+    # track's own position -- but with every track's rows sharing the same ~3000-ish
+    # frames, the naive per-row call recomputes the identical whole-frame clip hundreds of
+    # times over (confirmed: 1.83M rows against 3116 unique frames on a real dense cut,
+    # ~588x redundant on average) and was the dominant cost of the whole asteroid_lightcurves
+    # stage. Caching per frame index removes that redundancy; sigma_clip_cache is None (a
+    # fresh dict, scoped to just this one call) in the sequential fallback path, where a
+    # single call already covers every track's rows together, or the calling worker's own
+    # persistent dict in the parallel path (see _photometry_worker_init) so the cache still
+    # pays off there even though each worker call only ever sees one track's own rows.
+    if sigma_clip_cache is None:
+        sigma_clip_cache = {}
 
     r_in, r_out = 2 * radius_px + 3, 2 * radius_px + 7
     rows = []
     for row in ephemeris_df.itertuples():
         if not (0 <= row.x < cube.shape[2] and 0 <= row.y < cube.shape[1]):
             continue
-        frame = cube[row.frame]
+        frame_idx = int(row.frame)
+        frame = cube[frame_idx]
         aperture = CircularAperture([(row.x, row.y)], radius_px)
         annulus = CircularAnnulus([(row.x, row.y)], r_in, r_out)
-        mask = sigma_clip(frame, masked=True, sigma=5).mask
+        mask = sigma_clip_cache.get(frame_idx)
+        if mask is None:
+            mask = sigma_clip(frame, masked=True, sigma=5).mask
+            sigma_clip_cache[frame_idx] = mask
         sky = ApertureStats(frame, annulus, mask=mask)
         phot = aperture_photometry(frame, aperture)
         npix = aperture.area
         sky_mean, sky_std = float(sky.mean[0]), float(sky.std[0])
         flux = float(phot["aperture_sum"].value[0]) - npix * sky_mean
         sig = flux / (np.sqrt(npix) * sky_std) if sky_std and np.isfinite(sky_std) and sky_std > 0 else np.nan
-        rows.append(dict(designation=row.designation, frame=int(row.frame), mjd=row.mjd,
+        rows.append(dict(designation=row.designation, frame=frame_idx, mjd=row.mjd,
                           x=row.x, y=row.y, flux=flux, sky_std=sky_std, sig=sig))
     # pd.DataFrame([]) has no columns at all (not even 'x') -- a fully out-of-bounds track
     # (e.g. every frame lands within STAMP_SIZE/2 of a cut's edge) would otherwise silently

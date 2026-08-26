@@ -1018,7 +1018,7 @@ PYTHONUNBUFFERED=1\n\
         # -- Run Tessellate only over cuts that injected successfully -- #
         run = Tessellate(data_path=self.data_path,working_path=self.working_path,job_output_path=self.job_output_path,
                             sector=self.sector,cam=self.cam,ccd=self.ccd,n=self.n,cuts=successful_cuts,
-                            download=False,make_cube=False,fix_wcs=False,make_cuts=False,calibrate=False,
+                            download=False,make_cube=False,fix_wcs=False,make_cuts=False,calibrate=False,asteroid_lightcurves=False,predict_asteroids=False,
                             reduce=True,search=True,injection=True,plot=False,delete=False,injection_dir=self.injection_dir,
                             reset_logs=False,overwrite=False,ask_config=False,save_config=False,use_suggestions=True,search_snr=search_snr)
 

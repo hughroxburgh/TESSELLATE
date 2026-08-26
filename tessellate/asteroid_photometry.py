@@ -45,6 +45,23 @@ GAIA_MAG_LIMIT = 19.0
 # usage would defeat the point on exactly the dense, memory-tight cuts this
 # is meant to help.
 
+def _available_cpu_count():
+    """os.cpu_count() reports the WHOLE NODE's core count, not this process's actual
+    scheduling allocation -- on a shared cluster node that's a real, large difference (
+    confirmed on ozstar: os.cpu_count()==36 vs the 8 cores an 8-cpus-per-task SLURM job was
+    actually given). Sizing a worker pool off it oversubscribes massively: 36 processes
+    competing for 8 real cores' worth of cgroup CPU time, each getting only a sliver
+    (confirmed live: 36 worker processes sampled at ~2.8% CPU each, not the ~100%/8≈12.5%
+    a correctly-sized pool would show). os.sched_getaffinity(0) reflects the actual cgroup/
+    affinity-restricted core count and is what SLURM (or any cgroup-based scheduler) sets;
+    it doesn't exist on macOS, so this falls back to cpu_count() there, which is fine since
+    there's no cgroup restriction to respect on a local dev machine anyway."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 4
+
+
 _worker_cube = None
 _worker_shm = None
 _worker_sigma_clip_cache = None
@@ -90,7 +107,7 @@ def _run_parallel_by_track(cube, ephemeris_df, track_worker, worker_args, empty_
 
     designations = ephemeris_df["designation"].unique()
     if n_workers is None:
-        n_workers = max(1, min(len(designations), (os.cpu_count() or 4)))
+        n_workers = max(1, min(len(designations), _available_cpu_count()))
 
     if n_workers <= 1 or len(designations) <= 1:
         return None  # signal: caller should run its own sequential _core directly

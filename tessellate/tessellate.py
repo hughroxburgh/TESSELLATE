@@ -2988,8 +2988,12 @@ export PYTHONUNBUFFERED=1\n\
     # 563 tracks or the northern incident's ~440): 44:16 -> 2:53. Only PER_TRACK_S is scaled
     # by that measured factor (with margin: 5.0/15.4 ~ 0.325, rounded up to 0.35) since it's
     # what the fixes actually changed -- FLOOR_S covers fixed per-job overhead (imports, WCS
-    # load, cube load) the fixes never touched, and is set from real near-zero-track
-    # measurements (~8-11s observed) rather than scaled down from 300. Memory dropped for an
+    # load, cube load) the fixes never touched. Real near-zero-track measurements only
+    # showed ~8-11s of that overhead, but an initial floor of 60s (launched across the real
+    # Year 3 rerun) proved too tight in practice against real scheduling/filesystem variance
+    # on a live cluster, not just the raw compute time a controlled benchmark measures --
+    # kept at the pre-revision value of 300s for that safety margin rather than trimmed down
+    # to what the benchmark alone would justify. Memory dropped for an
     # unrelated reason (worker count now genuinely 8, not float(36) competing for the same 8
     # cores -- see d09218c), so MEM_* are set fresh from the one real measured peak (2.9GB
     # at 1783 tracks) rather than scaled from the old memory constants, which were never
@@ -3000,7 +3004,7 @@ export PYTHONUNBUFFERED=1\n\
     # real Year 3 (sectors 27-39) production jobs complete under these values to refit
     # properly against a larger sample, the same way the original 50-point fit was built.
     _LIGHTCURVES_TIME_PER_TRACK_S = 0.35
-    _LIGHTCURVES_TIME_FLOOR_S = 60
+    _LIGHTCURVES_TIME_FLOOR_S = 300
     _LIGHTCURVES_MEM_PER_TRACK_GB = 0.001
     _LIGHTCURVES_MEM_FLOOR_GB = 4
 

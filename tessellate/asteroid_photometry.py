@@ -65,27 +65,47 @@ def _available_cpu_count():
 _worker_cube = None
 _worker_shm = None
 _worker_sigma_clip_cache = None
+_worker_cpu_affinity = None
+
+
+def _reset_worker_affinity():
+    """Undo the affinity narrowing (see _photometry_worker_init) if it recurs. Confirmed
+    live (via os.sched_getaffinity(0) bracketing a real _psf_lc_core call) that a forked
+    worker's affinity is still correct going in, then collapses to a single CPU immediately
+    after -- and stays that way for the rest of that worker's life, i.e. it's a one-time
+    event per worker, not per call, but resetting defensively around every call is what
+    guarantees it never matters which call triggers it or whether the env-var fix in
+    _photometry_worker_init (set post-fork, so not certain to affect a BLAS thread pool
+    that may have already initialized in the parent before fork) actually prevents it."""
+    if _worker_cpu_affinity is not None:
+        try:
+            os.sched_setaffinity(0, _worker_cpu_affinity)
+        except AttributeError:
+            pass  # no sched_setaffinity (e.g. macOS)
 
 
 def _photometry_worker_init(shm_name, shape, dtype, cpu_affinity=None):
-    global _worker_cube, _worker_shm, _worker_sigma_clip_cache
-    # A forked worker process was found, on ozstar, to have its OWN cpu affinity silently
+    global _worker_cube, _worker_shm, _worker_sigma_clip_cache, _worker_cpu_affinity
+    # A forked worker process was found, on ozstar, to have its own cpu affinity silently
     # narrowed down to a single core (confirmed live via taskset -pc: the main process kept
     # its full 8-cpu SLURM allocation, but every one of its forked children ended up pinned
-    # to just cpu 0) -- the classic OpenBLAS/MKL behaviour of pinning a thread to one core
-    # on first use of a threaded BLAS call, which leaks out to the whole forked process here
-    # instead of staying scoped to BLAS's own internal thread pool. This is why 8 workers
-    # were confirmed (via /proc tick-sampling AND per-cpu mpstat) to collectively use only
-    # ~1 core's worth of aggregate CPU despite all showing "R" (runnable) -- they were all
-    # actually competing for time on that single shared core, not spread across the 8 real
-    # ones. Explicitly resetting affinity here, to the set captured from the (still
-    # correctly-allocated) main process before fork, undoes that regardless of which library
-    # caused it.
-    if cpu_affinity is not None:
-        try:
-            os.sched_setaffinity(0, cpu_affinity)
-        except AttributeError:
-            pass  # no sched_setaffinity (e.g. macOS) -- nothing to reset
+    # to just one CPU) -- the classic OpenBLAS/MKL behaviour of a thread pool pinning itself
+    # to one core on first use inside a forked process. This is why 8 workers were confirmed
+    # (via /proc tick-sampling AND per-cpu mpstat) to collectively use only ~1 core's worth
+    # of aggregate CPU despite all showing "R" (runnable) -- they were all actually
+    # competing for time on that single shared core, not spread across the 8 real ones.
+    #
+    # Two defenses, since it isn't certain which (if either alone) is sufficient: force
+    # single-threaded BLAS (parallelism here comes from the process pool, not from each
+    # worker also multi-threading its own linear algebra, so this is correct regardless);
+    # and keep the captured main-process affinity around so _reset_worker_affinity can be
+    # called defensively around the actual call that was confirmed to trigger the
+    # narrowing, since a one-time reset here wouldn't survive it recurring mid-pool-lifetime.
+    for _env in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                 "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[_env] = "1"
+    _worker_cpu_affinity = cpu_affinity
+    _reset_worker_affinity()
     _worker_shm = shared_memory.SharedMemory(name=shm_name)
     _worker_cube = np.ndarray(shape, dtype=dtype, buffer=_worker_shm.buf)
     # fresh per worker process, i.e. per cube (a new pool -- and so a new call to this
@@ -305,6 +325,11 @@ def _forced_psf_photometry_core(cube, ephemeris_df, sector, cam, ccd, ccd_x0, cc
                                 cam, ccd, sector, prf_path=prf_path, stamp_size=stamp_size)
         except Exception:
             continue
+        # confirmed live (see _photometry_worker_init) that the first call into this
+        # (PRF-loading, BLAS-backed) function is exactly what triggers the affinity
+        # narrowing in a forked worker -- reset immediately after every call, not just
+        # once, since it isn't certain the env-var fix alone prevents it from recurring
+        _reset_worker_affinity()
         flux, e_flux, bg = float(out["flux_counts"][0]), float(out["e_flux_counts"][0]), float(out["background"][0])
         sig = flux / e_flux if e_flux and np.isfinite(e_flux) and e_flux > 0 else np.nan
         rows.append(dict(designation=row.designation, frame=int(row.frame), mjd=row.mjd,

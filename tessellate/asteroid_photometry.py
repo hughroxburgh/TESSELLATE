@@ -964,7 +964,13 @@ def pool_offset_from_stacks(ephemeris, cube, sector, cam, ccd, ccd_x0, ccd_y0, p
             continue
         rows.append(dict(designation=designation, offset_x=ox, offset_y=oy, sig=sig,
                           flux=flux, mag=mag, mag_err=mag_err, n_stamps=n_stamps, used=used))
-    diagnostics = pd.DataFrame(rows)
+    # pd.DataFrame([]) has no columns at all (not even 'used') -- a cut where every single
+    # predicted track has zero usable stamps (confirmed: a real cut, no tracks ever land
+    # in-bounds) would otherwise raise KeyError on the diagnostics["used"] access below
+    # instead of just producing zero used tracks, same pitfall already guarded against in
+    # forced_aperture_photometry/forced_psf_photometry's own empty-result cases
+    diagnostics = pd.DataFrame(rows, columns=["designation", "offset_x", "offset_y", "sig",
+                                                "flux", "mag", "mag_err", "n_stamps", "used"])
 
     used_offsets = diagnostics[diagnostics["used"]]
     if len(used_offsets) < min_tracks:

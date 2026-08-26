@@ -761,7 +761,7 @@ class DataProcessor():
         import pandas as pd
         from astropy.io import fits
         from astropy.wcs import WCS
-        from .asteroid_photometry import (forced_aperture_photometry, forced_psf_photometry,
+        from .asteroid_photometry import (forced_psf_photometry,
                                             match_ephemeris_to_reduced_frames, detrend_pixel_phase,
                                             local_gaia_cat_to_stars, flag_star_contamination,
                                             stack_lightcurves, STACK_SIG_TARGET, pool_offset_from_stacks)
@@ -853,21 +853,21 @@ class DataProcessor():
                 # own min_tracks fallback) -- save at the uncorrected position instead
                 photometry_ephemeris = ephemeris
 
-            # Step 2: forced photometry, exactly once, at the position from step 1
-            aperture_df = forced_aperture_photometry(cube, photometry_ephemeris)
+            # Step 2: forced photometry, exactly once, at the position from step 1.
+            # Aperture photometry is currently disabled -- not part of the pipeline for now
+            # (forced_aperture_photometry itself is untouched in asteroid_photometry.py, just
+            # not called here).
             psf_df = forced_psf_photometry(cube, photometry_ephemeris, self.sector, cam, ccd,
                                              cut_corner[0], cut_corner[1])
             psf_df = detrend_pixel_phase(psf_df)
 
             # Step 3: contamination flags, on the one photometry result actually being saved
-            aperture_df = flag_star_contamination(aperture_df, stars, flux_col='flux')
             psf_df = flag_star_contamination(psf_df, stars, flux_col='flux_detrended')
             stack_summary, stacked_df = stack_lightcurves(psf_df)
 
             offset_df = pd.DataFrame([{'offset_x': offset_x, 'offset_y': offset_y,
                                         'n_tracks_used': n_offset_tracks}])
 
-            save_table(aperture_df,f'{cutFolder}/asteroids/{base}_AsteroidAperturePhotometry.csv')
             save_table(psf_df,f'{cutFolder}/asteroids/{base}_AsteroidPSFPhotometry.csv')
             save_table(stack_summary.reset_index(),f'{cutFolder}/asteroids/{base}_AsteroidStackSummary.csv')
             save_table(stacked_df,f'{cutFolder}/asteroids/{base}_AsteroidStackedPhotometry.csv')

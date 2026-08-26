@@ -94,7 +94,7 @@ def _Negative_pixel_extent(data_sub, sources, r=2.0):
 
     return np.maximum(0.0, -min_vals) / std
 
-def _TESS_sourcefinder(image, frame_number, thresh = 0.3, bw=24,fwhm_min=0.7,fwhm_max=2.0, n_scales=10,deblend_nthresh=128,snr=3.0,
+def _TESS_sourcefinder(image, frame_number, thresh = 0.3, bw=24,fwhm_min=0.7,fwhm_max=2.0, n_scales=10,deblend_nthresh=128,min_snr=3.0,
                        deblend_cont= 5e-5,dedup_radius= 1.0,flux_signs=(-1,1)):#,boundary_buffer= 2.0,boundary_near= 5.0):
 
     import sep
@@ -165,7 +165,7 @@ def _TESS_sourcefinder(image, frame_number, thresh = 0.3, bw=24,fwhm_min=0.7,fwh
         sources['frame'] = frame_number
 
             # self.background_ = bkg
-        allsources = pd.concat([allsources,sources[(sources.snr >= snr) & (sources.neg_extent < 3) & (sources.ellipticity<0.75)]])
+        allsources = pd.concat([allsources,sources[(sources.snr >= min_snr) & (sources.neg_extent < 3) & (sources.ellipticity<0.75)]])
 
     return allsources
 
@@ -1336,7 +1336,7 @@ class Detector():
 
         # elif self.mode == 'claudefinder':
         # print('Source Finding')
-        sources = Parallel(n_jobs=self.cpu)(delayed(_TESS_sourcefinder)(flux[i],inputNum+i,min_snr) for i in tqdm(length,desc='Source Finding'))
+        sources = Parallel(n_jobs=self.cpu)(delayed(_TESS_sourcefinder)(flux[i],inputNum+i,min_snr=min_snr) for i in tqdm(length,desc='Source Finding'))
 
         # print('Making DataFrame')
         sources = _Make_dataframe(sources,flux[0])

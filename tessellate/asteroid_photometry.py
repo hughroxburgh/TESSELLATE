@@ -45,18 +45,80 @@ GAIA_MAG_LIMIT = 19.0
 # usage would defeat the point on exactly the dense, memory-tight cuts this
 # is meant to help.
 
+def _available_cpu_count():
+    """os.cpu_count() reports the WHOLE NODE's core count, not this process's actual
+    scheduling allocation -- on a shared cluster node that's a real, large difference (
+    confirmed on ozstar: os.cpu_count()==36 vs the 8 cores an 8-cpus-per-task SLURM job was
+    actually given). Sizing a worker pool off it oversubscribes massively: 36 processes
+    competing for 8 real cores' worth of cgroup CPU time, each getting only a sliver
+    (confirmed live: 36 worker processes sampled at ~2.8% CPU each, not the ~100%/8≈12.5%
+    a correctly-sized pool would show). os.sched_getaffinity(0) reflects the actual cgroup/
+    affinity-restricted core count and is what SLURM (or any cgroup-based scheduler) sets;
+    it doesn't exist on macOS, so this falls back to cpu_count() there, which is fine since
+    there's no cgroup restriction to respect on a local dev machine anyway."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 4
+
+
 _worker_cube = None
 _worker_shm = None
+_worker_sigma_clip_cache = None
+_worker_cpu_affinity = None
 
 
-def _photometry_worker_init(shm_name, shape, dtype):
-    global _worker_cube, _worker_shm
+def _reset_worker_affinity():
+    """Undo the affinity narrowing (see _photometry_worker_init) if it recurs. Confirmed
+    live (via os.sched_getaffinity(0) bracketing a real _psf_lc_core call) that a forked
+    worker's affinity is still correct going in, then collapses to a single CPU immediately
+    after -- and stays that way for the rest of that worker's life, i.e. it's a one-time
+    event per worker, not per call, but resetting defensively around every call is what
+    guarantees it never matters which call triggers it or whether the env-var fix in
+    _photometry_worker_init (set post-fork, so not certain to affect a BLAS thread pool
+    that may have already initialized in the parent before fork) actually prevents it."""
+    if _worker_cpu_affinity is not None:
+        try:
+            os.sched_setaffinity(0, _worker_cpu_affinity)
+        except AttributeError:
+            pass  # no sched_setaffinity (e.g. macOS)
+
+
+def _photometry_worker_init(shm_name, shape, dtype, cpu_affinity=None):
+    global _worker_cube, _worker_shm, _worker_sigma_clip_cache, _worker_cpu_affinity
+    # A forked worker process was found, on ozstar, to have its own cpu affinity silently
+    # narrowed down to a single core (confirmed live via taskset -pc: the main process kept
+    # its full 8-cpu SLURM allocation, but every one of its forked children ended up pinned
+    # to just one CPU) -- the classic OpenBLAS/MKL behaviour of a thread pool pinning itself
+    # to one core on first use inside a forked process. This is why 8 workers were confirmed
+    # (via /proc tick-sampling AND per-cpu mpstat) to collectively use only ~1 core's worth
+    # of aggregate CPU despite all showing "R" (runnable) -- they were all actually
+    # competing for time on that single shared core, not spread across the 8 real ones.
+    #
+    # Two defenses, since it isn't certain which (if either alone) is sufficient: force
+    # single-threaded BLAS (parallelism here comes from the process pool, not from each
+    # worker also multi-threading its own linear algebra, so this is correct regardless);
+    # and keep the captured main-process affinity around so _reset_worker_affinity can be
+    # called defensively around the actual call that was confirmed to trigger the
+    # narrowing, since a one-time reset here wouldn't survive it recurring mid-pool-lifetime.
+    for _env in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                 "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[_env] = "1"
+    _worker_cpu_affinity = cpu_affinity
+    _reset_worker_affinity()
     _worker_shm = shared_memory.SharedMemory(name=shm_name)
     _worker_cube = np.ndarray(shape, dtype=dtype, buffer=_worker_shm.buf)
+    # fresh per worker process, i.e. per cube (a new pool -- and so a new call to this
+    # initializer -- is created for every forced_aperture_photometry call): a persistent
+    # dict here, reused across every track task this worker is dispatched over the pool's
+    # whole lifetime, is what makes the frame-level sigma-clip cache in
+    # _forced_aperture_photometry_core actually pay off in the parallel path -- see there
+    _worker_sigma_clip_cache = {}
 
 
 def _aperture_track_worker(track_df, radius_px):
-    return _forced_aperture_photometry_core(_worker_cube, track_df, radius_px)
+    return _forced_aperture_photometry_core(_worker_cube, track_df, radius_px,
+                                              sigma_clip_cache=_worker_sigma_clip_cache)
 
 
 def _psf_track_worker(track_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size):
@@ -82,12 +144,43 @@ def _run_parallel_by_track(cube, ephemeris_df, track_worker, worker_args, empty_
 
     designations = ephemeris_df["designation"].unique()
     if n_workers is None:
-        n_workers = max(1, min(len(designations), (os.cpu_count() or 4)))
+        n_workers = max(1, min(len(designations), _available_cpu_count()))
 
     if n_workers <= 1 or len(designations) <= 1:
         return None  # signal: caller should run its own sequential _core directly
 
     batch_size = max(n_workers * 20, 100)
+
+    # Batches only close out once every one of their own futures resolves, so a batch's
+    # own wall time is set by its single slowest track, not its average -- and track length
+    # varies hugely on a real cut (confirmed: 1 to 3116 rows on one field, std/mean ~64%),
+    # so batches built from designations' plain appearance order draw an arbitrary mix of
+    # big and small tracks, and most workers finish their (smaller) track well before that
+    # batch's biggest straggler, then sit idle until it's done. Sorting descending and
+    # chunking CONTIGUOUSLY (not round-robin -- confirmed by simulation that round-robin
+    # doesn't help at all, since it just reproduces the same overall size mix in every
+    # batch) groups similarly-sized tracks together instead: low variance within a batch
+    # means workers finish close together, so little idle waiting either way -- one batch
+    # of uniformly big tracks that's genuinely slow throughout, not fast-but-blocked-on-one.
+    # One groupby pass up front, not a fresh ephemeris_df["designation"] == d boolean scan
+    # of the FULL frame for every single track -- that scan is O(len(ephemeris_df)) each,
+    # and doing it once per track (1783 times on a real dense cut) made it O(n_tracks *
+    # len(ephemeris_df)), ~3.3 BILLION comparisons total, entirely on the one main-process
+    # core building each batch's futures -- confirmed live: sampling actual (not ps's
+    # lifetime-averaged) CPU ticks mid-run showed the main process pinned at 100% while
+    # every worker sat at ~2.7%, i.e. genuinely idle, not just imbalanced. Workers can never
+    # be fed faster than the main process can hand them work, so this dwarfed the batch-
+    # scheduling fix above -- that fix still matters (it's what determines whether the
+    # WORKERS themselves idle on each other once fed), but this is what was actually
+    # keeping them all starved.
+    groups = dict(tuple(ephemeris_df.groupby("designation")))
+    order = ephemeris_df.groupby("designation").size().sort_values(ascending=False).index.to_numpy()
+    batches = [order[i:i + batch_size] for i in range(0, len(order), batch_size)]
+
+    try:
+        main_affinity = os.sched_getaffinity(0)
+    except AttributeError:
+        main_affinity = None  # e.g. macOS -- _photometry_worker_init handles None as a no-op
 
     shm = shared_memory.SharedMemory(create=True, size=cube.nbytes)
     try:
@@ -95,10 +188,9 @@ def _run_parallel_by_track(cube, ephemeris_df, track_worker, worker_args, empty_
         shared_cube[:] = cube[:]
         batch_results = []
         with ProcessPoolExecutor(max_workers=n_workers, initializer=_photometry_worker_init,
-                                  initargs=(shm.name, cube.shape, cube.dtype)) as pool:
-            for start in range(0, len(designations), batch_size):
-                batch = designations[start:start + batch_size]
-                futures = [pool.submit(track_worker, ephemeris_df[ephemeris_df["designation"] == d].copy(), *worker_args)
+                                  initargs=(shm.name, cube.shape, cube.dtype, main_affinity)) as pool:
+            for batch in batches:
+                futures = [pool.submit(track_worker, groups[d], *worker_args)
                            for d in batch]
                 results = [fut.result() for fut in as_completed(futures)]
                 results = [r for r in results if len(r)]
@@ -139,26 +231,43 @@ def forced_aperture_photometry(cube, ephemeris_df, radius_px=APERTURE_RADIUS_PX,
     return _forced_aperture_photometry_core(cube, ephemeris_df, radius_px)
 
 
-def _forced_aperture_photometry_core(cube, ephemeris_df, radius_px):
+def _forced_aperture_photometry_core(cube, ephemeris_df, radius_px, sigma_clip_cache=None):
     from astropy.stats import sigma_clip
     from photutils.aperture import CircularAperture, CircularAnnulus, ApertureStats, aperture_photometry
+
+    # sigma_clip(frame, ...) below depends only on which frame this row is, never on the
+    # track's own position -- but with every track's rows sharing the same ~3000-ish
+    # frames, the naive per-row call recomputes the identical whole-frame clip hundreds of
+    # times over (confirmed: 1.83M rows against 3116 unique frames on a real dense cut,
+    # ~588x redundant on average) and was the dominant cost of the whole asteroid_lightcurves
+    # stage. Caching per frame index removes that redundancy; sigma_clip_cache is None (a
+    # fresh dict, scoped to just this one call) in the sequential fallback path, where a
+    # single call already covers every track's rows together, or the calling worker's own
+    # persistent dict in the parallel path (see _photometry_worker_init) so the cache still
+    # pays off there even though each worker call only ever sees one track's own rows.
+    if sigma_clip_cache is None:
+        sigma_clip_cache = {}
 
     r_in, r_out = 2 * radius_px + 3, 2 * radius_px + 7
     rows = []
     for row in ephemeris_df.itertuples():
         if not (0 <= row.x < cube.shape[2] and 0 <= row.y < cube.shape[1]):
             continue
-        frame = cube[row.frame]
+        frame_idx = int(row.frame)
+        frame = cube[frame_idx]
         aperture = CircularAperture([(row.x, row.y)], radius_px)
         annulus = CircularAnnulus([(row.x, row.y)], r_in, r_out)
-        mask = sigma_clip(frame, masked=True, sigma=5).mask
+        mask = sigma_clip_cache.get(frame_idx)
+        if mask is None:
+            mask = sigma_clip(frame, masked=True, sigma=5).mask
+            sigma_clip_cache[frame_idx] = mask
         sky = ApertureStats(frame, annulus, mask=mask)
         phot = aperture_photometry(frame, aperture)
         npix = aperture.area
         sky_mean, sky_std = float(sky.mean[0]), float(sky.std[0])
         flux = float(phot["aperture_sum"].value[0]) - npix * sky_mean
         sig = flux / (np.sqrt(npix) * sky_std) if sky_std and np.isfinite(sky_std) and sky_std > 0 else np.nan
-        rows.append(dict(designation=row.designation, frame=int(row.frame), mjd=row.mjd,
+        rows.append(dict(designation=row.designation, frame=frame_idx, mjd=row.mjd,
                           x=row.x, y=row.y, flux=flux, sky_std=sky_std, sig=sig))
     # pd.DataFrame([]) has no columns at all (not even 'x') -- a fully out-of-bounds track
     # (e.g. every frame lands within STAMP_SIZE/2 of a cut's edge) would otherwise silently
@@ -216,6 +325,11 @@ def _forced_psf_photometry_core(cube, ephemeris_df, sector, cam, ccd, ccd_x0, cc
                                 cam, ccd, sector, prf_path=prf_path, stamp_size=stamp_size)
         except Exception:
             continue
+        # confirmed live (see _photometry_worker_init) that the first call into this
+        # (PRF-loading, BLAS-backed) function is exactly what triggers the affinity
+        # narrowing in a forked worker -- reset immediately after every call, not just
+        # once, since it isn't certain the env-var fix alone prevents it from recurring
+        _reset_worker_affinity()
         flux, e_flux, bg = float(out["flux_counts"][0]), float(out["e_flux_counts"][0]), float(out["background"][0])
         sig = flux / e_flux if e_flux and np.isfinite(e_flux) and e_flux > 0 else np.nan
         rows.append(dict(designation=row.designation, frame=int(row.frame), mjd=row.mjd,
@@ -850,7 +964,13 @@ def pool_offset_from_stacks(ephemeris, cube, sector, cam, ccd, ccd_x0, ccd_y0, p
             continue
         rows.append(dict(designation=designation, offset_x=ox, offset_y=oy, sig=sig,
                           flux=flux, mag=mag, mag_err=mag_err, n_stamps=n_stamps, used=used))
-    diagnostics = pd.DataFrame(rows)
+    # pd.DataFrame([]) has no columns at all (not even 'used') -- a cut where every single
+    # predicted track has zero usable stamps (confirmed: a real cut, no tracks ever land
+    # in-bounds) would otherwise raise KeyError on the diagnostics["used"] access below
+    # instead of just producing zero used tracks, same pitfall already guarded against in
+    # forced_aperture_photometry/forced_psf_photometry's own empty-result cases
+    diagnostics = pd.DataFrame(rows, columns=["designation", "offset_x", "offset_y", "sig",
+                                                "flux", "mag", "mag_err", "n_stamps", "used"])
 
     used_offsets = diagnostics[diagnostics["used"]]
     if len(used_offsets) < min_tracks:

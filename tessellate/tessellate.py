@@ -2975,13 +2975,38 @@ export PYTHONUNBUFFERED=1\n\
     # above was against southern-sector (Cycle 3) data, which rarely exceeds ~35 tracks/cut;
     # northern cuts commonly run 300-400+ tracks/cut (an order of magnitude denser), a regime
     # the original fit never sampled and its claimed 1.30x margin doesn't safely extrapolate
-    # into. No real data yet to refit the northern-regime slope, so this is a conservative
-    # multiplier (2.5x time, matching floor bump) pending enough completed northern jobs to
-    # refit properly -- revisit once that data exists.
-    _LIGHTCURVES_TIME_PER_TRACK_S = 5.0
+    # into.
+    #
+    # Revised after a real asteroid_lightcurves performance investigation found and fixed
+    # 6 real bugs in the forced-photometry dispatch path (sigma-clip mask recomputed
+    # redundantly per row, batch scheduling imbalance, an O(n_tracks * n_rows) per-track
+    # DataFrame filter, os.cpu_count() oversubscribing workers 36-to-8, and -- the dominant
+    # one -- BLAS/OpenBLAS silently pinning every forked worker to a single shared CPU) --
+    # see asteroid_photometry.py commits 7739ad0, f88bce0, 3587ce9, d09218c, 43c5086.
+    # Measured 15.4x faster wall-clock on the same real worst-case cut (Sector 44 Cam3 Ccd4
+    # Cut33, 1783 tracks -- denser than either the original 50-point southern fit's max of
+    # 563 tracks or the northern incident's ~440): 44:16 -> 2:53. Only PER_TRACK_S is scaled
+    # by that measured factor (with margin: 5.0/15.4 ~ 0.325, rounded up to 0.35) since it's
+    # what the fixes actually changed -- FLOOR_S covers fixed per-job overhead (imports, WCS
+    # load, cube load) the fixes never touched. Real near-zero-track measurements only
+    # showed ~8-11s of that overhead, but an initial floor of 60s (launched across the real
+    # Year 3 rerun) proved too tight in practice against real scheduling/filesystem variance
+    # on a live cluster, not just the raw compute time a controlled benchmark measures --
+    # kept at the pre-revision value of 300s for that safety margin rather than trimmed down
+    # to what the benchmark alone would justify. Memory dropped for an
+    # unrelated reason (worker count now genuinely 8, not float(36) competing for the same 8
+    # cores -- see d09218c), so MEM_* are set fresh from the one real measured peak (2.9GB
+    # at 1783 tracks) rather than scaled from the old memory constants, which were never
+    # northern-bump-validated for memory the way TIME was (only TIME got the 2.5x bump above).
+    # Validated against 8 real cuts spanning both southern (sectors 30, 35) and northern
+    # (40, 44) sectors, 0-1783 tracks -- see
+    # /fred/oz335/rridden/code/runs/shape_proto/resource_validation/. Revisit once enough
+    # real Year 3 (sectors 27-39) production jobs complete under these values to refit
+    # properly against a larger sample, the same way the original 50-point fit was built.
+    _LIGHTCURVES_TIME_PER_TRACK_S = 0.35
     _LIGHTCURVES_TIME_FLOOR_S = 300
-    _LIGHTCURVES_MEM_PER_TRACK_GB = 0.01
-    _LIGHTCURVES_MEM_FLOOR_GB = 22
+    _LIGHTCURVES_MEM_PER_TRACK_GB = 0.001
+    _LIGHTCURVES_MEM_FLOOR_GB = 4
 
     def _lightcurves_resources_for_cut(self,cam,ccd,cut):
         """Size asteroid_lightcurves' time/mem request from this cut's actual predicted track

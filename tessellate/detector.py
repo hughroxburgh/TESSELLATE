@@ -94,7 +94,7 @@ def _Negative_pixel_extent(data_sub, sources, r=2.0):
 
     return np.maximum(0.0, -min_vals) / std
 
-def _TESS_sourcefinder(image, frame_number, thresh = 0.3, bw=24,fwhm_min=0.7,fwhm_max=2.0, n_scales=10,deblend_nthresh=128,
+def _TESS_sourcefinder(image, frame_number, thresh = 0.3, bw=24,fwhm_min=0.7,fwhm_max=2.0, n_scales=10,deblend_nthresh=128,snr=3.0,
                        deblend_cont= 5e-5,dedup_radius= 1.0,flux_signs=(-1,1)):#,boundary_buffer= 2.0,boundary_near= 5.0):
 
     import sep
@@ -165,7 +165,7 @@ def _TESS_sourcefinder(image, frame_number, thresh = 0.3, bw=24,fwhm_min=0.7,fwh
         sources['frame'] = frame_number
 
             # self.background_ = bkg
-        allsources = pd.concat([allsources,sources[(sources.snr >= 3) & (sources.neg_extent < 3) & (sources.ellipticity<0.75)]])
+        allsources = pd.concat([allsources,sources[(sources.snr >= snr) & (sources.neg_extent < 3) & (sources.ellipticity<0.75)]])
 
     return allsources
 
@@ -1289,7 +1289,7 @@ class Detector():
     # ------------------------------ Source finding functions ------------------------------ #
 
     def _find_sources_in_images(self,flux,#column,row,
-                                inputNums=None,isolate_single_detections=True):#,datadir='/fred/oz335/_local_TESS_PRFs'):
+                                inputNums=None,isolate_single_detections=True,min_snr=3.0):#,datadir='/fred/oz335/_local_TESS_PRFs'):
         """
         Detect sources in flux and collate information.
         """
@@ -1336,7 +1336,7 @@ class Detector():
 
         # elif self.mode == 'claudefinder':
         # print('Source Finding')
-        sources = Parallel(n_jobs=self.cpu)(delayed(_TESS_sourcefinder)(flux[i],inputNum+i) for i in tqdm(length,desc='Source Finding'))
+        sources = Parallel(n_jobs=self.cpu)(delayed(_TESS_sourcefinder)(flux[i],inputNum+i,min_snr) for i in tqdm(length,desc='Source Finding'))
 
         # print('Making DataFrame')
         sources = _Make_dataframe(sources,flux[0])
@@ -1385,7 +1385,7 @@ class Detector():
     
         return result
 
-    def _run_find_sources(self,frame_bin):
+    def _run_find_sources(self,frame_bin,min_snr):
         """
         Run the source finding on this specific frame_binning.
         """
@@ -1412,7 +1412,7 @@ class Detector():
 
         # -- Run the detection algorithm, generates dataframe -- #
         results,single_isolated_detections = self._find_sources_in_images(flux,#column=column,row=row,datadir=self.prf_path,
-                                                                 isolate_single_detections=isolate_single_detections)
+                                                                 isolate_single_detections=isolate_single_detections,min_snr=min_snr)
         
         # -- Save out single detections which are isolated in space in time, probably noise, maybe cool -- #
         if isolate_single_detections:
@@ -1494,7 +1494,7 @@ class Detector():
 
         return frame_bins
 
-    def find_sources(self,time_bins):
+    def find_sources(self,time_bins,min_snr):
         """
         Find sources.
         """
@@ -1506,7 +1506,7 @@ class Detector():
         sources = pd.DataFrame()
         for frame_bin in frame_bins:
             ts = clock()
-            sources = pd.concat([sources,self._run_find_sources(frame_bin)]) 
+            sources = pd.concat([sources,self._run_find_sources(frame_bin,min_snr=min_snr)]) 
             print(f'    Run with time bin = {frame_bin} ({clock()-ts:.0f}s)',flush=True)
             
         # -- Reset objid so each objid,frame_bin pair is unique -- #
@@ -2280,7 +2280,7 @@ class Detector():
         
     # ------------------------------ Main search function ------------------------------ #
 
-    def transient_search(self,cut,mode='starfind',prf_path='/fred/oz335/_local_TESS_PRFs',time_bins=['10min']):
+    def transient_search(self,cut,mode='starfind',prf_path='/fred/oz335/_local_TESS_PRFs',time_bins=['10min'],min_snr=3.0):
 
         import os
 
@@ -2303,7 +2303,7 @@ class Detector():
 
         if self.sources is None:
             print('-------Source finding (see progress in errors log file)-------',flush=True)
-            self.find_sources(time_bins)
+            self.find_sources(time_bins,min_snr=min_snr)
             print('\n')
 
         if not os.path.exists(f'{self.prf_path}/cam{self.cam}_ccd{self.ccd}/snr_to_localisation/cut{cut}of{int(self.n**2)}_coeffs_y.npy'):

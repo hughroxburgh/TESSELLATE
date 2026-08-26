@@ -955,7 +955,8 @@ PYTHONUNBUFFERED=1\n\
             type_probs=(0.6, 0.2, 0.2),
             K_negative_range=(-0.2, 0.2),
             period_range_min=(20, None), period_mode_min=240.0,
-            period_concentration=3.0):
+            period_concentration=3.0,
+            search_snr = 3.0):
 
         _Print_buff(60,f'Running Source Injection for Sector{self.sector} Cam{self.cam} Ccd{self.ccd}')
 
@@ -1019,7 +1020,7 @@ PYTHONUNBUFFERED=1\n\
                             sector=self.sector,cam=self.cam,ccd=self.ccd,n=self.n,cuts=successful_cuts,
                             download=False,make_cube=False,fix_wcs=False,make_cuts=False,calibrate=False,
                             reduce=True,search=True,injection=True,plot=False,delete=False,injection_dir=self.injection_dir,
-                            reset_logs=False,overwrite=False,ask_config=False,save_config=False,use_suggestions=True)
+                            reset_logs=False,overwrite=False,ask_config=False,save_config=False,use_suggestions=True,search_snr=search_snr)
 
         
     def match_results_to_transients(self, centroid_match_radius=1.0, min_temporal_iou=0.0,

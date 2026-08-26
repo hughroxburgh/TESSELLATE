@@ -108,6 +108,18 @@ def _run_parallel_by_track(cube, ephemeris_df, track_worker, worker_args, empty_
     # batch) groups similarly-sized tracks together instead: low variance within a batch
     # means workers finish close together, so little idle waiting either way -- one batch
     # of uniformly big tracks that's genuinely slow throughout, not fast-but-blocked-on-one.
+    # One groupby pass up front, not a fresh ephemeris_df["designation"] == d boolean scan
+    # of the FULL frame for every single track -- that scan is O(len(ephemeris_df)) each,
+    # and doing it once per track (1783 times on a real dense cut) made it O(n_tracks *
+    # len(ephemeris_df)), ~3.3 BILLION comparisons total, entirely on the one main-process
+    # core building each batch's futures -- confirmed live: sampling actual (not ps's
+    # lifetime-averaged) CPU ticks mid-run showed the main process pinned at 100% while
+    # every worker sat at ~2.7%, i.e. genuinely idle, not just imbalanced. Workers can never
+    # be fed faster than the main process can hand them work, so this dwarfed the batch-
+    # scheduling fix above -- that fix still matters (it's what determines whether the
+    # WORKERS themselves idle on each other once fed), but this is what was actually
+    # keeping them all starved.
+    groups = dict(tuple(ephemeris_df.groupby("designation")))
     order = ephemeris_df.groupby("designation").size().sort_values(ascending=False).index.to_numpy()
     batches = [order[i:i + batch_size] for i in range(0, len(order), batch_size)]
 
@@ -119,7 +131,7 @@ def _run_parallel_by_track(cube, ephemeris_df, track_worker, worker_args, empty_
         with ProcessPoolExecutor(max_workers=n_workers, initializer=_photometry_worker_init,
                                   initargs=(shm.name, cube.shape, cube.dtype)) as pool:
             for batch in batches:
-                futures = [pool.submit(track_worker, ephemeris_df[ephemeris_df["designation"] == d].copy(), *worker_args)
+                futures = [pool.submit(track_worker, groups[d], *worker_args)
                            for d in batch]
                 results = [fut.result() for fut in as_completed(futures)]
                 results = [r for r in results if len(r)]

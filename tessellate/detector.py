@@ -1717,8 +1717,6 @@ class Detector():
         instead, so downstream code relying on asteroid_id being an int
         keeps working unchanged.
         """
-        from .tools import load_table, table_exists
-        from .asteroid_photometry import identify_known_asteroids
 
         ephemeris_path = f'{self.path}/Cut{self.cut}of{self.n**2}/asteroids/sector{self.sector}_cam{self.cam}_ccd{self.ccd}_cut{self.cut}_of{self.n**2}_Asteroids.csv'
         if not table_exists(ephemeris_path) or self.sources is None or len(self.sources) == 0:
@@ -1726,6 +1724,9 @@ class Detector():
             self.events['known_asteroid_dist_px'] = np.nan
             self.events['known_asteroid_frame'] = None
             return
+
+        from .tools import load_table, table_exists
+        from .asteroid_photometry import identify_known_asteroids
 
         ephemeris = load_table(ephemeris_path)
         if len(ephemeris) == 0:

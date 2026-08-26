@@ -2693,10 +2693,11 @@ export PYTHONUNBUFFERED=1\n\
                         print('\n')
                         prediction_status[(cam, ccd, cut)]['status'] = 'COMPLETED'
                     else:
-                        job_id = self._cut_predict_asteroids(cam=cam,ccd=ccd,cut=cut)
+                        cut_time = self._predict_asteroids_time_for_cut(cam,ccd,cut)
+                        job_id = self._cut_predict_asteroids(cam=cam,ccd=ccd,cut=cut,time=cut_time)
                         prediction_status[(cam, ccd, cut)]['status'] = 'INCOMPLETE'
                         prediction_status[(cam, ccd, cut)]['job_id'] = job_id
-                        prediction_status[(cam, ccd, cut)]['job_time'] = self.predict_asteroids_time
+                        prediction_status[(cam, ccd, cut)]['job_time'] = cut_time
 
         return prediction_status
 
@@ -3041,6 +3042,41 @@ export PYTHONUNBUFFERED=1\n\
         scaled_mem = int(np.ceil(total_mem / cpu))
 
         return scaled_time, cpu, scaled_mem
+
+    # Real timeout-RATE by |declination| bin across the Year 3/4 rerun (6666 completed +
+    # 1380 timed-out PredictAsteroids jobs, flat 10:00 budget): |dec|<20 -> 30.8-30.0%
+    # timeout rate, 20-30 -> 19.9%, >=30 -> a flat 4-7% background rate. predict_asteroids
+    # doesn't know its own candidate count ahead of time the way asteroid_lightcurves knows
+    # its track count from predict_asteroids' own completed output -- but it does know the
+    # cut's sky position, and declination is what's actually driving the density difference
+    # (TESS's northern-sky sectors put low declinations near the ecliptic plane, where real
+    # candidate counts run an order of magnitude denser: 5558 Stage-2 survivors on one real
+    # low-dec cut vs 215 on the cut the original flat 10:00 was benchmarked from). Tiers
+    # include +15min margin on top of what the raw data implied, per direct instruction
+    # after the first dec-based relaunch still needed some 60-min follow-up retries.
+    def _predict_asteroids_time_for_cut(self,cam,ccd,cut):
+        try:
+            from astropy.io import fits
+            from astropy.wcs import WCS
+            from .dataprocessor import DataProcessor
+            processor = DataProcessor(sector=self.sector,data_path=self.data_path,verbose=0)
+            cutCorners, _, _, _ = processor.find_cuts(cam=cam,ccd=ccd,n=self.n,plot=False,verbose=0)
+            x0, y0 = cutCorners[cut-1]
+            wcs_path = f'{processor.path}/Cam{cam}/Ccd{ccd}/wcs/ref/corrected.fits'
+            with fits.open(wcs_path) as f:
+                wcsItem = WCS(f[1].header)
+            cut_side = 2078 / self.n
+            ra, dec = wcsItem.all_pix2world(x0 + cut_side/2, y0 + cut_side/2, 0)
+            abs_dec = abs(float(dec))
+        except Exception:
+            return self.predict_asteroids_time
+
+        if abs_dec < 20:
+            return "1:00:00"
+        elif abs_dec < 30:
+            return "45:00"
+        else:
+            return "12:00"
 
     def _cut_asteroid_lightcurves(self,cam,ccd,cut):
 

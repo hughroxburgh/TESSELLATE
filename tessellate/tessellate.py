@@ -28,7 +28,7 @@ class Tessellate():
                  reduce_time=None,reduce_cpu=None,reduce_mem=None,
                  asteroid_lightcurves_time=None,asteroid_lightcurves_cpu=None,asteroid_lightcurves_mem=None,
                  calibrate_time=None,calibrate_cpu=None,calibrate_mem=None,
-                 search_time=None,search_cpu=None,search_mem=None,detect_mode='both',time_bins=None,
+                 search_time=None,search_cpu=None,search_mem=None,detect_mode='both',search_time_bins=None,search_snr=3.0,
                  plot_time=None,plot_cpu=None,plot_mem=None,
                  download=None,make_cube=None,fix_wcs=None,make_cuts=None,predict_asteroids=None,
                  reduce=None,asteroid_lightcurves=None,calibrate=None,search=None,plot=None,delete=None,
@@ -184,7 +184,8 @@ class Tessellate():
         self.search_mem = search_mem
         self.search_cpu = search_cpu
         self.detect_mode = detect_mode
-        self.time_bins = time_bins
+        self.search_time_bins = search_time_bins
+        self.search_snr = search_snr
 
         self.plot_time = plot_time
         self.plot_mem = plot_mem
@@ -460,7 +461,7 @@ class Tessellate():
             self.search_mem = parse_value(parser['search'].get('search job memory', None))
             self.search_cpu = parse_value(parser['search'].get('search job cpu', None))
             self.detect_mode = parse_value(parser['search'].get('search detection mode', None))
-            self.time_bins = parse_value(parser['search'].get('search time bins', None))
+            self.search_time_bins = parse_value(parser['search'].get('search time bins', None))
             print(f'   - Run Transient Search on Cut(s)? [y/n] = y')
         else:
             search = False
@@ -542,7 +543,7 @@ class Tessellate():
             print(f"   - Search Batch Time ['h:mm:ss'] = {self.search_time}")
             print(f"   - Search Mem/CPU = {self.search_mem}")
             print(f"   - Search Num CPUs Needed = {self.search_cpu}")
-            print(f"   - Search Time Bins = {self.time_bins}")
+            print(f"   - Search Time Bins = {self.search_time_bins}")
             print('\n')
 
         if plot:
@@ -1788,40 +1789,39 @@ class Tessellate():
             raise ValueError(e)
 
         pattern = r'^\d+(\.\d+)?(sec|min|hr|day)s?$'
-        if self.time_bins is None:
+        if self.search_time_bins is None:
             if use_suggestions:
-                self.time_bins = suggestions[3].split(',')
-                print(f'   - Search Time Bin = {self.time_bins}')
+                self.search_time_bins = suggestions[3].split(',')
+                print(f'   - Search Time Bin = {self.search_time_bins}')
             else:
-                time_bins = input(f"   - Search Time Bins [#sec,#min,#hr,#day] ({suggestions[3]} suggested) = ")
+                search_time_bins = input(f"   - Search Time Bins [#sec,#min,#hr,#day] ({suggestions[3]} suggested) = ")
                 done = False
                 while not done:
-                    if ',' in time_bins:
-                        time_bins = time_bins.split(',')
+                    if ',' in search_time_bins:
+                        search_time_bins = search_time_bins.split(',')
                     else:
-                        time_bins = [time_bins]
+                        search_time_bins = [search_time_bins]
 
-                    if all(re.match(pattern, t) for t in time_bins):
-                        self.time_bins = time_bins
+                    if all(re.match(pattern, t) for t in search_time_bins):
+                        self.search_time_bins = search_time_bins
                         done = True
                     else:
-                        time_bins = input(f"      Invalid format! Search Time Bins [#sec,#min,#hr,#day] ({suggestions[3]} suggested) = ")
+                        search_time_bins = input(f"      Invalid format! Search Time Bins [#sec,#min,#hr,#day] ({suggestions[3]} suggested) = ")
         
         else:
-            if type(self.time_bins) == str:
-                self.time_bins = self.time_bins.split(',')
-                if all(re.match(pattern, t) for t in self.time_bins):
-                    print(f'   - Search Time Bin = {self.time_bins}')
+            if type(self.search_time_bins) == str:
+                self.search_time_bins = self.search_time_bins.split(',')
+                if all(re.match(pattern, t) for t in self.search_time_bins):
+                    print(f'   - Search Time Bin = {self.search_time_bins}')
                 else:
-                    e = f'Invalid Search Time Bin Input of {self.time_bins}\n'
+                    e = f'Invalid Search Time Bin Input of {self.search_time_bins}\n'
                     raise ValueError(e)
             
-            elif all(re.match(pattern, t) for t in self.time_bins):
-                print(f'   - Search Time Bins = {self.time_bins}')
+            elif all(re.match(pattern, t) for t in self.search_time_bins):
+                print(f'   - Search Time Bins = {self.search_time_bins}')
             else:
-                e = f'Invalid Search Time Bins Input of {self.time_bins}\n'
+                e = f'Invalid Search Time Bins Input of {self.search_time_bins}\n'
                 raise ValueError(e)
-
 
         print('\n')
     
@@ -2058,7 +2058,7 @@ class Tessellate():
                 'search job memory' : self.search_mem,
                 'search job cpu' : self.search_cpu,
                 'search detection mode' : self.detect_mode,
-                'search time bins' : self.time_bins}
+                'search time bins' : self.search_time_bins}
 
         if plot:
             config['plot'] = {
@@ -3323,13 +3323,13 @@ if part:\n\
     path2 = '{self.data_path}/{self.sector}/Cam{cam}/Ccd{ccd}/Part2/Cut{cut}of{self.n**2}/{self._inj_dir}/detected_events.csv'\n\
     if not os.path.exists(path1):\n\
         detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n},injection={self.injection},part=1)\n\
-        detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.time_bins})\n\
+        detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.search_time_bins},min_snr={self.search_snr})\n\
     if not os.path.exists(path2):\n\
         detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n},injection={self.injection},part=2)\n\
-        detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.time_bins})\n\
+        detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.search_time_bins},min_snr={self.search_snr})\n\
 else:\n\
     detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n},injection={self.injection},injection_dir='{self._inj_dir}')\n\
-    detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.time_bins})"   
+    detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.search_time_bins},min_snr={self.search_snr})"   
                     
         with open(f"{self.working_path}/detection_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py", "w") as python_file:
             python_file.write(python_text)

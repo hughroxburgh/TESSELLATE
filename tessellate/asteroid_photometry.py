@@ -97,6 +97,20 @@ def _run_parallel_by_track(cube, ephemeris_df, track_worker, worker_args, empty_
 
     batch_size = max(n_workers * 20, 100)
 
+    # Batches only close out once every one of their own futures resolves, so a batch's
+    # own wall time is set by its single slowest track, not its average -- and track length
+    # varies hugely on a real cut (confirmed: 1 to 3116 rows on one field, std/mean ~64%),
+    # so batches built from designations' plain appearance order draw an arbitrary mix of
+    # big and small tracks, and most workers finish their (smaller) track well before that
+    # batch's biggest straggler, then sit idle until it's done. Sorting descending and
+    # chunking CONTIGUOUSLY (not round-robin -- confirmed by simulation that round-robin
+    # doesn't help at all, since it just reproduces the same overall size mix in every
+    # batch) groups similarly-sized tracks together instead: low variance within a batch
+    # means workers finish close together, so little idle waiting either way -- one batch
+    # of uniformly big tracks that's genuinely slow throughout, not fast-but-blocked-on-one.
+    order = ephemeris_df.groupby("designation").size().sort_values(ascending=False).index.to_numpy()
+    batches = [order[i:i + batch_size] for i in range(0, len(order), batch_size)]
+
     shm = shared_memory.SharedMemory(create=True, size=cube.nbytes)
     try:
         shared_cube = np.ndarray(cube.shape, dtype=cube.dtype, buffer=shm.buf)
@@ -104,8 +118,7 @@ def _run_parallel_by_track(cube, ephemeris_df, track_worker, worker_args, empty_
         batch_results = []
         with ProcessPoolExecutor(max_workers=n_workers, initializer=_photometry_worker_init,
                                   initargs=(shm.name, cube.shape, cube.dtype)) as pool:
-            for start in range(0, len(designations), batch_size):
-                batch = designations[start:start + batch_size]
+            for batch in batches:
                 futures = [pool.submit(track_worker, ephemeris_df[ephemeris_df["designation"] == d].copy(), *worker_args)
                            for d in batch]
                 results = [fut.result() for fut in as_completed(futures)]

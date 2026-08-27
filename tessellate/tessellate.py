@@ -2992,22 +2992,21 @@ export PYTHONUNBUFFERED=1\n\
     # load, cube load) the fixes never touched. Real near-zero-track measurements only
     # showed ~8-11s of that overhead, but an initial floor of 60s (launched across the real
     # Year 3 rerun) proved too tight in practice against real scheduling/filesystem variance
-    # on a live cluster, not just the raw compute time a controlled benchmark measures --
-    # kept at the pre-revision value of 300s for that safety margin rather than trimmed down
-    # to what the benchmark alone would justify. Memory dropped for an
-    # unrelated reason (worker count now genuinely 8, not float(36) competing for the same 8
-    # cores -- see d09218c), so MEM_* are set fresh from the one real measured peak (2.9GB
-    # at 1783 tracks) rather than scaled from the old memory constants, which were never
-    # northern-bump-validated for memory the way TIME was (only TIME got the 2.5x bump above).
-    # Validated against 8 real cuts spanning both southern (sectors 30, 35) and northern
-    # (40, 44) sectors, 0-1783 tracks -- see
-    # /fred/oz335/rridden/code/runs/shape_proto/resource_validation/. Revisit once enough
-    # real Year 3 (sectors 27-39) production jobs complete under these values to refit
-    # properly against a larger sample, the same way the original 50-point fit was built.
-    _LIGHTCURVES_TIME_PER_TRACK_S = 0.35
-    _LIGHTCURVES_TIME_FLOOR_S = 300
-    _LIGHTCURVES_MEM_PER_TRACK_GB = 0.001
-    _LIGHTCURVES_MEM_FLOOR_GB = 4
+    # on a live cluster, not just the raw compute time a controlled benchmark measures.
+    # Refit 2026-08-27 against 21018 real COMPLETED AsteroidLightcurves jobs from the
+    # Year 3/4 production rerun (sectors 27-55), correlated against each cut's actual
+    # predicted track count -- the previous constants (0.35 s/track, 300s floor) were set
+    # from an 8-cut validation sample and turned out to badly overshoot time at scale (a
+    # 6292-track cut would have requested 2502s when the real max observed was 197s) while
+    # undershooting memory slightly at the high end. Fit as floor + slope*n_tracks against
+    # the 99.5th percentile of elapsed_s/mem_gb in n_tracks>=100 bins (isolating genuine
+    # per-track scaling from cluster-noise jitter, which floods low-track-count jobs up to
+    # ~150s regardless of track count), then padded ~20-25% for safety margin. Covers 100%
+    # of the 21018-row sample for time and 99.99% for memory (2 rows short by <0.08GB).
+    _LIGHTCURVES_TIME_PER_TRACK_S = 0.0009
+    _LIGHTCURVES_TIME_FLOOR_S = 240
+    _LIGHTCURVES_MEM_PER_TRACK_GB = 0.0025
+    _LIGHTCURVES_MEM_FLOOR_GB = 3
 
     def _lightcurves_resources_for_cut(self,cam,ccd,cut):
         """Size asteroid_lightcurves' time/mem request from this cut's actual predicted track

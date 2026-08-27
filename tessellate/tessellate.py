@@ -237,7 +237,13 @@ class Tessellate():
                 _Save_space(f'{self.job_output_path}/tessellate_asteroid_prediction_logs')
 
             if reduce:
-                self._reduce_properties(make_cuts,suggestions[2],use_suggestions)
+                # predict_asteroids (above) already resolves self.n/self.cuts from
+                # 'all' to a range when it runs first -- mirroring
+                # _asteroid_lightcurves_properties's guard so reduce doesn't try to
+                # re-resolve an already-resolved range and hit its elif chain's
+                # missing range case (confirmed the hard way: "Invalid Cut Input
+                # of range(1, 65)").
+                self._reduce_properties(make_cuts or predict_asteroids,suggestions[2],use_suggestions)
                 _Save_space(f'{self.job_output_path}/tessellate_reduction_logs')
 
             if asteroid_lightcurves:

@@ -31,14 +31,27 @@ def _Mexhat_kernels(fwhm: float) -> np.ndarray:
 
 def _Dedup_close_sources(combined: pd.DataFrame, dedup_radius: float) -> pd.DataFrame:
     from scipy.spatial import KDTree
-    keep = np.ones(len(combined), dtype=bool)
-    tree = KDTree(combined[["xcentroid", "ycentroid"]].values)
-    for i in range(len(combined)):
-        if not keep[i]:
-            continue
-        for j in tree.query_ball_point(combined[["xcentroid", "ycentroid"]].iloc[i].values, r=dedup_radius):
-            if j > i:
+    import numpy as np
+
+    n = len(combined)
+    if n == 0:
+        return combined
+
+    coords = combined[["xcentroid", "ycentroid"]].to_numpy()
+    keep = np.ones(n, dtype=bool)
+
+    tree = KDTree(coords)
+    # All pairs within radius, one bulk call instead of n separate queries
+    pairs = tree.query_pairs(r=dedup_radius, output_type="ndarray")
+
+    if len(pairs):
+        # combined is already sorted by flux descending, so lower index = higher flux.
+        # Process in index order so suppression follows flux priority, same as original.
+        pairs = pairs[np.argsort(pairs[:, 0], kind="stable")]
+        for i, j in pairs:
+            if keep[i]:
                 keep[j] = False
+
     return combined[keep].reset_index(drop=True)
 
 
@@ -94,20 +107,28 @@ def _Negative_pixel_extent(data_sub, sources, r=2.0):
 
     return np.maximum(0.0, -min_vals) / std
 
-def _TESS_sourcefinder(image, frame_number, thresh = 0.3, bw=24,fwhm_min=0.7,fwhm_max=2.0, n_scales=10,deblend_nthresh=128,min_snr=3.0,
-                       deblend_cont= 5e-5,dedup_radius= 1.0,flux_signs=(-1,1)):#,boundary_buffer= 2.0,boundary_near= 5.0):
+def _TESS_sourcefinder(image, frame_number, thresh=0.3, bw=24, fwhm_min=0.7, fwhm_max=2.0, n_scales=10,
+                        deblend_nthresh=128, min_snr=3.0, deblend_cont=5e-5, dedup_radius=1.0,
+                        flux_signs=(-1, 1)):
 
     import sep
 
     fwhms = np.linspace(fwhm_min, fwhm_max, n_scales)
     kernels = [_Mexhat_kernels(f) for f in fwhms]
 
+    # --- Compute background ONCE on the positive image ---
+    # Background level is antisymmetric under negation (back(-x) = -back(x))
+    # and RMS is symmetric (rms(-x) = rms(x)), so we avoid a second full
+    # sep.Background() call (median/mode tiling) for the negative pass.
+    data_pos = np.asarray(image, dtype=np.float32)
+    bkg = sep.Background(data_pos, bw=bw, bh=bw)
+    back_pos = bkg.back()
+    rms = bkg.rms()  # shared by both flux signs
+
     allsources = pd.DataFrame()
     for flux_sign in flux_signs:
-        data = np.asarray(image*flux_sign, dtype=np.float32)
-        bkg = sep.Background(data, bw=bw, bh=bw)
-        data_sub = data - bkg.back()
-        err = bkg.rms()
+        data_sub = data_pos * flux_sign - back_pos * flux_sign
+        err = rms
 
         per_scale = []
         for fwhm, kern in zip(fwhms, kernels):
@@ -129,9 +150,6 @@ def _TESS_sourcefinder(image, frame_number, thresh = 0.3, bw=24,fwhm_min=0.7,fwh
                 "detection_fwhm": fwhm,
             }))
 
-        empty = pd.DataFrame(columns=["xcentroid","ycentroid","flux","peak","a","b","theta","flag",
-                                    "detection_fwhm","snr","ellipticity","fwhm",
-                                    "neg_extent"])
         if not per_scale:
             continue
 
@@ -142,15 +160,7 @@ def _TESS_sourcefinder(image, frame_number, thresh = 0.3, bw=24,fwhm_min=0.7,fwh
             dedup_radius,
         )
 
-        # H, W = data_sub.shape
-        # x, y = sources["x"].values, sources["y"].values
-        # dist_to_edge = np.minimum.reduce([x, y, (W - 1) - x, (H - 1) - y])
-        # sources = sources[dist_to_edge >= boundary_buffer].reset_index(drop=True)
-
-        # x, y = sources["x"].values, sources["y"].values
-        # dist_to_edge = np.minimum.reduce([x, y, (W - 1) - x, (H - 1) - y])
-        # sources["boundary_flag"] = dist_to_edge < boundary_near
-
+        # Aperture photometry (r=1.5) for SNR
         ap_flux, ap_err, _ = sep.sum_circle(
             data_sub, sources["xcentroid"].values, sources["ycentroid"].values,
             r=1.5, err=err, gain=1.0,
@@ -161,11 +171,13 @@ def _TESS_sourcefinder(image, frame_number, thresh = 0.3, bw=24,fwhm_min=0.7,fwh
         sources["ellipticity"] = 1.0 - sources["b"].values / a
         sources["fwhm"] = 2.0 * np.sqrt(np.log(2) * 2) * np.sqrt(sources["a"] * sources["b"])
         sources["neg_extent"] = _Negative_pixel_extent(data_sub, sources, r=2.0)
-        sources['flux_sign'] = flux_sign
-        sources['frame'] = frame_number
+        sources["flux_sign"] = flux_sign
+        sources["frame"] = frame_number
 
-            # self.background_ = bkg
-        allsources = pd.concat([allsources,sources[(sources.snr >= min_snr) & (sources.neg_extent < 3) & (sources.ellipticity<0.75)]])
+        allsources = pd.concat([
+            allsources,
+            sources[(sources.snr >= min_snr) & (sources.neg_extent < 3) & (sources.ellipticity < 0.75)]
+        ])
 
     return allsources
 

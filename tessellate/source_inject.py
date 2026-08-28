@@ -715,7 +715,7 @@ class SourceInjector():
         raw_cube, processed = self.load_raw_cube(cut, cube_mode)
 
         if processed:
-            shifts = np.zeros((self._true_nav.time.shape[0], 2)).shape
+            shifts = np.zeros((self._true_nav.time.shape[0], 2))
         else:
             shifts = np.load(f'{directory}/{base_name}_Shifts.npy')
 

@@ -558,10 +558,10 @@ class SourceInjector():
 
             if source.event_type == 'sinusoid':
                 flux = Gen_Sinusoid(time_days, source.period_min, cadence_min, phase=source.phase)
-                sign = 1.0
+                flux_sign = 1.0
             else:
                 flux = Gen_Event(source.K, cadence_min, time_days, source.event_time_min, source.duty_frac)
-                sign = -1.0 if source.event_type == 'negative' else 1.0
+                flux_sign = -1.0 if source.event_type == 'negative' else 1.0
 
             frames = np.arange(source.frame_start, source.frame_end)
             ref_idx = np.argmax(np.abs(flux))
@@ -624,7 +624,7 @@ class SourceInjector():
 
                 raw_cube[frames[j], yint-2:yint+3, xint-2:xint+3] += image_frame
 
-            snr_lc = flux * source.snr / np.nanmax(flux) * source.flux_sign
+            snr_lc = flux * source.snr / np.nanmax(flux) * flux_sign
             injections.iloc[i, injections.columns.get_loc('n_sig_frames')] = len(np.where(snr_lc>3)[0])
             
 

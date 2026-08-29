@@ -603,7 +603,7 @@ class SourceInjector():
             b = -source.snr**2 / 600
             c = -source.snr**2 * npix * noise**2
             peak_flux = (-b + np.sqrt(b**2 - 4*c)) / 2
-            peak_flux *= sign
+            peak_flux *= flux_sign
 
             flux *= peak_flux
             lcs.append(np.array([frames,flux]))

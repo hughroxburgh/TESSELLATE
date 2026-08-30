@@ -685,9 +685,9 @@ class Tessellate():
             # search_cpu_sug = '32'
             # search_mem_req = 64
             # search_time_bins = '10min'
-            search_time_sug = '45:00'
+            search_time_sug = '1:00:00'
             search_cpu_sug = '32'
-            search_mem_req = 32
+            search_mem_req = 64
             search_time_bins = '10min,30min,2hr,12hr'
 
             plot_time_sug = '10:00'

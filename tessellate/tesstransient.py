@@ -30,7 +30,7 @@ from shapely.geometry.point import Point
     
 class TessTransient():
     
-    def __init__(self,ra,dec,eventtime,data_path,job_output_path,working_path,error=0,n=8,verbose=1,run=False,download=True):
+    def __init__(self,ra,dec,eventtime,data_path,job_output_path,working_path,error=0.1,n=8,verbose=1,run=False,download=True):
         """
         Transient Localisation for TESS!
 

@@ -620,6 +620,88 @@ def _Get_temporal_events(df, max_gap=2, frame_col='frame', id_col='eventid',star
     return df
 
 
+# def _Lightcurve_significance(time,flux,frame_start,frame_end,pos,flux_sign,
+#                            event_mask=None,event_time_buffer = 0.2,calc_time_window=1):
+
+#     from tessellate.tools import Generate_LC
+#     from scipy import stats
+
+#     y = pos[1] 
+#     x = pos[0] 
+#     t,lc = Generate_LC(time,flux,x,y,radius=1.5)
+
+#     time_start = time[frame_start]
+#     time_end = time[frame_end]
+    
+#     buffer_start = np.argmin(abs(time - (time_start - event_time_buffer)))
+#     buffer_end = np.argmin(abs(time - (time_end + event_time_buffer)))
+#     if buffer_start < 0:
+#         buffer_start = 0
+#     if buffer_end > len(time):
+#         buffer_end = len(time) - 1 
+
+#     window_start = np.argmin(abs(time - (time_start - event_time_buffer-calc_time_window)))
+#     window_end = np.argmin(abs(time - (time_end + event_time_buffer+calc_time_window)))
+#     if window_start < 0:
+#         window_start = 0
+#     if window_end > len(time):
+#         window_end = len(time) - 1 
+
+#     frames = np.arange(0,len(lc))
+#     if event_mask is None:
+#         event_mask = np.ones_like(frames).astype(bool)
+
+#     # local window excluding THIS event's frames, respecting event_mask (original "ind")
+#     ind = event_mask & (((frames > window_start) & (frames < buffer_start)) | ((frames < window_end) & (frames > buffer_end)))
+
+#     # same exclusion of THIS event's frames, but ignoring event_mask entirely
+#     ind_abs = ((frames > window_start) & (frames < buffer_start)) | ((frames < window_end) & (frames > buffer_end))
+
+#     t_window = t[ind]
+#     lc_window = lc[ind]
+    
+#     med = np.nanmedian(lc_window)
+#     std = np.nanstd(lc_window)
+
+#     lcevent = lc[frame_start:frame_end+1]
+#     lc_sig = (lcevent - med) / std
+
+#     if flux_sign >= 0:
+#         sig_max = np.nanmax(lc_sig)
+#         sig_med = np.nanmean(lc_sig)
+#         max_flux = np.nanmax(lcevent)
+#         max_frame = np.argmax(lcevent)+frame_start
+        
+#     else:
+#         max_flux = np.nanmin(lcevent)
+#         max_frame = np.argmin(lcevent)+frame_start
+#         sig_max = abs(np.nanmin(lc_sig))
+#         sig_med = abs(np.nanmean(lc_sig))
+    
+#     lc_sig = (lc - med) / std
+
+#     if ind.sum() < 2:
+#         return np.nan, np.nan, np.ones_like(time)*np.nan, max_flux, max_frame, np.nan
+
+#     slope, _, _, _, _ = stats.linregress(t_window, lc_window)
+#     flat_local = (abs(slope) / std < 2) and (abs(med) < std) and (std < 5)
+
+#     if not flat_local:
+#         baseline_is_flat = -1
+#     else:
+#         if ind_abs.sum() < 2:
+#             baseline_is_flat = 0
+#         else:
+#             t_abs = t[ind_abs]
+#             lc_abs = lc[ind_abs]
+#             slope_abs, _, _, _, _ = stats.linregress(t_abs, lc_abs)
+#             med_abs = np.nanmedian(lc_abs)
+#             std_abs = np.nanstd(lc_abs)
+#             flat_absolute = (abs(slope_abs) / std_abs < 2) and (abs(med_abs) < std_abs) and (std_abs < 5)
+#             baseline_is_flat = 1 if flat_absolute else 0
+
+#     return sig_max, sig_med, lc_sig * flux_sign, max_flux, max_frame, baseline_is_flat
+
 def _Lightcurve_significance(time,flux,frame_start,frame_end,pos,flux_sign,
                            event_mask=None,event_time_buffer = 0.2,calc_time_window=1):
 
@@ -729,7 +811,7 @@ def _Lightcurve_event_checker(lc_sig,triggers,siglim=3,maxsep=5):
     return new_start,new_end,n_detections,sorted(triggers)
 
 
-def _Fit_psf(flux, event, prf, frames, uncertainty_funcs, exposure_time, big_size=15, small_size=5,core_size=3):
+def _Fit_psf(flux, event, prf, frames, uncertainty_funcs, exposure_time, big_size=15, small_size=5,core_size=3,psf_stacked=None):
     """
     Generate an cutout around an event and fit PSF. 
     Chooses the frame based on the highest SNR between stack through event and individual frames.
@@ -838,18 +920,17 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_funcs, exposure_time, big_siz
     stacked_snr = stacked_flux_sum / stacked_ap_err
 
     # --- Choose best image or stacked through event --- #
-    if np.max(snrs) >= stacked_snr:
-        idx = int(np.argmax(snrs))
-        centred_flux = cuts[idx][
-            half_big-half_small:half_big+half_small+1,
-            half_big-half_small:half_big+half_small+1,
-        ]
-        snr = snrs[idx]
-        stacked_psf_fit = 0
-    else:
+    use_stacked = psf_stacked if psf_stacked is not None else stacked_snr > np.max(snrs)
+
+    if use_stacked:
         centred_flux = stacked_small
         snr = stacked_snr
-        stacked_psf_fit = 1 
+        stacked_psf_fit = 1
+    else:
+        idx = int(np.argmax(snrs))
+        centred_flux = cuts[idx][half_big-half_small:half_big+half_small+1, half_big-half_small:half_big+half_small+1]
+        snr = snrs[idx]
+        stacked_psf_fit = 0
 
     # --- PSF fit --- #
     unc_x = uncertainty_funcs[0](snr)
@@ -877,7 +958,7 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_funcs, exposure_time, big_siz
 
 def _Isolate_events(objid,time,flux,sources,sector,cam,ccd,cut,prf,
                     exposure_time,snr_to_localisation_func,nan_frames,
-                    frame_buffer,event_time_buffer,calc_time_window):
+                    frame_buffer,event_time_buffer,calc_time_window,psf_stacked=None):
     """
     Groups sources for given objid into temporally separated events.
     """
@@ -957,7 +1038,7 @@ def _Isolate_events(objid,time,flux,sources,sector,cam,ccd,cut,prf,
         event['ycentroid_det'] = weighted_eventsources.iloc[0]['ycentroid']
 
         # -- Fit PSF -- #
-        event = _Fit_psf(flux,event,prf,frames,snr_to_localisation_func,exposure_time)
+        event = _Fit_psf(flux,event,prf,frames,snr_to_localisation_func,exposure_time,psf_stacked)
         
         # -- If event is quite PSF-like, centroid likely good -- #
         if event['psf_like']>0.5:

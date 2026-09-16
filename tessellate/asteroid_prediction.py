@@ -607,6 +607,16 @@ def _vectorized_kepler_unit_vectors(mpcorb_df, epoch_mjd, sample_mjds, earth_hel
 NEO_PERIHELION_AU = 1.3  # standard NEO definition; also where REBOUND's adaptive
                           # timestep starts being forced down by close passages
 
+HOT_PERIHELION_AU = 0.3  # the NEO bucket (q < NEO_PERIHELION_AU) is itself steep enough that
+                          # its own hottest members set the group's shared timestep for
+                          # everyone else in it -- measured on the current MPCORB.DAT: 42,131
+                          # objects share q < 1.3au, but only 479 of them have q < 0.3au (down
+                          # to 0.07au), and those 479 alone were enough to make the full
+                          # 42,131-object group not finish in 3 hours where a same-sized
+                          # bulk-only group finishes in under 1. Splitting those out mirrors
+                          # exactly the reasoning that separated NEOs from the bulk population
+                          # in the first place, one perihelion tier further down.
+
 
 # Mean obliquity of the ecliptic at J2000.0 (IAU, 23d26'21.448"). MPCORB's elements are
 # referenced to the ecliptic and mean equinox of J2000; ASSIST/REBOUND and the Sun's position
@@ -757,7 +767,8 @@ def _state_to_elements(pos_au, vel_au_per_day, mu):
 
 
 def build_sector_mpcorb_snapshot(target_mjd, data_dir=None, out_path=None,
-                                 shard_index=0, n_shards=1, neo_perihelion_au=NEO_PERIHELION_AU):
+                                 shard_index=0, n_shards=1, neo_perihelion_au=NEO_PERIHELION_AU,
+                                 hot_perihelion_au=HOT_PERIHELION_AU):
     """Re-epoch a shard of MPCORB to target_mjd (a sector's midpoint) via a real ASSIST
     integration, and save it in load_mpcorb's own column format so it is a drop-in replacement
     -- ecliptic_reachable_mask, brightness_reachable_mask and coarse_position_mask need no
@@ -773,12 +784,20 @@ def build_sector_mpcorb_snapshot(target_mjd, data_dir=None, out_path=None,
     a mixed 5,000-particle sweep cost 24.4 ms/particle where a bulk-only sweep of the same size
     cost 7.8 ms/particle, purely from a handful of small-perihelion outliers).
 
+    That NEO bucket is itself split again at hot_perihelion_au, for the same reason one level
+    down: a small number of very close-perihelion objects inside it (q < 0.3au, down to 0.07au
+    on the current file) forced the whole ~42,000-object NEO group's shared timestep down far
+    enough that it did not finish in 3 hours where a same-sized bulk-only group finishes in
+    under 1 (confirmed directly rather than assumed -- see the ecliptic_filter_fix debugging
+    history). The hot tier itself is small (479 objects on the current file) so runs quickly
+    once it is not carrying the other 41,000+ down with it.
+
     The MPCORB minority not on the file's dominant shared epoch (~0.7%, up to a ~5-year-old
-    epoch in the current file) is further excluded from both and grouped by its own epoch
-    value: each distinct epoch gets its own small integration from THAT epoch to target_mjd,
-    since REBOUND requires one shared sim.t for every particle added to a simulation. This is
-    a bounded, small Python-level loop (measured: 428 distinct epochs, none of them large),
-    not a per-object loop over the catalogue.
+    epoch in the current file) is further excluded from all of the above and grouped by its own
+    epoch value: each distinct epoch gets its own small integration from THAT epoch to
+    target_mjd, since REBOUND requires one shared sim.t for every particle added to a
+    simulation. This is a bounded, small Python-level loop (measured: 427 distinct epochs,
+    median 7 objects each, one outlier at 1047), not a per-object loop over the catalogue.
 
     Writes a parquet file of shard results; the caller (or a merge step) concatenates shards.
     """
@@ -790,7 +809,8 @@ def build_sector_mpcorb_snapshot(target_mjd, data_dir=None, out_path=None,
     common_epoch = pd.Series(epoch_mjd).mode().iloc[0]
     on_common = np.isclose(epoch_mjd, common_epoch)
     is_bulk = on_common & (q >= neo_perihelion_au)
-    is_neo = on_common & (q < neo_perihelion_au)
+    is_neo_warm = on_common & (q < neo_perihelion_au) & (q >= hot_perihelion_au)
+    is_neo_hot = on_common & (q < hot_perihelion_au)
     is_minority = ~on_common
 
     ephem = load_assist_ephem(data_dir)
@@ -849,8 +869,11 @@ def build_sector_mpcorb_snapshot(target_mjd, data_dir=None, out_path=None,
     results = []
     if shard_index == 0:
         # the small groups are cheap and only need doing once, regardless of how many
-        # shards the bulk population is split across
-        results.append(integrate_group(mpcorb[is_neo].reset_index(drop=True), common_epoch))
+        # shards the bulk population is split across -- warm and hot NEOs are integrated
+        # separately so the rare very-close-perihelion outliers don't force their crushed
+        # timestep onto the much larger warm-NEO group (see docstring)
+        results.append(integrate_group(mpcorb[is_neo_warm].reset_index(drop=True), common_epoch))
+        results.append(integrate_group(mpcorb[is_neo_hot].reset_index(drop=True), common_epoch))
         minority = mpcorb[is_minority]
         minority_epochs = epoch_mjd[is_minority]
         for ep in np.unique(minority_epochs):

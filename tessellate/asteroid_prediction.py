@@ -391,10 +391,42 @@ def get_tess_kernel_for_epoch(mjd, data_dir=None, allow_download=True):
 # Stage 1: ecliptic-latitude reachability
 # ---------------------------------------------------------------------------
 
-def ecliptic_reachable_mask(mpcorb_df, target_ecl_lat_deg, margin_deg=1.0):
-    """Vectorised, no propagation: an object can only ever be found at an
-    ecliptic latitude up to its own orbital inclination."""
-    return (mpcorb_df["inclination_degrees"].values + margin_deg) >= abs(target_ecl_lat_deg)
+def ecliptic_reachable_mask(mpcorb_df, epoch_mjd, sample_mjds, target_ecl_lat_deg, margin_deg):
+    """Vectorised, propagated -- an object's REAL ecliptic latitude at the actual observation
+    epoch, not a static geometric bound.
+
+    The previous version compared the field's ecliptic latitude, as seen from EARTH, against
+    only the object's HELIOCENTRIC orbital inclination: `inclination + margin_deg >=
+    abs(target_ecl_lat_deg)`. Those are not the same quantity. Earth sits up to 1 au off the
+    Sun-object line, and that parallax shifts the apparent ecliptic latitude beyond what the
+    heliocentric inclination alone permits -- by asin(1 au / perihelion distance), which is
+    negligible for a very distant object but ~11 deg for a Jupiter Trojan and tens of degrees
+    for an NEO. A flat 1 deg margin does not begin to cover that.
+
+    Confirmed missing (5254) Ulysses (i=24.19 deg) from a field at ecliptic latitude -30.6 deg:
+    24.19+1.0 < 30.6 by the old bound, so it was dropped at this first stage, before
+    propagation or brightness were ever checked, even though its real position that epoch sits
+    inside the field. The object was independently confirmed present in TESS's own archive by a
+    separate, non-TESSELLATE detection (SkyBoT cone search against the raw images).
+
+    A parallax-bounded worst case fixes the miss but is far too loose to use as a filter --
+    measured against the real MPCORB catalogue, it inflates survivors at this field's latitude
+    from 14,184 to 1,251,467 (99.7th percentile: 213,186), which would blow out every
+    downstream stage's cost by 1-2 orders of magnitude for any field off the ecliptic plane.
+
+    So instead of bounding what the orbit could EVER reach, this propagates each object's
+    actual position to sample_mjds (the same coarse-sampling epochs stage 2 already uses,
+    reusing _vectorized_kepler_unit_vectors -- the identical machinery stage 2 calls, just run
+    over the full catalogue instead of stage 1b's survivors, ~4-7s for 1.5M rows) and tests the
+    real ecliptic latitude at each sample against the field's, keeping a row if ANY sample
+    comes within margin_deg. margin_deg should be sized the same way the caller sizes stage 2's
+    (footprint radius + motion budget over the sample spacing), not the whole-window motion
+    budget, since a handful of samples across the window already bound how far a real position
+    can drift between them.
+    """
+    x, y, z = _vectorized_kepler_unit_vectors(mpcorb_df, epoch_mjd, np.asarray(sample_mjds))
+    lat_deg = np.degrees(np.arcsin(np.clip(z, -1.0, 1.0)))          # (n_objects, n_samples)
+    return (np.abs(lat_deg - target_ecl_lat_deg) <= margin_deg).any(axis=1)
 
 
 # ---------------------------------------------------------------------------
@@ -862,15 +894,9 @@ def predict_asteroids_for_footprint(ra_center_deg, dec_center_deg, radius_deg,
         verify_data_available(data_dir, frame_mjds=frame_mjds)
     mpcorb = load_mpcorb(data_dir)
 
-    ecl = SkyCoord(ra=ra_center_deg * u.deg, dec=dec_center_deg * u.deg).barycentrictrueecliptic
-    stage1 = ecliptic_reachable_mask(mpcorb, ecl.lat.deg, margin_deg=1.0)
-    print(f"  Stage 1 (ecliptic reachability): {stage1.sum()} / {len(mpcorb)} survive", flush=True)
-
-    stage1b_input = mpcorb[stage1].reset_index(drop=True)
-    stage1b = brightness_reachable_mask(stage1b_input, faint_limit_mag=faint_limit_mag)
-    print(f"  Stage 1b (best-case brightness <= {faint_limit_mag}): "
-          f"{stage1b.sum()} / {len(stage1b_input)} survive", flush=True)
-
+    # Coarse sample epochs across the observing window -- hoisted above stage 1 (it used to
+    # sit between stage 1b and stage 2) because stage 1 now needs it too: both stages
+    # propagate the same way, at the same epochs, just over different-sized candidate sets.
     max_motion_deg_per_day = 1.5
     if n_coarse_samples is None:
         # pick enough samples that the between-sample motion margin stays
@@ -882,14 +908,26 @@ def predict_asteroids_for_footprint(ra_center_deg, dec_center_deg, radius_deg,
         target_spacing = max(radius_deg / max_motion_deg_per_day, window_days / 500)
         n_coarse_samples = int(np.clip(np.ceil(window_days / target_spacing) + 1, 5, 500))
     sample_mjds = np.linspace(mjd_start, mjd_end, n_coarse_samples)
-    stage2_input = stage1b_input[stage1b].reset_index(drop=True)
-    # margin: footprint radius + typical geocentric motion budget between
-    # consecutive coarse samples (NOT the full window -- an object can only drift
-    # so far between adjacent samples, however long the overall window is)
     sample_spacing = sample_mjds[1] - sample_mjds[0] if n_coarse_samples > 1 else (mjd_end - mjd_start)
-    margin = radius_deg + max_motion_deg_per_day * sample_spacing
+    coarse_margin = radius_deg + max_motion_deg_per_day * sample_spacing
+
+    ecl = SkyCoord(ra=ra_center_deg * u.deg, dec=dec_center_deg * u.deg).barycentrictrueecliptic
+    epoch_mjd = _mpc_packed_epoch_to_mjd(mpcorb["epoch_packed"].values)
+    stage1 = ecliptic_reachable_mask(mpcorb, epoch_mjd, sample_mjds, ecl.lat.deg,
+                                     margin_deg=coarse_margin)
+    print(f"  Stage 1 (ecliptic reachability): {stage1.sum()} / {len(mpcorb)} survive", flush=True)
+
+    stage1b_input = mpcorb[stage1].reset_index(drop=True)
+    stage1b = brightness_reachable_mask(stage1b_input, faint_limit_mag=faint_limit_mag)
+    print(f"  Stage 1b (best-case brightness <= {faint_limit_mag}): "
+          f"{stage1b.sum()} / {len(stage1b_input)} survive", flush=True)
+
+    stage2_input = stage1b_input[stage1b].reset_index(drop=True)
+    # margin: footprint radius + typical geocentric motion budget between consecutive coarse
+    # samples (NOT the full window -- an object can only drift so far between adjacent
+    # samples, however long the overall window is). Same coarse_margin stage 1 uses above.
     stage2, hit_samples_by_row, rate_by_row = coarse_position_mask(
-        stage2_input, ra_center_deg, dec_center_deg, radius_deg + margin, sample_mjds,
+        stage2_input, ra_center_deg, dec_center_deg, radius_deg + coarse_margin, sample_mjds,
         return_hit_samples=True)
     survivors = stage2_input[stage2].reset_index(drop=True)
     print(f"  Stage 2 (coarse position): {len(survivors)} / {len(stage2_input)} survive", flush=True)

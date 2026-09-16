@@ -608,14 +608,48 @@ NEO_PERIHELION_AU = 1.3  # standard NEO definition; also where REBOUND's adaptiv
                           # timestep starts being forced down by close passages
 
 
+# Mean obliquity of the ecliptic at J2000.0 (IAU, 23d26'21.448"). MPCORB's elements are
+# referenced to the ecliptic and mean equinox of J2000; ASSIST/REBOUND and the Sun's position
+# from the ephemeris are in the ICRF-equatorial frame JPL's DE440 natively uses (indistinguishable
+# from J2000 mean equatorial at the sub-milliarcsecond level, far below anything relevant here).
+# The two frames differ by this one fixed rotation about the equinox (x) axis -- get it backwards
+# and every position is wrong by up to ~2*sin(23.4 deg)*r, of order several au at asteroid
+# distances, while still passing any test that only checks internal self-consistency (see the
+# validation history in this module's tests: state<->elements round-tripped to machine precision
+# while being ~6 au off skyfield's already-correct equatorial output, purely from this).
+_OBLIQUITY_J2000_RAD = np.radians(23.4392911)
+
+
+def _ecliptic_to_equatorial(vec):
+    """Rotate (..., 3) ecliptic vectors to equatorial (ICRF-equivalent) about the x-axis."""
+    eps = _OBLIQUITY_J2000_RAD
+    x, y, z = vec[..., 0], vec[..., 1], vec[..., 2]
+    return np.stack([x, y * np.cos(eps) - z * np.sin(eps), y * np.sin(eps) + z * np.cos(eps)], axis=-1)
+
+
+def _equatorial_to_ecliptic(vec):
+    """Inverse of _ecliptic_to_equatorial."""
+    eps = _OBLIQUITY_J2000_RAD
+    x, y, z = vec[..., 0], vec[..., 1], vec[..., 2]
+    return np.stack([x, y * np.cos(eps) + z * np.sin(eps), -y * np.sin(eps) + z * np.cos(eps)], axis=-1)
+
+
 def _vectorized_state_at_own_epoch(mpcorb_df):
-    """Heliocentric ecliptic (position_au, velocity_au_per_day) for every row, AT ITS OWN
-    MPCORB reference epoch -- exact 2-body, not an approximation, because dt=0 there: mean
-    anomaly at an object's own epoch is exactly its catalogued mean_anomaly_degrees, with no
-    Kepler-equation-vs-perturbation drift to accumulate. The one iterative step still needed
-    (mean anomaly -> eccentric anomaly) is the same Newton solve _vectorized_kepler_unit_vectors
-    already uses; this returns full 3-D state (both position AND velocity), not just a
-    direction, so the result can seed a REBOUND simulation.
+    """Heliocentric EQUATORIAL (ICRF-equivalent) (position_au, velocity_au_per_day) for every
+    row, AT ITS OWN MPCORB reference epoch -- exact 2-body, not an approximation, because dt=0
+    there: mean anomaly at an object's own epoch is exactly its catalogued mean_anomaly_degrees,
+    with no Kepler-equation-vs-perturbation drift to accumulate. The one iterative step still
+    needed (mean anomaly -> eccentric anomaly) is the same Newton solve
+    _vectorized_kepler_unit_vectors already uses; this returns full 3-D state (both position
+    AND velocity), not just a direction, so the result can seed a REBOUND simulation directly
+    (once the Sun's own equatorial-frame position/velocity from the ephemeris is added).
+
+    The orbital-plane rotation (node/inclination/argument of perihelion) naturally produces
+    ECLIPTIC coordinates, since that is the frame MPCORB's elements are defined in -- matching
+    _vectorized_kepler_unit_vectors's convention. An extra fixed obliquity rotation converts to
+    equatorial before returning, since that is the frame REBOUND/ASSIST and the ephemeris's Sun
+    position are in. Do not skip this: mixing frames here corrupts silently, since
+    self-consistency tests (state->elements round trip) cannot detect a frame error at all.
 
     mu (GM_sun) is not a separate constant: MPCORB's mean_daily_motion_degrees already encodes
     it per Kepler's third law (n^2 = mu/a^3), so mu = n^2 a^3 recovers exactly the GM_sun value
@@ -652,13 +686,13 @@ def _vectorized_state_at_own_epoch(mpcorb_df):
     R31 = sin_w * sin_i
     R32 = cos_w * sin_i
 
-    pos = np.stack([R11 * x_orb + R12 * y_orb,
-                    R21 * x_orb + R22 * y_orb,
-                    R31 * x_orb + R32 * y_orb], axis=-1)
-    vel = np.stack([R11 * vx_orb + R12 * vy_orb,
-                    R21 * vx_orb + R22 * vy_orb,
-                    R31 * vx_orb + R32 * vy_orb], axis=-1)
-    return pos, vel
+    pos_ecl = np.stack([R11 * x_orb + R12 * y_orb,
+                        R21 * x_orb + R22 * y_orb,
+                        R31 * x_orb + R32 * y_orb], axis=-1)
+    vel_ecl = np.stack([R11 * vx_orb + R12 * vy_orb,
+                        R21 * vx_orb + R22 * vy_orb,
+                        R31 * vx_orb + R32 * vy_orb], axis=-1)
+    return _ecliptic_to_equatorial(pos_ecl), _ecliptic_to_equatorial(vel_ecl)
 
 
 def _state_to_elements(pos_au, vel_au_per_day, mu):
@@ -670,9 +704,17 @@ def _state_to_elements(pos_au, vel_au_per_day, mu):
     integration implicitly conserves for an unperturbed two-body problem, and using the Sun's
     true GM here instead would reintroduce a small but avoidable inconsistency.
 
+    Input is heliocentric EQUATORIAL (ICRF-equivalent) -- what a REBOUND/ASSIST integration
+    works in, after subtracting the ephemeris's own equatorial-frame Sun position. Rotated back
+    to ecliptic first, since inclination/node/etc. below are defined relative to the ecliptic
+    pole [0,0,1], matching MPCORB's own convention -- see _vectorized_state_at_own_epoch for
+    why skipping this corrupts the result without any self-consistency test catching it.
+
     Returns a dict of the columns load_mpcorb's consumers expect, EXCLUDING epoch (the caller
     sets that to the target epoch this state was integrated to).
     """
+    pos_au = _equatorial_to_ecliptic(pos_au)
+    vel_au_per_day = _equatorial_to_ecliptic(vel_au_per_day)
     r = np.linalg.norm(pos_au, axis=-1)
     v2 = np.sum(vel_au_per_day ** 2, axis=-1)
     h_vec = np.cross(pos_au, vel_au_per_day)

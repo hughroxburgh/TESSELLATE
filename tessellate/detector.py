@@ -934,29 +934,39 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_func, exposure_time, big_size
         stacked_psf_fit = 0
 
     if snr < 0:
-        print('\n')
-        print(event)
-        print('\n')
-        raise ValueError
+        xcentroid = np.nan
+        ycentroid = np.nan
+        xcentroid_err_psf = np.nan
+        ycentroid_err_psf = np.nan
+        psf_like = 0
+        psf_diff = np.nan
+        stacked_psf_fit = 0
+    else:
 
-    # --- PSF fit --- #
-    unc_x = uncertainty_func(snr,95,'x')  # use the 95% confidence interval as the metric of interest
-    unc_y = uncertainty_func(snr,95,'y')  
+        # --- PSF fit --- #
+        unc_x = uncertainty_func(snr,95,'x')  # use the 95% confidence interval as the metric of interest
+        unc_y = uncertainty_func(snr,95,'y')  
 
-    fitter = PSF_Fitter(small_size, prf)
-    fitter.fit_psf(centred_flux, limx=0.5, limy=0.5)
+        fitter = PSF_Fitter(small_size, prf)
+        fitter.fit_psf(centred_flux, limx=0.5, limy=0.5)
 
-    event['xcentroid_psf'] = fitter.source_x + brightest_x
-    event['ycentroid_psf'] = fitter.source_y + brightest_y - GLOBAL_PSF_Y_OFFSET
-    event['xcentroid_err_psf'] = unc_x
-    event['ycentroid_err_psf'] = unc_y
+        xcentroid = fitter.source_x + brightest_x
+        ycentroid = fitter.source_y + brightest_y - GLOBAL_PSF_Y_OFFSET
+        xcentroid_err_psf = unc_x
+        ycentroid_err_psf = unc_y
+
+        psf_like = np.corrcoef(centred_flux.flatten(), fitter.psf.flatten())[0, 1]
+
+        norm_flux = centred_flux / np.nansum(centred_flux)
+        psf_diff = np.nansum(np.abs(norm_flux - fitter.psf))
+
+    event['xcentroid_psf'] = xcentroid
+    event['ycentroid_psf'] = ycentroid
     event['snr_psf'] = snr
-
-    r = np.corrcoef(centred_flux.flatten(), fitter.psf.flatten())[0, 1]
-    event['psf_like'] = r
-
-    norm_flux = centred_flux / np.nansum(centred_flux)
-    event['psf_diff'] = np.nansum(np.abs(norm_flux - fitter.psf))
+    event['xcentroid_err_psf'] = xcentroid_err_psf
+    event['ycentroid_err_psf'] = ycentroid_err_psf
+    event['psf_like'] = psf_like
+    event['psf_diff'] = psf_diff
     event['psf_stacked'] = stacked_psf_fit
 
     return event

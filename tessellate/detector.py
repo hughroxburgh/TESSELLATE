@@ -812,7 +812,7 @@ def _Lightcurve_event_checker(lc_sig,triggers,siglim=3,maxsep=5):
     return new_start,new_end,n_detections,sorted(triggers)
 
 
-def _Fit_psf(flux, event, prf, frames, uncertainty_funcs, exposure_time, big_size=15, small_size=5,core_size=3,psf_stacked=None):
+def _Fit_psf(flux, event, prf, frames, uncertainty_func, exposure_time, big_size=15, small_size=5,core_size=3,psf_stacked=None):
     """
     Generate an cutout around an event and fit PSF. 
     Chooses the frame based on the highest SNR between stack through event and individual frames.
@@ -934,8 +934,8 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_funcs, exposure_time, big_siz
         stacked_psf_fit = 0
 
     # --- PSF fit --- #
-    unc_x = uncertainty_funcs['x'](snr,95)  # use the 95% confidence interval as the metric of interest
-    unc_y = uncertainty_funcs['y'](snr,95)  
+    unc_x = uncertainty_func(snr,95,'x')  # use the 95% confidence interval as the metric of interest
+    unc_y = uncertainty_func(snr,95,'y')  
 
     fitter = PSF_Fitter(small_size, prf)
     fitter.fit_psf(centred_flux, limx=0.5, limy=0.5)

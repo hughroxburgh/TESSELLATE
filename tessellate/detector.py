@@ -621,6 +621,88 @@ def _Get_temporal_events(df, max_gap=2, frame_col='frame', id_col='eventid',star
     return df
 
 
+def _Lightcurve_significance(time,flux,frame_start,frame_end,pos,flux_sign,
+                           event_mask=None,event_time_buffer = 0.2,calc_time_window=1):
+
+    from .tools import Generate_LC
+    from scipy import stats
+
+    y = pos[1] 
+    x = pos[0] 
+    t,lc = Generate_LC(time,flux,x,y,radius=1.5)
+
+    time_start = time[frame_start]
+    time_end = time[frame_end]
+    
+    buffer_start = np.argmin(abs(time - (time_start - event_time_buffer)))
+    buffer_end = np.argmin(abs(time - (time_end + event_time_buffer)))
+    if buffer_start < 0:
+        buffer_start = 0
+    if buffer_end > len(time):
+        buffer_end = len(time) - 1 
+
+    window_start = np.argmin(abs(time - (time_start - event_time_buffer-calc_time_window)))
+    window_end = np.argmin(abs(time - (time_end + event_time_buffer+calc_time_window)))
+    if window_start < 0:
+        window_start = 0
+    if window_end > len(time):
+        window_end = len(time) - 1 
+
+    frames = np.arange(0,len(lc))
+    if event_mask is None:
+        event_mask = np.ones_like(frames).astype(bool)
+
+    # local window excluding THIS event's frames, respecting event_mask (original "ind")
+    ind = event_mask & (((frames > window_start) & (frames < buffer_start)) | ((frames < window_end) & (frames > buffer_end)))
+
+    # same exclusion of THIS event's frames, but ignoring event_mask entirely
+    ind_abs = ((frames > window_start) & (frames < buffer_start)) | ((frames < window_end) & (frames > buffer_end))
+
+    t_window = t[ind]
+    lc_window = lc[ind]
+    
+    med = np.nanmedian(lc_window)
+    std = np.nanstd(lc_window)
+
+    lcevent = lc[frame_start:frame_end+1]
+    lc_sig = (lcevent - med) / std
+
+    if flux_sign >= 0:
+        sig_max = np.nanmax(lc_sig)
+        sig_med = np.nanmean(lc_sig)
+        max_flux = np.nanmax(lcevent)
+        max_frame = np.argmax(lcevent)+frame_start
+        
+    else:
+        max_flux = np.nanmin(lcevent)
+        max_frame = np.argmin(lcevent)+frame_start
+        sig_max = abs(np.nanmin(lc_sig))
+        sig_med = abs(np.nanmean(lc_sig))
+    
+    lc_sig = (lc - med) / std
+
+    if ind.sum() < 2:
+        return np.nan, np.nan, np.ones_like(time)*np.nan, max_flux, max_frame, np.nan
+
+    slope, _, _, _, _ = stats.linregress(t_window, lc_window)
+    flat_local = (abs(slope) / std < 2) and (abs(med) < std) and (std < 5)
+
+    if not flat_local:
+        baseline_is_flat = -1
+    else:
+        if ind_abs.sum() < 2:
+            baseline_is_flat = 0
+        else:
+            t_abs = t[ind_abs]
+            lc_abs = lc[ind_abs]
+            slope_abs, _, _, _, _ = stats.linregress(t_abs, lc_abs)
+            med_abs = np.nanmedian(lc_abs)
+            std_abs = np.nanstd(lc_abs)
+            flat_absolute = (abs(slope_abs) / std_abs < 2) and (abs(med_abs) < std_abs) and (std_abs < 5)
+            baseline_is_flat = 1 if flat_absolute else 0
+
+    return sig_max, sig_med, lc_sig * flux_sign, max_flux, max_frame, baseline_is_flat
+
 # def _Lightcurve_significance(time,flux,frame_start,frame_end,pos,flux_sign,
 #                            event_mask=None,event_time_buffer = 0.2,calc_time_window=1):
 
@@ -652,12 +734,9 @@ def _Get_temporal_events(df, max_gap=2, frame_col='frame', id_col='eventid',star
 #     if event_mask is None:
 #         event_mask = np.ones_like(frames).astype(bool)
 
-#     # local window excluding THIS event's frames, respecting event_mask (original "ind")
 #     ind = event_mask & (((frames > window_start) & (frames < buffer_start)) | ((frames < window_end) & (frames > buffer_end)))
-
-#     # same exclusion of THIS event's frames, but ignoring event_mask entirely
-#     ind_abs = ((frames > window_start) & (frames < buffer_start)) | ((frames < window_end) & (frames > buffer_end))
-
+#     #mean,med, std = sigma_clipped_stats(lc[ind])
+    
 #     t_window = t[ind]
 #     lc_window = lc[ind]
     
@@ -682,91 +761,12 @@ def _Get_temporal_events(df, max_gap=2, frame_col='frame', id_col='eventid',star
 #     lc_sig = (lc - med) / std
 
 #     if ind.sum() < 2:
-#         return np.nan, np.nan, np.ones_like(time)*np.nan, max_flux, max_frame, np.nan
+#         return np.nan, np.nan, np.ones_like(time)*np.nan,max_flux,max_frame,False
 
 #     slope, _, _, _, _ = stats.linregress(t_window, lc_window)
-#     flat_local = (abs(slope) / std < 2) and (abs(med) < std) and (std < 5)
-
-#     if not flat_local:
-#         baseline_is_flat = -1
-#     else:
-#         if ind_abs.sum() < 2:
-#             baseline_is_flat = 0
-#         else:
-#             t_abs = t[ind_abs]
-#             lc_abs = lc[ind_abs]
-#             slope_abs, _, _, _, _ = stats.linregress(t_abs, lc_abs)
-#             med_abs = np.nanmedian(lc_abs)
-#             std_abs = np.nanstd(lc_abs)
-#             flat_absolute = (abs(slope_abs) / std_abs < 2) and (abs(med_abs) < std_abs) and (std_abs < 5)
-#             baseline_is_flat = 1 if flat_absolute else 0
+#     baseline_is_flat =(abs(slope) / std < 2) and  (abs(med) < std) and (std < 5)
 
 #     return sig_max, sig_med, lc_sig * flux_sign, max_flux, max_frame, baseline_is_flat
-
-def _Lightcurve_significance(time,flux,frame_start,frame_end,pos,flux_sign,
-                           event_mask=None,event_time_buffer = 0.2,calc_time_window=1):
-
-    from tessellate.tools import Generate_LC
-    from scipy import stats
-
-    y = pos[1] 
-    x = pos[0] 
-    t,lc = Generate_LC(time,flux,x,y,radius=1.5)
-
-    time_start = time[frame_start]
-    time_end = time[frame_end]
-    
-    buffer_start = np.argmin(abs(time - (time_start - event_time_buffer)))
-    buffer_end = np.argmin(abs(time - (time_end + event_time_buffer)))
-    if buffer_start < 0:
-        buffer_start = 0
-    if buffer_end > len(time):
-        buffer_end = len(time) - 1 
-
-    window_start = np.argmin(abs(time - (time_start - event_time_buffer-calc_time_window)))
-    window_end = np.argmin(abs(time - (time_end + event_time_buffer+calc_time_window)))
-    if window_start < 0:
-        window_start = 0
-    if window_end > len(time):
-        window_end = len(time) - 1 
-
-    frames = np.arange(0,len(lc))
-    if event_mask is None:
-        event_mask = np.ones_like(frames).astype(bool)
-
-    ind = event_mask & (((frames > window_start) & (frames < buffer_start)) | ((frames < window_end) & (frames > buffer_end)))
-    #mean,med, std = sigma_clipped_stats(lc[ind])
-    
-    t_window = t[ind]
-    lc_window = lc[ind]
-    
-    med = np.nanmedian(lc_window)
-    std = np.nanstd(lc_window)
-
-    lcevent = lc[frame_start:frame_end+1]
-    lc_sig = (lcevent - med) / std
-
-    if flux_sign >= 0:
-        sig_max = np.nanmax(lc_sig)
-        sig_med = np.nanmean(lc_sig)
-        max_flux = np.nanmax(lcevent)
-        max_frame = np.argmax(lcevent)+frame_start
-        
-    else:
-        max_flux = np.nanmin(lcevent)
-        max_frame = np.argmin(lcevent)+frame_start
-        sig_max = abs(np.nanmin(lc_sig))
-        sig_med = abs(np.nanmean(lc_sig))
-    
-    lc_sig = (lc - med) / std
-
-    if ind.sum() < 2:
-        return np.nan, np.nan, np.ones_like(time)*np.nan,max_flux,max_frame,False
-
-    slope, _, _, _, _ = stats.linregress(t_window, lc_window)
-    baseline_is_flat =(abs(slope) / std < 2) and  (abs(med) < std) and (std < 5)
-
-    return sig_max, sig_med, lc_sig * flux_sign, max_flux, max_frame, baseline_is_flat
 
 
 def _Lightcurve_event_checker(lc_sig,triggers,siglim=3,maxsep=5):
@@ -1888,8 +1888,8 @@ class Detector():
                 dra_wrapped = (dra_raw + 180) % 360 - 180
 
                 box_mask = (
-                    (np.abs(dra_wrapped * np.cos(np.radians(event.dec))) < 3 * event.ra_err) &
-                    (np.abs(gaia.dec - event.dec) < 3 * event.dec_err)
+                    (np.abs(dra_wrapped * np.cos(np.radians(event.dec))) < event.ra_err) &
+                    (np.abs(gaia.dec - event.dec) < event.dec_err)
                 )
 
                 if box_mask.any():
@@ -1907,7 +1907,7 @@ class Detector():
                     dec_err_arcsec = event.dec_err * 3600
 
                     mahalanobis = np.sqrt((dra_arcsec / ra_err_arcsec)**2 + (ddec_arcsec / dec_err_arcsec)**2)
-                    rad_mask = mahalanobis <= 3
+                    rad_mask = mahalanobis <= 1
 
                     if rad_mask.any():
 

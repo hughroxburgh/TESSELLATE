@@ -958,7 +958,7 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_funcs, exposure_time, big_siz
 
 def _Isolate_events(objid,time,flux,sources,sector,cam,ccd,cut,prf,
                     exposure_time,snr_to_localisation_func,nan_frames,
-                    frame_buffer,event_time_buffer,calc_time_window,psf_stacked=None):
+                    frame_buffer,event_time_buffer,calc_time_window,psf_stacked=None,eventid=None):
     """
     Groups sources for given objid into temporally separated events.
     """
@@ -992,6 +992,10 @@ def _Isolate_events(objid,time,flux,sources,sector,cam,ccd,cut,prf,
     # -- Iterate through eventids -- #
     dfs = []
     for eventID in all_labelled_sources['eventid'].unique():
+
+        if (eventid is not None) and (eventID != eventid): 
+            continue
+
         event = {}
         eventsources = deepcopy(all_labelled_sources[all_labelled_sources['eventid']==eventID])
         weighted_eventsources = pandas_weighted_avg(eventsources,'snr')

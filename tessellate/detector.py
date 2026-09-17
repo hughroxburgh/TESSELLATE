@@ -1854,7 +1854,7 @@ class Detector():
         self.events.loc[matched,'classification'] = 'Asteroid'
         self.events = self.events.drop(columns=['matched_known_asteroid'])
 
-    def _catalogue_crossmatch(self,sigma=3):
+    def _catalogue_crossmatch(self):
         """
         Crossmatch events with stars / variables.
         """
@@ -1929,8 +1929,8 @@ class Detector():
         variables = pd.read_csv(f'{self.path}/Cut{self.cut}of{self.n**2}/variable_catalog.csv')
         for i,event in events.iterrows():
             if event.classification not in ['Asteroid','CosmicRay','Junk']:
-                inside = variables[(abs(variables.ra-event.ra) < sigma*event.ra_err)&
-                            (abs(variables.dec-event.dec) < sigma*event.dec_err)]
+                inside = variables[(abs(variables.ra-event.ra) < event.ra_err)&
+                            (abs(variables.dec-event.dec) < event.dec_err)]
                 if len(inside) > 0:
                     events.loc[i,'classification'] = inside.iloc[0].Type
 

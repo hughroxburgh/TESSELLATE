@@ -1632,7 +1632,7 @@ class Detector():
         from joblib import Parallel, delayed 
         from tqdm import tqdm
         from .dataprocessor import DataProcessor
-        from .localisation import get_snr_to_localisation_func, get_wcs_uncertainty
+        from .localisation import get_snr_to_localisation_func #, get_wcs_uncertainty
         from .tools import Frame_Bin
         from PRF import TESS_PRF
         from astropy.io import fits

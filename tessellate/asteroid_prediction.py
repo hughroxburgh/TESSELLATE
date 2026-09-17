@@ -391,10 +391,42 @@ def get_tess_kernel_for_epoch(mjd, data_dir=None, allow_download=True):
 # Stage 1: ecliptic-latitude reachability
 # ---------------------------------------------------------------------------
 
-def ecliptic_reachable_mask(mpcorb_df, target_ecl_lat_deg, margin_deg=1.0):
-    """Vectorised, no propagation: an object can only ever be found at an
-    ecliptic latitude up to its own orbital inclination."""
-    return (mpcorb_df["inclination_degrees"].values + margin_deg) >= abs(target_ecl_lat_deg)
+def ecliptic_reachable_mask(mpcorb_df, epoch_mjd, sample_mjds, target_ecl_lat_deg, margin_deg):
+    """Vectorised, propagated -- an object's REAL ecliptic latitude at the actual observation
+    epoch, not a static geometric bound.
+
+    The previous version compared the field's ecliptic latitude, as seen from EARTH, against
+    only the object's HELIOCENTRIC orbital inclination: `inclination + margin_deg >=
+    abs(target_ecl_lat_deg)`. Those are not the same quantity. Earth sits up to 1 au off the
+    Sun-object line, and that parallax shifts the apparent ecliptic latitude beyond what the
+    heliocentric inclination alone permits -- by asin(1 au / perihelion distance), which is
+    negligible for a very distant object but ~11 deg for a Jupiter Trojan and tens of degrees
+    for an NEO. A flat 1 deg margin does not begin to cover that.
+
+    Confirmed missing (5254) Ulysses (i=24.19 deg) from a field at ecliptic latitude -30.6 deg:
+    24.19+1.0 < 30.6 by the old bound, so it was dropped at this first stage, before
+    propagation or brightness were ever checked, even though its real position that epoch sits
+    inside the field. The object was independently confirmed present in TESS's own archive by a
+    separate, non-TESSELLATE detection (SkyBoT cone search against the raw images).
+
+    A parallax-bounded worst case fixes the miss but is far too loose to use as a filter --
+    measured against the real MPCORB catalogue, it inflates survivors at this field's latitude
+    from 14,184 to 1,251,467 (99.7th percentile: 213,186), which would blow out every
+    downstream stage's cost by 1-2 orders of magnitude for any field off the ecliptic plane.
+
+    So instead of bounding what the orbit could EVER reach, this propagates each object's
+    actual position to sample_mjds (the same coarse-sampling epochs stage 2 already uses,
+    reusing _vectorized_kepler_unit_vectors -- the identical machinery stage 2 calls, just run
+    over the full catalogue instead of stage 1b's survivors, ~4-7s for 1.5M rows) and tests the
+    real ecliptic latitude at each sample against the field's, keeping a row if ANY sample
+    comes within margin_deg. margin_deg should be sized the same way the caller sizes stage 2's
+    (footprint radius + motion budget over the sample spacing), not the whole-window motion
+    budget, since a handful of samples across the window already bound how far a real position
+    can drift between them.
+    """
+    x, y, z = _vectorized_kepler_unit_vectors(mpcorb_df, epoch_mjd, np.asarray(sample_mjds))
+    lat_deg = np.degrees(np.arcsin(np.clip(z, -1.0, 1.0)))          # (n_objects, n_samples)
+    return (np.abs(lat_deg - target_ecl_lat_deg) <= margin_deg).any(axis=1)
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +581,330 @@ def _vectorized_kepler_unit_vectors(mpcorb_df, epoch_mjd, sample_mjds, earth_hel
     return x / norm, y / norm, z / norm
 
 
+# ---------------------------------------------------------------------------
+# Per-sector MPCORB snapshot: re-epoch the whole catalogue to a sector's own
+# midpoint via a real perturbed integration, so the coarse stages above never
+# see a multi-year gap between MPCORB's catalogue epoch and the observing
+# window.
+#
+# The module docstring above says unperturbed propagation is "negligible over
+# a ~27-day sector window" -- true, but it assumes epoch_mjd already sits near
+# that window. MPCORB.DAT is a single, continuously-refreshed file with no
+# per-sector archive; reprocessing an old sector with today's file can leave
+# a multi-year gap. Confirmed on (1) Ceres: MPCORB's epoch was 2112 days
+# (more than one Ceres year) from a real Sector 29 window, and 2-body
+# propagation across that gap put it 15 deg from its true (perturbed)
+# position -- a difference of that size routinely flips a coarse-stage
+# in/out decision.
+#
+# Building a full ASSIST integration is exactly what precise_ephemeris
+# already does, but per-survivor; this applies it to the WHOLE catalogue
+# once per sector; splitting off close-perihelion objects only for the
+# fast timestep and cost analysis they force, everything else is one, we
+# get the same accuracy without the cost.
+# ---------------------------------------------------------------------------
+
+NEO_PERIHELION_AU = 1.3  # standard NEO definition; also where REBOUND's adaptive
+                          # timestep starts being forced down by close passages
+
+HOT_PERIHELION_AU = 0.3  # the NEO bucket (q < NEO_PERIHELION_AU) is itself steep enough that
+                          # its own hottest members set the group's shared timestep for
+                          # everyone else in it -- measured on the current MPCORB.DAT: 42,131
+                          # objects share q < 1.3au, but only 479 of them have q < 0.3au (down
+                          # to 0.07au), and those 479 alone were enough to make the full
+                          # 42,131-object group not finish in 3 hours where a same-sized
+                          # bulk-only group finishes in under 1. Splitting those out mirrors
+                          # exactly the reasoning that separated NEOs from the bulk population
+                          # in the first place, one perihelion tier further down.
+
+
+# Mean obliquity of the ecliptic at J2000.0 (IAU, 23d26'21.448"). MPCORB's elements are
+# referenced to the ecliptic and mean equinox of J2000; ASSIST/REBOUND and the Sun's position
+# from the ephemeris are in the ICRF-equatorial frame JPL's DE440 natively uses (indistinguishable
+# from J2000 mean equatorial at the sub-milliarcsecond level, far below anything relevant here).
+# The two frames differ by this one fixed rotation about the equinox (x) axis -- get it backwards
+# and every position is wrong by up to ~2*sin(23.4 deg)*r, of order several au at asteroid
+# distances, while still passing any test that only checks internal self-consistency (see the
+# validation history in this module's tests: state<->elements round-tripped to machine precision
+# while being ~6 au off skyfield's already-correct equatorial output, purely from this).
+_OBLIQUITY_J2000_RAD = np.radians(23.4392911)
+
+
+def _ecliptic_to_equatorial(vec):
+    """Rotate (..., 3) ecliptic vectors to equatorial (ICRF-equivalent) about the x-axis."""
+    eps = _OBLIQUITY_J2000_RAD
+    x, y, z = vec[..., 0], vec[..., 1], vec[..., 2]
+    return np.stack([x, y * np.cos(eps) - z * np.sin(eps), y * np.sin(eps) + z * np.cos(eps)], axis=-1)
+
+
+def _equatorial_to_ecliptic(vec):
+    """Inverse of _ecliptic_to_equatorial."""
+    eps = _OBLIQUITY_J2000_RAD
+    x, y, z = vec[..., 0], vec[..., 1], vec[..., 2]
+    return np.stack([x, y * np.cos(eps) + z * np.sin(eps), -y * np.sin(eps) + z * np.cos(eps)], axis=-1)
+
+
+def _vectorized_state_at_own_epoch(mpcorb_df):
+    """Heliocentric EQUATORIAL (ICRF-equivalent) (position_au, velocity_au_per_day) for every
+    row, AT ITS OWN MPCORB reference epoch -- exact 2-body, not an approximation, because dt=0
+    there: mean anomaly at an object's own epoch is exactly its catalogued mean_anomaly_degrees,
+    with no Kepler-equation-vs-perturbation drift to accumulate. The one iterative step still
+    needed (mean anomaly -> eccentric anomaly) is the same Newton solve
+    _vectorized_kepler_unit_vectors already uses; this returns full 3-D state (both position
+    AND velocity), not just a direction, so the result can seed a REBOUND simulation directly
+    (once the Sun's own equatorial-frame position/velocity from the ephemeris is added).
+
+    The orbital-plane rotation (node/inclination/argument of perihelion) naturally produces
+    ECLIPTIC coordinates, since that is the frame MPCORB's elements are defined in -- matching
+    _vectorized_kepler_unit_vectors's convention. An extra fixed obliquity rotation converts to
+    equatorial before returning, since that is the frame REBOUND/ASSIST and the ephemeris's Sun
+    position are in. Do not skip this: mixing frames here corrupts silently, since
+    self-consistency tests (state->elements round trip) cannot detect a frame error at all.
+
+    mu (GM_sun) is not a separate constant: MPCORB's mean_daily_motion_degrees already encodes
+    it per Kepler's third law (n^2 = mu/a^3), so mu = n^2 a^3 recovers exactly the GM_sun value
+    consistent with each object's own published elements -- no unit mismatch is possible.
+    """
+    a = mpcorb_df["semimajor_axis_au"].values
+    e = mpcorb_df["eccentricity"].values
+    inc = np.radians(mpcorb_df["inclination_degrees"].values)
+    node = np.radians(mpcorb_df["longitude_of_ascending_node_degrees"].values)
+    peri = np.radians(mpcorb_df["argument_of_perihelion_degrees"].values)
+    M = np.radians(mpcorb_df["mean_anomaly_degrees"].values)
+    n = np.radians(mpcorb_df["mean_daily_motion_degrees"].values)
+    mu = n ** 2 * a ** 3
+
+    E = M.copy()
+    for _ in range(10):
+        E = E - (E - e * np.sin(E) - M) / (1 - e * np.cos(E))
+
+    cos_E, sin_E = np.cos(E), np.sin(E)
+    r = a * (1 - e * cos_E)
+    x_orb = a * (cos_E - e)
+    y_orb = a * np.sqrt(1 - e ** 2) * sin_E
+    # standard vis-viva-derived orbital-plane velocity (rad/day-consistent since n is rad/day)
+    vx_orb = -a * n * sin_E / (1 - e * cos_E)
+    vy_orb = a * n * np.sqrt(1 - e ** 2) * cos_E / (1 - e * cos_E)
+
+    cos_O, sin_O = np.cos(node), np.sin(node)
+    cos_i, sin_i = np.cos(inc), np.sin(inc)
+    cos_w, sin_w = np.cos(peri), np.sin(peri)
+    R11 = cos_O * cos_w - sin_O * sin_w * cos_i
+    R12 = -cos_O * sin_w - sin_O * cos_w * cos_i
+    R21 = sin_O * cos_w + cos_O * sin_w * cos_i
+    R22 = -sin_O * sin_w + cos_O * cos_w * cos_i
+    R31 = sin_w * sin_i
+    R32 = cos_w * sin_i
+
+    pos_ecl = np.stack([R11 * x_orb + R12 * y_orb,
+                        R21 * x_orb + R22 * y_orb,
+                        R31 * x_orb + R32 * y_orb], axis=-1)
+    vel_ecl = np.stack([R11 * vx_orb + R12 * vy_orb,
+                        R21 * vx_orb + R22 * vy_orb,
+                        R31 * vx_orb + R32 * vy_orb], axis=-1)
+    return _ecliptic_to_equatorial(pos_ecl), _ecliptic_to_equatorial(vel_ecl)
+
+
+def _state_to_elements(pos_au, vel_au_per_day, mu):
+    """Inverse of _vectorized_state_at_own_epoch: classical osculating elements from a
+    heliocentric Cartesian state, vectorised, closed-form (no iteration -- unlike mean-to-
+    eccentric anomaly, Cartesian-to-elements needs no Kepler-equation solve). Standard
+    astrodynamics formulas (e.g. Vallado); mu must be the SAME per-object value used to build
+    the state (n^2 a^3 from the ORIGINAL elements), since that is what a REBOUND/ASSIST
+    integration implicitly conserves for an unperturbed two-body problem, and using the Sun's
+    true GM here instead would reintroduce a small but avoidable inconsistency.
+
+    Input is heliocentric EQUATORIAL (ICRF-equivalent) -- what a REBOUND/ASSIST integration
+    works in, after subtracting the ephemeris's own equatorial-frame Sun position. Rotated back
+    to ecliptic first, since inclination/node/etc. below are defined relative to the ecliptic
+    pole [0,0,1], matching MPCORB's own convention -- see _vectorized_state_at_own_epoch for
+    why skipping this corrupts the result without any self-consistency test catching it.
+
+    Returns a dict of the columns load_mpcorb's consumers expect, EXCLUDING epoch (the caller
+    sets that to the target epoch this state was integrated to).
+    """
+    pos_au = _equatorial_to_ecliptic(pos_au)
+    vel_au_per_day = _equatorial_to_ecliptic(vel_au_per_day)
+    r = np.linalg.norm(pos_au, axis=-1)
+    v2 = np.sum(vel_au_per_day ** 2, axis=-1)
+    h_vec = np.cross(pos_au, vel_au_per_day)
+    h = np.linalg.norm(h_vec, axis=-1)
+    node_vec = np.cross(np.array([0.0, 0.0, 1.0]), h_vec)
+    node_mag = np.linalg.norm(node_vec, axis=-1)
+
+    e_vec = (np.cross(vel_au_per_day, h_vec) / mu[..., None]
+             - pos_au / r[..., None])
+    e = np.linalg.norm(e_vec, axis=-1)
+
+    energy = v2 / 2 - mu / r
+    a = -mu / (2 * energy)
+
+    inc = np.arccos(np.clip(h_vec[..., 2] / h, -1, 1))
+
+    node = np.arctan2(node_vec[..., 1], node_vec[..., 0])
+    node = np.where(node_mag > 1e-12, np.mod(node, 2 * np.pi), 0.0)
+
+    cos_peri = np.clip(np.sum(node_vec * e_vec, axis=-1) / np.maximum(node_mag * e, 1e-30), -1, 1)
+    peri = np.arccos(cos_peri)
+    peri = np.where(e_vec[..., 2] < 0, 2 * np.pi - peri, peri)
+
+    cos_nu = np.clip(np.sum(e_vec * pos_au, axis=-1) / np.maximum(e * r, 1e-30), -1, 1)
+    nu = np.arccos(cos_nu)
+    rdotv = np.sum(pos_au * vel_au_per_day, axis=-1)
+    nu = np.where(rdotv < 0, 2 * np.pi - nu, nu)
+
+    E = 2 * np.arctan2(np.sqrt(np.clip(1 - e, 0, None)) * np.sin(nu / 2),
+                       np.sqrt(np.clip(1 + e, 0, None)) * np.cos(nu / 2))
+    M = np.mod(E - e * np.sin(E), 2 * np.pi)
+    n_rad_day = np.sqrt(mu / a ** 3)
+
+    return dict(semimajor_axis_au=a, eccentricity=e,
+               inclination_degrees=np.degrees(inc),
+               longitude_of_ascending_node_degrees=np.degrees(node),
+               argument_of_perihelion_degrees=np.degrees(peri),
+               mean_anomaly_degrees=np.degrees(M),
+               mean_daily_motion_degrees=np.degrees(n_rad_day))
+
+
+def build_sector_mpcorb_snapshot(target_mjd, data_dir=None, out_path=None,
+                                 shard_index=0, n_shards=1, neo_perihelion_au=NEO_PERIHELION_AU,
+                                 hot_perihelion_au=HOT_PERIHELION_AU):
+    """Re-epoch a shard of MPCORB to target_mjd (a sector's midpoint) via a real ASSIST
+    integration, and save it in load_mpcorb's own column format so it is a drop-in replacement
+    -- ecliptic_reachable_mask, brightness_reachable_mask and coarse_position_mask need no
+    changes, only the epoch_mjd they are handed changes.
+
+    Sharding is over the BULK (q >= neo_perihelion_au) population only, split across n_shards
+    equal slices by row order -- safe because REBOUND's adaptive step here is set by the
+    slowest-varying, near-circular bulk of the catalogue, not by row order, so any slice is
+    representative. The close-perihelion minority (q < neo_perihelion_au, ~2.7% of MPCORB,
+    dominated by NEAs) is excluded from every bulk shard and handled once, on shard_index==0,
+    as its own separate integration: mixing it into the bulk sweep would force every bulk
+    particle down to the NEA-forced timestep, for no benefit (see module history/benchmarks --
+    a mixed 5,000-particle sweep cost 24.4 ms/particle where a bulk-only sweep of the same size
+    cost 7.8 ms/particle, purely from a handful of small-perihelion outliers).
+
+    That NEO bucket is itself split again at hot_perihelion_au, for the same reason one level
+    down: a small number of very close-perihelion objects inside it (q < 0.3au, down to 0.07au
+    on the current file) forced the whole ~42,000-object NEO group's shared timestep down far
+    enough that it did not finish in 3 hours where a same-sized bulk-only group finishes in
+    under 1 (confirmed directly rather than assumed -- see the ecliptic_filter_fix debugging
+    history). The hot tier itself is small (479 objects on the current file) so runs quickly
+    once it is not carrying the other 41,000+ down with it.
+
+    The MPCORB minority not on the file's dominant shared epoch (~0.7%, up to a ~5-year-old
+    epoch in the current file) is further excluded from all of the above and grouped by its own
+    epoch value: each distinct epoch gets its own small integration from THAT epoch to
+    target_mjd, since REBOUND requires one shared sim.t for every particle added to a
+    simulation. This is a bounded, small Python-level loop (measured: 427 distinct epochs,
+    median 7 objects each, one outlier at 1047), not a per-object loop over the catalogue.
+
+    Writes a parquet file of shard results; the caller (or a merge step) concatenates shards.
+    """
+    data_dir = data_dir or default_data_dir()
+    mpcorb = load_mpcorb(data_dir)
+    epoch_mjd = _mpc_packed_epoch_to_mjd(mpcorb["epoch_packed"].values)
+    q = mpcorb["semimajor_axis_au"].values * (1 - mpcorb["eccentricity"].values)
+
+    common_epoch = pd.Series(epoch_mjd).mode().iloc[0]
+    on_common = np.isclose(epoch_mjd, common_epoch)
+    is_bulk = on_common & (q >= neo_perihelion_au)
+    is_neo_warm = on_common & (q < neo_perihelion_au) & (q >= hot_perihelion_au)
+    is_neo_hot = on_common & (q < hot_perihelion_au)
+    is_minority = ~on_common
+
+    ephem = load_assist_ephem(data_dir)
+    jd_ref = ephem.jd_ref
+    t_target_days = (target_mjd + 2400000.5) - jd_ref
+
+    def integrate_group(sub_df, start_epoch_mjd):
+        """One REBOUND+ASSIST sweep: everyone in sub_df starts at start_epoch_mjd, all
+        integrated together once to t_target_days. Returns sub_df's designation_packed,
+        magnitude_H, magnitude_G alongside the re-epoched elements."""
+        import assist
+        import rebound
+
+        if len(sub_df) == 0:
+            return pd.DataFrame(columns=["designation_packed", "magnitude_H", "magnitude_G",
+                                         "semimajor_axis_au", "eccentricity",
+                                         "inclination_degrees",
+                                         "longitude_of_ascending_node_degrees",
+                                         "argument_of_perihelion_degrees",
+                                         "mean_anomaly_degrees", "mean_daily_motion_degrees",
+                                         "epoch_mjd"])
+        pos, vel = _vectorized_state_at_own_epoch(sub_df)
+        start_days = (start_epoch_mjd + 2400000.5) - jd_ref
+        sun = ephem.get_particle("Sun", start_days)
+        sun_pos = np.array([sun.x, sun.y, sun.z])
+        sun_vel = np.array([sun.vx, sun.vy, sun.vz])
+
+        sim = rebound.Simulation()
+        assist.Extras(sim, ephem)
+        sim.t = start_days
+        bary_pos = pos + sun_pos
+        bary_vel = vel + sun_vel
+        for i in range(len(sub_df)):
+            sim.add(x=bary_pos[i, 0], y=bary_pos[i, 1], z=bary_pos[i, 2],
+                   vx=bary_vel[i, 0], vy=bary_vel[i, 1], vz=bary_vel[i, 2])
+        sim.integrate(t_target_days)
+
+        end_pos = np.array([[p.x, p.y, p.z] for p in sim.particles])
+        end_vel = np.array([[p.vx, p.vy, p.vz] for p in sim.particles])
+        sun_end = ephem.get_particle("Sun", t_target_days)
+        helio_pos = end_pos - np.array([sun_end.x, sun_end.y, sun_end.z])
+        helio_vel = end_vel - np.array([sun_end.vx, sun_end.vy, sun_end.vz])
+
+        n_orig = np.radians(sub_df["mean_daily_motion_degrees"].values)
+        a_orig = sub_df["semimajor_axis_au"].values
+        mu = n_orig ** 2 * a_orig ** 3          # each object's OWN implied GM_sun, preserved
+        elements = _state_to_elements(helio_pos, helio_vel, mu)
+
+        out = pd.DataFrame(elements)
+        out["designation_packed"] = sub_df["designation_packed"].values
+        out["magnitude_H"] = sub_df["magnitude_H"].values
+        out["magnitude_G"] = sub_df["magnitude_G"].values
+        out["epoch_mjd"] = target_mjd
+        return out
+
+    results = []
+    if shard_index == 0:
+        # the small groups are cheap and only need doing once, regardless of how many
+        # shards the bulk population is split across -- warm and hot NEOs are integrated
+        # separately so the rare very-close-perihelion outliers don't force their crushed
+        # timestep onto the much larger warm-NEO group (see docstring)
+        results.append(integrate_group(mpcorb[is_neo_warm].reset_index(drop=True), common_epoch))
+        results.append(integrate_group(mpcorb[is_neo_hot].reset_index(drop=True), common_epoch))
+        minority = mpcorb[is_minority]
+        minority_epochs = epoch_mjd[is_minority]
+        for ep in np.unique(minority_epochs):
+            grp = minority[np.isclose(minority_epochs, ep)].reset_index(drop=True)
+            results.append(integrate_group(grp, ep))
+
+    bulk_idx = np.where(is_bulk)[0]
+    my_shard = np.array_split(bulk_idx, n_shards)[shard_index]
+    results.append(integrate_group(mpcorb.iloc[my_shard].reset_index(drop=True), common_epoch))
+
+    out_df = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+    if out_path:
+        out_df.to_parquet(out_path, index=False)
+    return out_df
+
+
+def load_mpcorb_snapshot(path):
+    """Load a per-sector re-epoched snapshot from build_sector_mpcorb_snapshot (merged across
+    shards). Same column set load_mpcorb produces, so every downstream stage (ecliptic/
+    brightness/coarse) works unchanged; epoch_mjd is a plain column here rather than needing
+    _mpc_packed_epoch_to_mjd, since the snapshot was written with a real epoch already."""
+    df = pd.read_parquet(path)
+    required = ["semimajor_axis_au", "eccentricity", "inclination_degrees",
+               "longitude_of_ascending_node_degrees", "argument_of_perihelion_degrees",
+               "mean_anomaly_degrees", "mean_daily_motion_degrees", "epoch_mjd"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"snapshot at {path} is missing columns: {missing}")
+    return df
+
+
 def coarse_position_mask(mpcorb_df, ra_center_deg, dec_center_deg, radius_deg, sample_mjds,
                           return_hit_samples=False):
     """Fully vectorised coarse 2-body position check across every object
@@ -626,23 +982,46 @@ def coarse_position_mask(mpcorb_df, ra_center_deg, dec_center_deg, radius_deg, s
 # ---------------------------------------------------------------------------
 
 def _state_vector_at_epoch(row, data_dir):
-    from skyfield.data import mpc
-    from skyfield.api import load
-    from skyfield.constants import GM_SUN_Pitjeva_2005_km3_s2
-    from types import SimpleNamespace
+    """Heliocentric state at an object's own reference epoch, from either source of elements:
 
-    ts = load.timescale()
-    ns_row = SimpleNamespace(
-        semimajor_axis_au=float(row.semimajor_axis_au), eccentricity=float(row.eccentricity),
-        inclination_degrees=float(row.inclination_degrees),
-        longitude_of_ascending_node_degrees=float(row.longitude_of_ascending_node_degrees),
-        argument_of_perihelion_degrees=float(row.argument_of_perihelion_degrees),
-        mean_anomaly_degrees=float(row.mean_anomaly_degrees),
-        epoch_packed=row.epoch_packed, designation=row.designation,
-    )
-    orbit = mpc.mpcorb_orbit(ns_row, ts, GM_SUN_Pitjeva_2005_km3_s2)
-    t_ref = orbit.epoch
-    return t_ref, orbit.at(t_ref).position.au, orbit.at(t_ref).velocity.au_per_d
+    - raw MPCORB rows carry epoch_packed (MPC's packed date string) -- unchanged skyfield path.
+    - rows from a per-sector snapshot (build_sector_mpcorb_snapshot) carry a plain epoch_mjd
+      float instead, since they were already re-epoched to a real date, not an MPC packed
+      string. Uses the same vectorised 2-body solve the snapshot builder itself uses
+      (_vectorized_state_at_own_epoch), on a length-1 batch -- exact at dt=0 either way, so
+      this is not a lower-accuracy fallback, just a different element source."""
+    epoch_packed = getattr(row, "epoch_packed", None)
+    if epoch_packed is not None and not (isinstance(epoch_packed, float) and math.isnan(epoch_packed)):
+        from skyfield.data import mpc
+        from skyfield.api import load
+        from skyfield.constants import GM_SUN_Pitjeva_2005_km3_s2
+        from types import SimpleNamespace
+
+        ts = load.timescale()
+        ns_row = SimpleNamespace(
+            semimajor_axis_au=float(row.semimajor_axis_au), eccentricity=float(row.eccentricity),
+            inclination_degrees=float(row.inclination_degrees),
+            longitude_of_ascending_node_degrees=float(row.longitude_of_ascending_node_degrees),
+            argument_of_perihelion_degrees=float(row.argument_of_perihelion_degrees),
+            mean_anomaly_degrees=float(row.mean_anomaly_degrees),
+            epoch_packed=epoch_packed, designation=row.designation,
+        )
+        orbit = mpc.mpcorb_orbit(ns_row, ts, GM_SUN_Pitjeva_2005_km3_s2)
+        t_ref = orbit.epoch
+        return t_ref, orbit.at(t_ref).position.au, orbit.at(t_ref).velocity.au_per_d
+
+    from skyfield.api import load
+    epoch_mjd = float(row.epoch_mjd)
+    row_df = pd.DataFrame([dict(
+        semimajor_axis_au=row.semimajor_axis_au, eccentricity=row.eccentricity,
+        inclination_degrees=row.inclination_degrees,
+        longitude_of_ascending_node_degrees=row.longitude_of_ascending_node_degrees,
+        argument_of_perihelion_degrees=row.argument_of_perihelion_degrees,
+        mean_anomaly_degrees=row.mean_anomaly_degrees,
+        mean_daily_motion_degrees=row.mean_daily_motion_degrees)])
+    pos, vel = _vectorized_state_at_own_epoch(row_df)
+    t_ref = load.timescale().tdb(jd=epoch_mjd + 2400000.5)
+    return t_ref, pos[0], vel[0]
 
 
 DEFAULT_SLOPE_G = 0.15  # MPC's standard assumption when an object's own G is unmeasured
@@ -831,7 +1210,8 @@ def _precise_ephemeris_worker(row, frame_mjds, data_dir, allow_download):
 def predict_asteroids_for_footprint(ra_center_deg, dec_center_deg, radius_deg,
                                        mjd_start, mjd_end, frame_mjds, wcs,
                                        n_coarse_samples=None, faint_limit_mag=20.8,
-                                       data_dir=None, plot_path=None, allow_download=True):
+                                       data_dir=None, plot_path=None, allow_download=True,
+                                       sector_snapshot_path=None):
     """Predict every MPCORB-catalogued object crossing a circular footprint
     (ra_center, dec_center, radius) at any point in [mjd_start, mjd_end],
     and build a precise per-frame ephemeris (ra, dec, x, y, flux, mag where
@@ -853,6 +1233,15 @@ def predict_asteroids_for_footprint(ra_center_deg, dec_center_deg, radius_deg,
     instead, so a missing/uncovered file fails fast with a clear message
     rather than partway through a worker process. Leave True for
     interactive/login-node use, where on-demand downloading is fine.
+
+    sector_snapshot_path: a per-sector re-epoched catalogue from
+    build_sector_mpcorb_snapshot, used in place of the raw MPCORB.DAT when given. Use this for
+    any sector whose observing window is not close in time to MPCORB.DAT's own catalogue
+    epoch -- reprocessing an old sector with today's file, for example -- since coarse
+    unperturbed propagation across a multi-year gap can misplace an object by many degrees
+    (confirmed on (1) Ceres: 15 deg, from a 2112-day gap). None keeps the original raw-MPCORB
+    behaviour unchanged, correct exactly when this module's docstring assumption holds: the
+    observing window is close to MPCORB.DAT's own epoch already.
     """
     from astropy.coordinates import SkyCoord
     import astropy.units as u
@@ -860,17 +1249,16 @@ def predict_asteroids_for_footprint(ra_center_deg, dec_center_deg, radius_deg,
     data_dir = data_dir or default_data_dir()
     if not allow_download:
         verify_data_available(data_dir, frame_mjds=frame_mjds)
-    mpcorb = load_mpcorb(data_dir)
+    if sector_snapshot_path is not None:
+        mpcorb = load_mpcorb_snapshot(sector_snapshot_path)
+        epoch_mjd = mpcorb["epoch_mjd"].values
+    else:
+        mpcorb = load_mpcorb(data_dir)
+        epoch_mjd = _mpc_packed_epoch_to_mjd(mpcorb["epoch_packed"].values)
 
-    ecl = SkyCoord(ra=ra_center_deg * u.deg, dec=dec_center_deg * u.deg).barycentrictrueecliptic
-    stage1 = ecliptic_reachable_mask(mpcorb, ecl.lat.deg, margin_deg=1.0)
-    print(f"  Stage 1 (ecliptic reachability): {stage1.sum()} / {len(mpcorb)} survive", flush=True)
-
-    stage1b_input = mpcorb[stage1].reset_index(drop=True)
-    stage1b = brightness_reachable_mask(stage1b_input, faint_limit_mag=faint_limit_mag)
-    print(f"  Stage 1b (best-case brightness <= {faint_limit_mag}): "
-          f"{stage1b.sum()} / {len(stage1b_input)} survive", flush=True)
-
+    # Coarse sample epochs across the observing window -- hoisted above stage 1 (it used to
+    # sit between stage 1b and stage 2) because stage 1 now needs it too: both stages
+    # propagate the same way, at the same epochs, just over different-sized candidate sets.
     max_motion_deg_per_day = 1.5
     if n_coarse_samples is None:
         # pick enough samples that the between-sample motion margin stays
@@ -882,14 +1270,25 @@ def predict_asteroids_for_footprint(ra_center_deg, dec_center_deg, radius_deg,
         target_spacing = max(radius_deg / max_motion_deg_per_day, window_days / 500)
         n_coarse_samples = int(np.clip(np.ceil(window_days / target_spacing) + 1, 5, 500))
     sample_mjds = np.linspace(mjd_start, mjd_end, n_coarse_samples)
-    stage2_input = stage1b_input[stage1b].reset_index(drop=True)
-    # margin: footprint radius + typical geocentric motion budget between
-    # consecutive coarse samples (NOT the full window -- an object can only drift
-    # so far between adjacent samples, however long the overall window is)
     sample_spacing = sample_mjds[1] - sample_mjds[0] if n_coarse_samples > 1 else (mjd_end - mjd_start)
-    margin = radius_deg + max_motion_deg_per_day * sample_spacing
+    coarse_margin = radius_deg + max_motion_deg_per_day * sample_spacing
+
+    ecl = SkyCoord(ra=ra_center_deg * u.deg, dec=dec_center_deg * u.deg).barycentrictrueecliptic
+    stage1 = ecliptic_reachable_mask(mpcorb, epoch_mjd, sample_mjds, ecl.lat.deg,
+                                     margin_deg=coarse_margin)
+    print(f"  Stage 1 (ecliptic reachability): {stage1.sum()} / {len(mpcorb)} survive", flush=True)
+
+    stage1b_input = mpcorb[stage1].reset_index(drop=True)
+    stage1b = brightness_reachable_mask(stage1b_input, faint_limit_mag=faint_limit_mag)
+    print(f"  Stage 1b (best-case brightness <= {faint_limit_mag}): "
+          f"{stage1b.sum()} / {len(stage1b_input)} survive", flush=True)
+
+    stage2_input = stage1b_input[stage1b].reset_index(drop=True)
+    # margin: footprint radius + typical geocentric motion budget between consecutive coarse
+    # samples (NOT the full window -- an object can only drift so far between adjacent
+    # samples, however long the overall window is). Same coarse_margin stage 1 uses above.
     stage2, hit_samples_by_row, rate_by_row = coarse_position_mask(
-        stage2_input, ra_center_deg, dec_center_deg, radius_deg + margin, sample_mjds,
+        stage2_input, ra_center_deg, dec_center_deg, radius_deg + coarse_margin, sample_mjds,
         return_hit_samples=True)
     survivors = stage2_input[stage2].reset_index(drop=True)
     print(f"  Stage 2 (coarse position): {len(survivors)} / {len(stage2_input)} survive", flush=True)

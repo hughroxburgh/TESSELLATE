@@ -933,6 +933,12 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_func, exposure_time, big_size
         snr = snrs[idx]
         stacked_psf_fit = 0
 
+    if snr < 0:
+        print('\n')
+        print(event)
+        print('\n')
+        raise ValueError
+
     # --- PSF fit --- #
     unc_x = uncertainty_func(snr,95,'x')  # use the 95% confidence interval as the metric of interest
     unc_y = uncertainty_func(snr,95,'y')  

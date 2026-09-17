@@ -9,6 +9,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 from .tools import RoundToInt, load_table, table_exists
 
+GLOBAL_PSF_Y_OFFSET = 0.0226
 
 # ----------------------------------------------------------------------------------------------------------------------------- #
 # ----------------------------------------------------------------------------------------------------------------------------- # 
@@ -933,14 +934,14 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_funcs, exposure_time, big_siz
         stacked_psf_fit = 0
 
     # --- PSF fit --- #
-    unc_x = uncertainty_funcs[0](snr)
-    unc_y = uncertainty_funcs[1](snr)
+    unc_x = uncertainty_funcs['x'](snr,95)  # use the 95% confidence interval as the metric of interest
+    unc_y = uncertainty_funcs['y'](snr,95)  
 
     fitter = PSF_Fitter(small_size, prf)
     fitter.fit_psf(centred_flux, limx=0.5, limy=0.5)
 
     event['xcentroid_psf'] = fitter.source_x + brightest_x
-    event['ycentroid_psf'] = fitter.source_y + brightest_y
+    event['ycentroid_psf'] = fitter.source_y + brightest_y - GLOBAL_PSF_Y_OFFSET
     event['xcentroid_err_psf'] = unc_x
     event['ycentroid_err_psf'] = unc_y
     event['snr_psf'] = snr
@@ -1645,7 +1646,8 @@ class Detector():
         prf = TESS_PRF(self.cam,self.ccd,self.sector,column,row,localdatadir=self.prf_path)
         
         # -- Retrieve cut localisation quality -- #
-        snr_to_localisation = get_snr_to_localisation_func(self.prf_path,self.sector,self.cam,self.ccd,self.cut,self.n)
+        # snr_to_localisation = get_snr_to_localisation_func(self.prf_path,self.sector,self.cam,self.ccd,self.cut,self.n)
+        snr_to_localisation = get_snr_to_localisation_func()
         exposure_time = fits.open(f'{self.path}/wcs/ref/corrected.fits')[1].header['EXPOSURE'] * 86400  # in seconds
 
         # -- Iterate over frame bins -- #
@@ -1686,13 +1688,13 @@ class Detector():
         events['yccd'] = RoundToInt(events['yint'] + cutCornerPx[self.cut-1][1])
 
         # -- Pull the uncertainty on WCS and combine with PSF fit centroid error -- #
-        wcs_unc = get_wcs_uncertainty(self.data_path,self.sector,self.cam,self.ccd,self.cut,self.n)
-        if np.isnan(wcs_unc).any():
-            events['xcentroid_err'] = 0.5
-            events['ycentroid_err'] = 0.5
-        else:
-            events['xcentroid_err'] = np.sqrt(events['xcentroid_err']**2 + wcs_unc[0]**2) * 1.136
-            events['ycentroid_err'] = np.sqrt(events['ycentroid_err']**2 + wcs_unc[1]**2) * 1.136
+        # wcs_unc = get_wcs_uncertainty(self.data_path,self.sector,self.cam,self.ccd,self.cut,self.n)
+        # if np.isnan(wcs_unc).any():
+        #     events['xcentroid_err'] = 0.5
+        #     events['ycentroid_err'] = 0.5
+        # else:
+        #     events['xcentroid_err'] = np.sqrt(events['xcentroid_err']**2 + wcs_unc[0]**2) * 1.136
+        #     events['ycentroid_err'] = np.sqrt(events['ycentroid_err']**2 + wcs_unc[1]**2) * 1.136
 
         # -- Remove all events with single frame durations -- #
         # fake_events = events[(events.frame_duration==1)&(events.frame_bin==1)].copy()
@@ -2184,7 +2186,6 @@ class Detector():
             'xint', 'yint','xccd', 'yccd',
             'xcentroid_det', 'ycentroid_det', 
             'xcentroid_psf', 'ycentroid_psf',
-            'xcentroid_err_psf','ycentroid_err_psf',
 
             # Astrometry
             'ra', 'dec','ra_err','dec_err',

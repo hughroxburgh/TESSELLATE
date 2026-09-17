@@ -1,6 +1,10 @@
 import numpy as np
 import os
 import pandas as pd
+import pickle
+from pathlib import Path
+from scipy.interpolate import interp1d
+
 
 class CutWCS():
 
@@ -189,206 +193,256 @@ class PSF_Fitter():
 # def model(snr, a, b, c):
 #     return a * snr**(-b) + c
 
-def model_quadrature(snr, a, b, c):
-    """
-    Quadrature combination of a power-law statistical term and a fixed
-    floor term.
-    """
-    return np.sqrt((a * snr**(-b))**2 + c**2)
+# def model_quadrature(snr, a, b, c):
+#     """
+#     Quadrature combination of a power-law statistical term and a fixed
+#     floor term.
+#     """
+#     return np.sqrt((a * snr**(-b))**2 + c**2)
 
-def log_model_quadrature(snr, log_a, b, log_c):
-    a = 10**log_a
-    c = 10**log_c
-    return np.log10(model_quadrature(snr, a, b, c))
+# def log_model_quadrature(snr, log_a, b, log_c):
+#     a = 10**log_a
+#     c = 10**log_c
+#     return np.log10(model_quadrature(snr, a, b, c))
 
-def predict_median(f,snr):
-    return float(f(snr))
+# def predict_median(f,snr):
+#     return float(f(snr))
     
-def gen_and_fit_source(snr, shift, image_size, prf):
+# def gen_and_fit_source(snr, shift, image_size, prf):
 
-    noise_sigma = 1
-    npix = 9
-    exptime_s = 600  # Exposure time used to go from counts/second to raw counts in order to incorporate Poisson shot noise error 
+#     noise_sigma = 1
+#     npix = 9
+#     exptime_s = 600  # Exposure time used to go from counts/second to raw counts in order to incorporate Poisson shot noise error 
 
-    centx_s = image_size // 2 + shift[0]
-    centy_s = image_size // 2 + shift[1]
+#     centx_s = image_size // 2 + shift[0]
+#     centy_s = image_size // 2 + shift[1]
 
-    psf = prf.locate(centx_s, centy_s, (image_size, image_size))
-    psf /= np.nansum(psf[image_size//2-1:image_size//2+2, image_size//2-1:image_size//2+2])
+#     psf = prf.locate(centx_s, centy_s, (image_size, image_size))
+#     psf /= np.nansum(psf[image_size//2-1:image_size//2+2, image_size//2-1:image_size//2+2])
 
-    # invert snr = flux / sqrt(npix*noise_sigma^2 + flux/exptime_s) for flux
-    b = -snr**2 / exptime_s
-    c = -snr**2 * npix 
-    flux = (-b + np.sqrt(b**2 - 4*c)) / 2
+#     # invert snr = flux / sqrt(npix*noise_sigma^2 + flux/exptime_s) for flux
+#     b = -snr**2 / exptime_s
+#     c = -snr**2 * npix 
+#     flux = (-b + np.sqrt(b**2 - 4*c)) / 2
 
-    signal = psf * flux
+#     signal = psf * flux
 
-    background_noise = np.random.normal(0, noise_sigma, (image_size, image_size))
-    poisson_std = np.sqrt(np.clip(signal, 0, None) / exptime_s)
-    poisson_noise = np.random.normal(0, poisson_std)
+#     background_noise = np.random.normal(0, noise_sigma, (image_size, image_size))
+#     poisson_std = np.sqrt(np.clip(signal, 0, None) / exptime_s)
+#     poisson_noise = np.random.normal(0, poisson_std)
 
-    frame = signal + background_noise + poisson_noise
+#     frame = signal + background_noise + poisson_noise
 
-    PSF_fitter = PSF_Fitter(image_size, prf, central_shape=5, function='sq')
-    PSF_fitter.fit_psf(frame, 0.5, 0.5)
+#     PSF_fitter = PSF_Fitter(image_size, prf, central_shape=5, function='sq')
+#     PSF_fitter.fit_psf(frame, 0.5, 0.5)
 
-    return [PSF_fitter.source_x, PSF_fitter.source_y]
+#     return [PSF_fitter.source_x, PSF_fitter.source_y]
 
-    # centx_s = image_size//2 + shift[0]
-    # centy_s = image_size//2 + shift[1]
+#     # centx_s = image_size//2 + shift[0]
+#     # centy_s = image_size//2 + shift[1]
 
-    # psf = prf.locate(centx_s,centy_s, (image_size,image_size))
-    # psf /= np.nansum(psf[image_size//2-1:image_size//2+2,image_size//2-1:image_size//2+2])
+#     # psf = prf.locate(centx_s,centy_s, (image_size,image_size))
+#     # psf /= np.nansum(psf[image_size//2-1:image_size//2+2,image_size//2-1:image_size//2+2])
 
-    # noise_frame = np.random.normal(0,noise_sigma,(image_size,image_size))
+#     # noise_frame = np.random.normal(0,noise_sigma,(image_size,image_size))
     
-    # flux = snr * (np.sqrt(npix)*noise_sigma)
+#     # flux = snr * (np.sqrt(npix)*noise_sigma)
     
-    # signal = psf * flux
-    # frame = signal + noise_frame
+#     # signal = psf * flux
+#     # frame = signal + noise_frame
 
-    # PSF_fitter = PSF_Fitter(image_size,prf,central_shape=5,function='sq')
-    # PSF_fitter.fit_psf(frame,0.5,0.5)
+#     # PSF_fitter = PSF_Fitter(image_size,prf,central_shape=5,function='sq')
+#     # PSF_fitter.fit_psf(frame,0.5,0.5)
 
-    # return [PSF_fitter.source_x,PSF_fitter.source_y]
+#     # return [PSF_fitter.source_x,PSF_fitter.source_y]
 
-def simulate_cut_psf_fitting(path,sector,cam,ccd,cut,n=8,nfits=1000,nMedians=20,image_size=7,plot=False,return_models=False):
+# def simulate_cut_psf_fitting(path,sector,cam,ccd,cut,n=8,nfits=1000,nMedians=20,image_size=7,plot=False,return_models=False):
 
-    from .dataprocessor import DataProcessor
-    from PRF import TESS_PRF
-    datadir='/fred/oz335/_local_TESS_PRFs/'
-    from joblib import Parallel, delayed 
-    from tqdm import tqdm
-    from scipy.optimize import curve_fit
-    import matplotlib.pyplot as plt
-    import pickle
-
-
-    dp = DataProcessor(sector=sector,data_path='/fred/oz335/TESSdata')
-    _, cutCentrePx, _, _ = dp.find_cuts(cam=cam,ccd=ccd,n=n,plot=False)
-
-    if sector>3:
-        prf = TESS_PRF(sector=sector,cam=cam,ccd=ccd,colnum=cutCentrePx[cut-1][0],rownum=cutCentrePx[cut-1][1],localdatadir=datadir+'Sectors4+')
-    else:
-        prf = TESS_PRF(sector=sector,cam=cam,ccd=ccd,colnum=cutCentrePx[cut-1][0],rownum=cutCentrePx[cut-1][1],localdatadir=datadir+'Sectors1_2_3')
+#     from .dataprocessor import DataProcessor
+#     from PRF import TESS_PRF
+#     datadir='/fred/oz335/_local_TESS_PRFs/'
+#     from joblib import Parallel, delayed 
+#     from tqdm import tqdm
+#     from scipy.optimize import curve_fit
+#     import matplotlib.pyplot as plt
+#     import pickle
 
 
-    snrs = 10 ** np.random.uniform(np.log10(1), np.log10(100), nfits)
-    shifts = np.random.uniform(-0.5,0.5,(nfits,2))
+#     dp = DataProcessor(sector=sector,data_path='/fred/oz335/TESSdata')
+#     _, cutCentrePx, _, _ = dp.find_cuts(cam=cam,ccd=ccd,n=n,plot=False)
 
-    fits = Parallel(n_jobs=-1)(delayed(gen_and_fit_source)(snrs[i],shifts[i],image_size,prf) for i in tqdm(range(nfits),desc='    Fitting injected sources'))
-
-    fits = np.array(fits)
-    dx = fits[:,0] - shifts[:,0]
-    dy = fits[:,1] - shifts[:,1]
-
-    edges = np.logspace(np.log10(snrs.min()), np.log10(snrs.max()), nMedians + 1)
-    centers = np.sqrt(edges[:-1] * edges[1:])
-
-    # per-axis 68th percentiles, computed separately - matches get_wcs_uncertainty's approach
-    x68 = np.array([
-        np.percentile(np.abs(dx[(snrs >= edges[i]) & (snrs < edges[i+1])]), 68)
-        for i in range(nMedians)
-    ])
-    y68 = np.array([
-        np.percentile(np.abs(dy[(snrs >= edges[i]) & (snrs < edges[i+1])]), 68)
-        for i in range(nMedians)
-    ])
-
-    # fit each separately vs SNR
-    p0x = [np.log10(x68[0]), 0.7, np.log10(x68[-1])]
-    poptx_log, _ = curve_fit(log_model_quadrature, centers, np.log10(x68), p0=p0x, maxfev=20000,
-                          bounds=([-3, 0, -3], [1, 5, 1]))
-    popty = 10**poptx_log[0], poptx_log[1], 10**poptx_log[2]
-
-    p0y = [np.log10(y68[0]), 0.7, np.log10(y68[-1])]
-    popty_log, _ = curve_fit(log_model_quadrature, centers, np.log10(y68), p0=p0y, maxfev=20000,
-                            bounds=([-3, 0, -3], [1, 5, 1]))
-    poptx = 10**popty_log[0], popty_log[1], 10**popty_log[2]
+#     if sector>3:
+#         prf = TESS_PRF(sector=sector,cam=cam,ccd=ccd,colnum=cutCentrePx[cut-1][0],rownum=cutCentrePx[cut-1][1],localdatadir=datadir+'Sectors4+')
+#     else:
+#         prf = TESS_PRF(sector=sector,cam=cam,ccd=ccd,colnum=cutCentrePx[cut-1][0],rownum=cutCentrePx[cut-1][1],localdatadir=datadir+'Sectors1_2_3')
 
 
+#     snrs = 10 ** np.random.uniform(np.log10(1), np.log10(100), nfits)
+#     shifts = np.random.uniform(-0.5,0.5,(nfits,2))
 
-    # p0x = [np.max(x68), 0.5, np.min(x68)]
-    # poptx, _ = curve_fit(model, centers, x68, p0=p0x, maxfev=10000)
+#     fits = Parallel(n_jobs=-1)(delayed(gen_and_fit_source)(snrs[i],shifts[i],image_size,prf) for i in tqdm(range(nfits),desc='    Fitting injected sources'))
 
-    # p0y = [np.max(y68), 0.5, np.min(y68)]
-    # popty, _ = curve_fit(model, centers, y68, p0=p0y, maxfev=10000)
+#     fits = np.array(fits)
+#     dx = fits[:,0] - shifts[:,0]
+#     dy = fits[:,1] - shifts[:,1]
+
+#     edges = np.logspace(np.log10(snrs.min()), np.log10(snrs.max()), nMedians + 1)
+#     centers = np.sqrt(edges[:-1] * edges[1:])
+
+#     # per-axis 68th percentiles, computed separately - matches get_wcs_uncertainty's approach
+#     x68 = np.array([
+#         np.percentile(np.abs(dx[(snrs >= edges[i]) & (snrs < edges[i+1])]), 68)
+#         for i in range(nMedians)
+#     ])
+#     y68 = np.array([
+#         np.percentile(np.abs(dy[(snrs >= edges[i]) & (snrs < edges[i+1])]), 68)
+#         for i in range(nMedians)
+#     ])
+
+#     # fit each separately vs SNR
+#     p0x = [np.log10(x68[0]), 0.7, np.log10(x68[-1])]
+#     poptx_log, _ = curve_fit(log_model_quadrature, centers, np.log10(x68), p0=p0x, maxfev=20000,
+#                           bounds=([-3, 0, -3], [1, 5, 1]))
+#     popty = 10**poptx_log[0], poptx_log[1], 10**poptx_log[2]
+
+#     p0y = [np.log10(y68[0]), 0.7, np.log10(y68[-1])]
+#     popty_log, _ = curve_fit(log_model_quadrature, centers, np.log10(y68), p0=p0y, maxfev=20000,
+#                             bounds=([-3, 0, -3], [1, 5, 1]))
+#     poptx = 10**popty_log[0], popty_log[1], 10**popty_log[2]
+
+
+
+#     # p0x = [np.max(x68), 0.5, np.min(x68)]
+#     # poptx, _ = curve_fit(model, centers, x68, p0=p0x, maxfev=10000)
+
+#     # p0y = [np.max(y68), 0.5, np.min(y68)]
+#     # popty, _ = curve_fit(model, centers, y68, p0=p0y, maxfev=10000)
 
     
-    # if plot:
-    #     snr_space = np.logspace(0,2,1000)
-    #     r68_fit = model(snr_space,popt[0],popt[1],popt[2])
+#     # if plot:
+#     #     snr_space = np.logspace(0,2,1000)
+#     #     r68_fit = model(snr_space,popt[0],popt[1],popt[2])
 
-    #     plt.figure()
-    #     plt.scatter(snrs,diffs,s=1)
-    #     plt.plot(centers,medians,'x',c='r')
-    #     plt.plot(centers,r68,'x',c='green')
+#     #     plt.figure()
+#     #     plt.scatter(snrs,diffs,s=1)
+#     #     plt.plot(centers,medians,'x',c='r')
+#     #     plt.plot(centers,r68,'x',c='green')
 
-    #     plt.plot(snr_space,med_fit,c='r',alpha=0.8)
-    #     plt.plot(snr_space,r68_fit,c='g',alpha=0.8)
+#     #     plt.plot(snr_space,med_fit,c='r',alpha=0.8)
+#     #     plt.plot(snr_space,r68_fit,c='g',alpha=0.8)
 
-    #     plt.xscale('log')
+#     #     plt.xscale('log')
 
-    df = pd.DataFrame()
-    df['snr'] = snrs
-    df['dx'] = dx
-    df['dy'] = dy
+#     df = pd.DataFrame()
+#     df['snr'] = snrs
+#     df['dx'] = dx
+#     df['dy'] = dy
 
-    np.save(f'{path}/cam{cam}_ccd{ccd}/snr_to_localisation/cut{cut}of{int(n**2)}_coeffs_x.npy',poptx)
-    np.save(f'{path}/cam{cam}_ccd{ccd}/snr_to_localisation/cut{cut}of{int(n**2)}_coeffs_y.npy',popty)
-    df.to_csv(f'{path}/cam{cam}_ccd{ccd}/snr_to_localisation/cut{cut}of{int(n**2)}_sources.csv',index=False)
+#     np.save(f'{path}/cam{cam}_ccd{ccd}/snr_to_localisation/cut{cut}of{int(n**2)}_coeffs_x.npy',poptx)
+#     np.save(f'{path}/cam{cam}_ccd{ccd}/snr_to_localisation/cut{cut}of{int(n**2)}_coeffs_y.npy',popty)
+#     df.to_csv(f'{path}/cam{cam}_ccd{ccd}/snr_to_localisation/cut{cut}of{int(n**2)}_sources.csv',index=False)
 
-    # with open(f'{path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{int(n**2)}/snr_localisation_coeffs_x.pkl', 'wb') as file:
-    #     pickle.dump(poptx, file)
-    # with open(f'{path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{int(n**2)}/snr_localisation_coeffs_y.pkl', 'wb') as file:
-    #     pickle.dump(popty, file)
-    print('    SNR to localisation accuracy model generated')
+#     # with open(f'{path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{int(n**2)}/snr_localisation_coeffs_x.pkl', 'wb') as file:
+#     #     pickle.dump(poptx, file)
+#     # with open(f'{path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{int(n**2)}/snr_localisation_coeffs_y.pkl', 'wb') as file:
+#     #     pickle.dump(popty, file)
+#     print('    SNR to localisation accuracy model generated')
 
-    if return_models:
-        return get_snr_to_localisation_func(path,sector,cam,ccd,cut)
+#     if return_models:
+#         return get_snr_to_localisation_func(path,sector,cam,ccd,cut)
 
 
-def get_snr_to_localisation_func(path,sector,cam,ccd,cut,n=8,xy=True):
+# def get_snr_to_localisation_func(path,sector,cam,ccd,cut,n=8,xy=True):
 
-    import pickle
+#     import pickle
 
-    if xy:
+#     if xy:
 
-        poptx = np.load(f'{path}/cam{cam}_ccd{ccd}/snr_to_localisation/cut{cut}of{int(n**2)}_coeffs_x.npy')
-        popty = np.load(f'{path}/cam{cam}_ccd{ccd}/snr_to_localisation/cut{cut}of{int(n**2)}_coeffs_y.npy')
+#         poptx = np.load(f'{path}/cam{cam}_ccd{ccd}/snr_to_localisation/cut{cut}of{int(n**2)}_coeffs_x.npy')
+#         popty = np.load(f'{path}/cam{cam}_ccd{ccd}/snr_to_localisation/cut{cut}of{int(n**2)}_coeffs_y.npy')
 
-        def func_x(snr):
-            return model_quadrature(snr, *poptx) 
-        def func_y(snr):
-            return model_quadrature(snr, *popty) 
+#         def func_x(snr):
+#             return model_quadrature(snr, *poptx) 
+#         def func_y(snr):
+#             return model_quadrature(snr, *popty) 
         
-        return func_x,func_y
+#         return func_x,func_y
 
-    else:
-        with open(f'{path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{int(n**2)}/snr_localisation_coeffs.pkl', 'rb') as file:
-            popt = pickle.load(file)
+#     else:
+#         with open(f'{path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{int(n**2)}/snr_localisation_coeffs.pkl', 'rb') as file:
+#             popt = pickle.load(file)
         
-        def func(snr):
-            return model(snr, *popt)
+#         def func(snr):
+#             return model(snr, *popt)
 
-        return func
+#         return func
 
-def get_wcs_uncertainty(path,sector,cam,ccd,cut,n=8):
+# def get_wcs_uncertainty(path,sector,cam,ccd,cut,n=8):
 
-    ccd_sources = pd.read_csv(f'{path}/Sector{sector}/Cam{cam}/Ccd{ccd}/wcs/ref/ccd_sourcefits.csv')
-    cut_wcs = CutWCS(path,sector,cam,ccd,cut,n)
+#     ccd_sources = pd.read_csv(f'{path}/Sector{sector}/Cam{cam}/Ccd{ccd}/wcs/ref/ccd_sourcefits.csv')
+#     cut_wcs = CutWCS(path,sector,cam,ccd,cut,n)
 
-    corner = cut_wcs.corner
-    size = 2048/n
+#     corner = cut_wcs.corner
+#     size = 2048/n
 
-    cut_sources = ccd_sources[(ccd_sources.xPSF>corner[0])&(ccd_sources.xPSF<corner[0]+size)&
-                              (ccd_sources.yPSF>corner[1])&(ccd_sources.yPSF<corner[1]+size)]
+#     cut_sources = ccd_sources[(ccd_sources.xPSF>corner[0])&(ccd_sources.xPSF<corner[0]+size)&
+#                               (ccd_sources.yPSF>corner[1])&(ccd_sources.yPSF<corner[1]+size)]
 
-    x,y = cut_wcs.all_world2pix(cut_sources.ra,cut_sources.dec,0)
+#     x,y = cut_wcs.all_world2pix(cut_sources.ra,cut_sources.dec,0)
 
-    dx = cut_sources.xPSF - (x+corner[0])
-    dy = cut_sources.yPSF - (y+corner[1])
-    xstd = np.percentile(np.abs(dx),68)
-    ystd = np.percentile(np.abs(dy),68)
+#     dx = cut_sources.xPSF - (x+corner[0])
+#     dy = cut_sources.yPSF - (y+corner[1])
+#     xstd = np.percentile(np.abs(dx),68)
+#     ystd = np.percentile(np.abs(dy),68)
 
-    return xstd, ystd
+#     return xstd, ystd
+
+
+_MODEL_PATH = Path(__file__).parent / "snr_localisation_model.pkl"  # adjust to wherever you store it
+
+def _bound_model(snr, a, b, floor):
+    return a * snr**(-b) + floor
+
+def get_snr_to_localisation_func(model_path=_MODEL_PATH):
+    """
+    Loads the fitted SNR -> localisation-error model and returns a callable:
+
+        f(snr_psf, percentage, axis=None) -> radius  or  {"x": radius, "y": radius}
+
+    Returns a single symmetric error radius r such that `percentage`% of
+    sources at that SNR have |error| <= r, for the given axis. axis must be
+    'x', 'y', or None (returns both as a dict). percentage is capped at the
+    fitted max (95%). SNR is extrapolated freely above the fitted range
+    (smooth analytic power law), but must be > 0.
+    """
+    with open(model_path, "rb") as f:
+        model = pickle.load(f)
+
+    percentages = model["percentages"]
+    pct_lo, pct_hi = percentages.min(), percentages.max()
+
+    def _eval_axis(snr_arr, percentage, axis):
+        params = model["params"][axis]
+        vals = np.array([_bound_model(snr_arr, *params[p]) for p in percentages])  # (n_pct, n_snr)
+        interp = interp1d(percentages, vals, axis=0)(percentage)
+        out = np.maximum(interp, 0)
+        return out if out.size > 1 else out.item()
+
+    def localisation_func(snr_psf, percentage, axis=None):
+        if axis not in ("x", "y", None):
+            raise ValueError("axis must be 'x', 'y', or None")
+        if not (pct_lo <= percentage <= pct_hi):
+            raise ValueError(f"percentage must be in [{pct_lo}, {pct_hi}] (got {percentage})")
+
+        snr_arr = np.atleast_1d(snr_psf).astype(float)
+        if np.any(snr_arr <= 0):
+            raise ValueError("snr_psf must be > 0")
+
+        if axis is None:
+            return {
+                "x": _eval_axis(snr_arr, percentage, "x"),
+                "y": _eval_axis(snr_arr, percentage, "y"),
+            }
+        return _eval_axis(snr_arr, percentage, axis)
+
+    return localisation_func

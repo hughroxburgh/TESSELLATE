@@ -1,3 +1,4 @@
 include README.md LICENSE
 include tessellate/rfc_files/*.npy
 include tessellate/rfc_files/*.joblib
+include tessellate/snr_localisation_model.pkl

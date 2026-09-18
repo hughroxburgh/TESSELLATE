@@ -254,8 +254,10 @@ class Navigator():
 
         # -- Flat local light curve baseline -- #
         if lc_flat == False:
-            events = events.loc[events.lc_flat == 0]
+            events = events.loc[events.lc_flat == -1]
         elif lc_flat == True:
+            events = events.loc[events.lc_flat >= 0]
+        elif lc_flat == 'hard':
             events = events.loc[events.lc_flat == 1]
 
         # -- Remove events within 'boundary_buffer' of the boundary -- #

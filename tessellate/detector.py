@@ -682,7 +682,7 @@ def _Lightcurve_significance(time,flux,frame_start,frame_end,pos,flux_sign,
     lc_sig = (lc - med) / std
 
     if ind.sum() < 2:
-        return np.nan, np.nan, np.ones_like(time)*np.nan, max_flux, max_frame, np.nan
+        return np.nan, np.nan, np.ones_like(time)*np.nan, max_flux, max_frame, -1
 
     slope, _, _, _, _ = stats.linregress(t_window, lc_window)
     flat_local = (abs(slope) / std < 2) and (abs(med) < std) and (std < 5)

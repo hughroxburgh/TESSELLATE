@@ -401,7 +401,7 @@ class PSF_Fitter():
 _MODEL_PATH = Path(__file__).parent / "snr_localisation_model.pkl"  # adjust to wherever you store it
 
 def _bound_model(snr, a, b, floor):
-    return a * snr**(-b) + floor
+    return np.sqrt((a * snr**(-b))**2 + floor**2)
 
 def get_snr_to_localisation_func(model_path=_MODEL_PATH):
     """
@@ -414,6 +414,11 @@ def get_snr_to_localisation_func(model_path=_MODEL_PATH):
     'x', 'y', or None (returns both as a dict). percentage is capped at the
     fitted max (95%). SNR is extrapolated freely above the fitted range
     (smooth analytic power law), but must be > 0.
+
+    Wing shape (a, b) is derived from PSF injection-recovery; the asymptotic
+    floor is calibrated against real flare stars with snr_psf above the
+    model's stored high_snr_cut, to correct for systematics (registration
+    error, subtraction bias) not present in injections.
     """
     with open(model_path, "rb") as f:
         model = pickle.load(f)

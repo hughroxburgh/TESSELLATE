@@ -703,19 +703,35 @@ def manual_sort(events_path, image_dir=None, sort_dir=None):
     except Exception:
         pass
 
-    lines = [f'{k + 1} : {c}' for k, c in enumerate(classes)] + ['', 'Enter : skip', 'Bkspc : undo', 'Esc/q : quit']
-    guide = np.zeros((32 * len(lines) + 20, 380, 3), dtype=np.uint8)
+    # Two columns (categories | navigation) so the window stays short enough for a VNC screen
+    col1 = ['  CONTROLS  '] + [f'{k + 1} : {c}' for k, c in enumerate(classes)]
+    col2 = ['  NAVIGATION  ', 'Enter  :  Skip', 'Bkspc  :  Undo', 'Esc/q  :  Quit']
+    font, fscale, thickness, pad = cv2.FONT_HERSHEY_SIMPLEX, 0.65, 1, 14
+    sizes1 = [cv2.getTextSize(line, font, fscale, thickness)[0] for line in col1]
+    sizes2 = [cv2.getTextSize(line, font, fscale, thickness)[0] for line in col2]
+    col1_w = max(w for w, _ in sizes1) + 2 * pad
+    col2_w = max(w for w, _ in sizes2) + 2 * pad
+    row_h = max(h for _, h in sizes1 + sizes2) + pad
+    height = max(len(col1), len(col2)) * row_h + pad
+
+    guide = np.zeros((height, col1_w + col2_w, 3), dtype=np.uint8)
     guide[:] = (0, 0, 139)
-    for k, line in enumerate(lines):
-        cv2.putText(guide, line, (15, 35 + 32 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (220, 220, 220), 1)
+    cv2.line(guide, (col1_w, 0), (col1_w, height), (80, 80, 80), 1)
+    for x0, lines, sizes in [(pad, col1, sizes1), (col1_w + pad, col2, sizes2)]:
+        y = pad
+        for k, (line, (_, th)) in enumerate(zip(lines, sizes)):
+            colour = (100, 220, 100) if k == 0 else (220, 220, 220)
+            cv2.putText(guide, line, (x0, y + th), font, fscale, colour, thickness)
+            y += th + pad
     cv2.imshow('Controls', guide)
-    cv2.moveWindow('Controls', 0, max(screen_h - guide.shape[0] - 60, 0))
+    cv2.moveWindow('Controls', 0, max(screen_h - height - 50, 0))
     cv2.waitKey(1)
 
     # -- Sorting loop -- #
     history = []    # (position in todo, category or None if skipped)
     i = 0
-    while i < len(todo):
+    stop = False
+    while i < len(todo) and not stop:
         idx, fname = todo[i]
         img = cv2.imread(image_of[fname])
         if img is None:
@@ -729,50 +745,58 @@ def manual_sort(events_path, image_dir=None, sort_dir=None):
         cv2.moveWindow('Image Sorter', 0, 0)
         print(f'[{i + 1}/{len(todo)}] {fname}')
 
-        key = cv2.waitKey(0) & 0xFF
-        if key in (27, ord('q')):
-            break
-
-        if key in (8, 127):
-            if not history:
-                print('  Nothing to undo.')
+        # wait for a recognised key; anything else is ignored
+        while True:
+            key = cv2.waitKey(0)
+            if key == -1:
                 continue
-            j, c = history.pop()
-            if c is not None:
-                prev = todo[j][1]
-                copied = os.path.join(sort_dir, c, prev)
-                if os.path.exists(copied):
-                    os.remove(copied)
-                ev = events.iloc[todo[j][0]]
-                match = np.all([groups[c][k].to_numpy() == ev[k] for k in keys], axis=0)
-                groups[c] = groups[c][~match]
+            key &= 0xFF
+
+            if key in (27, ord('q')):
+                stop = True
+                break
+
+            if key in (8, 127):
+                if not history:
+                    print('  Nothing to undo.')
+                    continue
+                j, c = history.pop()
+                if c is not None:
+                    prev = todo[j][1]
+                    copied = os.path.join(sort_dir, c, prev)
+                    if os.path.exists(copied):
+                        os.remove(copied)
+                    ev = events.iloc[todo[j][0]]
+                    match = np.all([groups[c][k].to_numpy() == ev[k] for k in keys], axis=0)
+                    groups[c] = groups[c][~match]
+                    groups[c].to_csv(group_csv[c], index=False)
+                    print(f'  Undid {prev} (was {c})')
+                i = j
+                break
+
+            if key == 13:
+                history.append((i, None))
+                print('  Skipped')
+                i += 1
+                break
+
+            if ord('1') <= key < ord('1') + len(classes):
+                c = classes[key - ord('1')]
+                shutil.copy2(image_of[fname], os.path.join(sort_dir, c, fname))
+                groups[c] = pd.concat([groups[c], events.iloc[[idx]]], ignore_index=True)
                 groups[c].to_csv(group_csv[c], index=False)
-                print(f'  Undid {prev} (was {c})')
-            i = j
-            continue
+                history.append((i, c))
 
-        if key == 13:
-            history.append((i, None))
-            print('  Skipped')
-            i += 1
-            continue
-
-        if ord('1') <= key < ord('1') + len(classes):
-            c = classes[key - ord('1')]
-            shutil.copy2(image_of[fname], os.path.join(sort_dir, c, fname))
-            groups[c] = pd.concat([groups[c], events.iloc[[idx]]], ignore_index=True)
-            groups[c].to_csv(group_csv[c], index=False)
-            history.append((i, c))
-
-            overlay = img.copy()
-            (tw, th), _ = cv2.getTextSize(c, cv2.FONT_HERSHEY_SIMPLEX, 2, 3)
-            cx, cy = (overlay.shape[1] - tw) // 2, (overlay.shape[0] + th) // 2
-            cv2.rectangle(overlay, (cx - 10, cy - th - 10), (cx + tw + 10, cy + 10), (0, 0, 255), -1)
-            cv2.putText(overlay, c, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 3)
-            cv2.imshow('Image Sorter', overlay)
-            cv2.waitKey(300)
-            print(f'  -> {c}')
-            i += 1
+                overlay = img.copy()
+                (tw, th), _ = cv2.getTextSize(c, cv2.FONT_HERSHEY_SIMPLEX, 2, 3)
+                cx, cy = (overlay.shape[1] - tw) // 2, (overlay.shape[0] + th) // 2
+                cv2.rectangle(overlay, (cx - 10, cy - th - 10), (cx + tw + 10, cy + 10), (0, 0, 255), -1)
+                cv2.putText(overlay, c, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 3)
+                cv2.imshow('Image Sorter', overlay)
+                cv2.waitKey(300)
+                print(f'  -> {c}')
+                i += 1
+                break
 
     cv2.destroyAllWindows()
     cv2.waitKey(1)

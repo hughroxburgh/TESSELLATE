@@ -23,13 +23,24 @@ inches_per_pt = 1.0/72.27			   # Convert pt to inches
 golden_mean = (np.sqrt(5)-1.0)/2.0		 # Aesthetic ratio
 fig_width = fig_width_pt*inches_per_pt  # width in inches
 
+def _Fetch(url, timeout=60):
+
+    """
+    Download with requests rather than giving astropy the URL, which prints a
+    'Downloading ...' progress bar and keeps a copy in ~/.astropy/cache.
+    """
+
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    return response
+
 def _Get_images(ra,dec,filters):
 
     """Query ps1filenames.py service to get a list of images"""
 
     service = "https://ps1images.stsci.edu/cgi-bin/ps1filenames.py"
     url = f"{service}?ra={ra}&dec={dec}&filters={filters}"
-    table = Table.read(url, format='ascii')
+    table = Table.read(_Fetch(url).text, format='ascii')
     return table
 
 def _Get_url_wcs(ra, dec, size, filters, color=False):
@@ -63,7 +74,7 @@ def _Get_im(ra, dec, size,color):
 
     if color:
         url = _Get_url_wcs(ra,dec,size=size,filters='grz',color=True)
-        fh = fits.open(url)
+        fh = fits.open(BytesIO(_Fetch(url).content))
         wcs = WCS(fh[0])
         # r = requests.get(url)
         # im = Image.open(BytesIO(r.content))
@@ -81,7 +92,7 @@ def _Get_im(ra, dec, size,color):
         
     else:
         url = _Get_url_wcs(ra,dec,size=size,filters='i')
-        fh = fits.open(url[0])
+        fh = fits.open(BytesIO(_Fetch(url[0]).content))
         wcs = WCS(fh[0])
 
         fim = fh[0].data
@@ -308,7 +319,6 @@ def _Skymapper_phot(ra, dec, size, show_bands=False,verbose=False):
 
     from astropy import log
     log.setLevel('ERROR')
-    import sys
 
     size *= 1.5
     og_size = size
@@ -321,12 +331,9 @@ def _Skymapper_phot(ra, dec, size, show_bands=False,verbose=False):
     attempt = 0
     while (not complete) & (attempt < max_attempts):
         try:
-            sys.stdout = open(os.devnull, 'w')
-            table = Table.read(url, format='ascii').to_pandas()
-            sys.stdout = sys.__stdout__
+            table = Table.read(_Fetch(url).text, format='ascii').to_pandas()
             complete = True
         except:
-            sys.stdout = sys.__stdout__
             attempt += 1
             if verbose:
                 print('failed to get table')
@@ -345,11 +352,7 @@ def _Skymapper_phot(ra, dec, size, show_bands=False,verbose=False):
             try:
                 f = t_unique.loc[t_unique['col3'] == filt].iloc[0]
                 img_url = f['col6']
-                sys.stdout = open(os.devnull, 'w')
-                sys.stderr = open(os.devnull, 'w')
-                hdu = fits.open(img_url)
-                sys.stdout = sys.__stdout__
-                sys.stderr = sys.__stderr__
+                hdu = fits.open(BytesIO(_Fetch(img_url).content))
                 data = hdu[0].data
                 m,med,std = sigma_clipped_stats(data)
                 data -= med

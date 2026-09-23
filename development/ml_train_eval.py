@@ -33,6 +33,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # ---- CONFIG ----
 FEATURES = [f'{HERE}/S55_features.csv.gz']   # one or more files from ml_extract_features.py
 SORT_DIR = f'{HERE}/images'                  # manual_sort.py output: one folder per group
+LABEL_RENAME = {'Other': 'Interesting'}      # sort folder name -> classifier class; None drops a folder.
+                                             # Classes: Junk, CosmicRay, Systematic, Blend, Asteroid,
+                                             # Flare, Variable, Interesting
 OUT_DIR = f'{HERE}/ml_eval'
 
 PIPELINE_WEIGHT = 0.3       # weight of the pipeline's Junk/CosmicRay/Asteroid tags (0 = ignore them)
@@ -158,11 +161,12 @@ def truth_check(predictions, labels, truth, path):
     print('\n' + '\n'.join(lines))
 
 
-def run(features_files, sort_dir, out_dir, pipeline_weight=0.3, crossbin_weight=0.5, groups=FEATURE_GROUPS,
-        class_balance=0.5, n_splits=5, ablation=False, importance=False, save_model=None, review=None, truth=None):
+def run(features_files, sort_dir, out_dir, label_rename=None, pipeline_weight=0.3, crossbin_weight=0.5,
+        groups=FEATURE_GROUPS, class_balance=0.5, n_splits=5, ablation=False, importance=False, save_model=None,
+        review=None, truth=None):
     os.makedirs(out_dir, exist_ok=True)
     features = pd.concat([pd.read_csv(f) for f in features_files], ignore_index=True)
-    manual = load_manual_labels(sort_dir) if sort_dir else None
+    manual = load_manual_labels(sort_dir, rename=label_rename) if sort_dir else None
     labels = attach_labels(features, manual, pipeline_weight=pipeline_weight, crossbin_weight=crossbin_weight)
 
     clf = EventClassifier(feature_groups=groups, class_balance=class_balance)
@@ -208,6 +212,6 @@ def run(features_files, sort_dir, out_dir, pipeline_weight=0.3, crossbin_weight=
 
 
 if __name__ == '__main__':
-    run(FEATURES, SORT_DIR, OUT_DIR, pipeline_weight=PIPELINE_WEIGHT, crossbin_weight=CROSSBIN_WEIGHT, groups=GROUPS,
-        class_balance=CLASS_BALANCE, n_splits=N_SPLITS, ablation=ABLATION, importance=IMPORTANCE,
-        save_model=SAVE_MODEL, review=REVIEW, truth=TRUTH)
+    run(FEATURES, SORT_DIR, OUT_DIR, label_rename=LABEL_RENAME, pipeline_weight=PIPELINE_WEIGHT,
+        crossbin_weight=CROSSBIN_WEIGHT, groups=GROUPS, class_balance=CLASS_BALANCE, n_splits=N_SPLITS,
+        ablation=ABLATION, importance=IMPORTANCE, save_model=SAVE_MODEL, review=REVIEW, truth=TRUTH)

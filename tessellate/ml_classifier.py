@@ -33,6 +33,23 @@ Workflow
 
 Labels
 ------
+Label an event by the physical event that defines its record (its peak,
+significance, duration and position); anything else in the light curve is
+background. Classes:
+
+  Junk         artefacts that don't fit the classes below
+  CosmicRay    one-frame hits, including those whose event window got stretched by noise
+  Systematic   real-looking, but one of many events at the same time (pointing jitter,
+               scattered light, unstable stretches)
+  Blend        the record's measurements come from different sources (e.g. a cosmic
+               ray on an asteroid track), so it can't be trusted as one object
+  Asteroid, Flare, Variable
+               a flare on a variable star is a Flare -- the variability is its baseline
+  Interesting  real, but none of the above
+
+Junk, CosmicRay, Systematic and Blend count as artefacts. Sort folders can use
+other names and be mapped with load_manual_labels(rename=...).
+
 Manual labels (development/manual_sort.py) are the ground truth, and the only
 labels used for evaluation and calibration. The pipeline's own Junk / CosmicRay /
 Asteroid tags can be added as down-weighted weak labels: they cover parts of
@@ -56,15 +73,15 @@ import pandas as pd
 
 
 # -- Taxonomy -- #
-CLASSES = ['Junk', 'CosmicRay', 'Asteroid', 'Flare', 'Variable', 'Interesting']
-ARTEFACT_CLASSES = ['Junk', 'CosmicRay']
+CLASSES = ['Junk', 'CosmicRay', 'Systematic', 'Blend', 'Asteroid', 'Flare', 'Variable', 'Interesting']
+ARTEFACT_CLASSES = ['Junk', 'CosmicRay', 'Systematic', 'Blend']   # see "Labels" in the module docstring
 PIPELINE_CLASSES = ['Junk', 'CosmicRay', 'Asteroid']
 
 KEY_COLS = ['sector', 'camera', 'ccd', 'cut', 'objid', 'eventid']
 META_COLS = KEY_COLS + ['frame_bin', 'flux_sign', 'classification', 'xcentroid', 'ycentroid', 'mjd_max',
                         'crossbin_ids']
 FEATURE_GROUPS = ('tab', 'lc', 'shape', 'ctx', 'pix', 'xm')
-FEATURE_VERSION = 1
+FEATURE_VERSION = 2
 
 DEFAULT_CONFIG = {
     'detrend_days': 1.0,          # running-median window; keeps events up to a few hours intact
@@ -234,23 +251,46 @@ def _n_crossbin(ids):
         return np.nan
 
 
-def _cut_groups(events):
-    keys = [k for k in ['sector', 'camera', 'ccd', 'cut'] if k in events]
-    return events.groupby(keys, sort=False).groups.values() if keys else [events.index]
-
-
-def _count_simultaneous(events):
-    """Number of other events in the same cut peaking within one (raw) frame bin of this one."""
-    out = pd.Series(np.nan, index=events.index)
-    if not {'frame_max', 'frame_bin'} <= set(events):
+def _time_crowding(events, windows_hr=(3, 12), sep_px=3.0):
+    """
+    How crowded in time the rest of the cut is around each event -- the sign of
+    systematics that make real-looking events appear everywhere at once. Counts
+    other events in the same cut and frame bin, more than sep_px away (so not
+    this source or its detections at other bins):
+      tab_n_simultaneous     peaking within one frame of this event
+      tab_n_local_{w}h       peaking within +/- w hours
+      tab_rate_ratio_{w}h    that count relative to the cut's average rate; catches
+                             unstable stretches where no single frame stands out
+    Only this cut's events are used, so each cut can be classified on its own.
+    """
+    cols = ['tab_n_simultaneous'] + [f'tab_{p}_{w}h' for w in windows_hr for p in ('n_local', 'rate_ratio')]
+    out = pd.DataFrame(np.nan, index=events.index, columns=cols)
+    if not {'frame_max', 'frame_bin', 'mjd_max', 'xcentroid', 'ycentroid'} <= set(events):
         return out
-    for idx in _cut_groups(events):
-        fb = events.loc[idx, 'frame_bin'].to_numpy(float)
-        peak = events.loc[idx, 'frame_max'].to_numpy(float) * fb
-        order = np.sort(peak)
-        tol = np.maximum(fb, 1)
-        n = np.searchsorted(order, peak + tol, side='right') - np.searchsorted(order, peak - tol, side='left')
-        out.loc[idx] = n - 1
+
+    keys = [k for k in ['sector', 'camera', 'ccd', 'cut', 'frame_bin'] if k in events]
+    widest = max(windows_hr) / 24
+    for idx in events.groupby(keys, sort=False).groups.values():
+        g = events.loc[idx]
+        t = g['mjd_max'].to_numpy(float)
+        frame = g['frame_max'].to_numpy(float)
+        x, y = g['xcentroid'].to_numpy(float), g['ycentroid'].to_numpy(float)
+        order = np.argsort(t)
+        ts = t[order]
+        finite = np.isfinite(t)
+        span = np.ptp(t[finite]) if finite.sum() > 1 else 0.0
+
+        res = np.full((len(g), len(cols)), np.nan)
+        for i in np.flatnonzero(finite):
+            near = order[np.searchsorted(ts, t[i] - widest, 'left'):np.searchsorted(ts, t[i] + widest, 'right')]
+            near = near[np.hypot(x[near] - x[i], y[near] - y[i]) > sep_px]
+            res[i, 0] = np.sum(np.abs(frame[near] - frame[i]) <= 1)
+            for k, w in enumerate(windows_hr):
+                n = np.sum(np.abs(t[near] - t[i]) <= w / 24)
+                expected = (len(g) - 1) * min(2 * w / 24 / span, 1) if span > 0 else 0
+                res[i, 1 + 2 * k] = n
+                res[i, 2 + 2 * k] = n / expected if expected > 0 else np.nan
+        out.loc[idx] = res
     return out
 
 
@@ -307,9 +347,8 @@ def table_features(events):
         f[f'tab_source_mask_b{b}'] = np.where(finite, (bits >> b) & 1, np.nan)
 
     f['tab_n_crossbin'] = events['crossbin_ids'].apply(_n_crossbin) if 'crossbin_ids' in events else np.nan
-    f['tab_n_simultaneous'] = _count_simultaneous(events)
     f['tab_obj_gap_cv'] = _object_gap_cv(events)
-    return f
+    return pd.concat([f, _time_crowding(events)], axis=1)
 
 
 # ----------------------------- Light-curve features ----------------------------- #
@@ -537,6 +576,15 @@ def _lc_features(t, lc, fs, fe, cadence, bounds, cfg):
     out['lc_log_fwhm_days'] = np.log10((hi - lo + 1) * cadence)
     out['lc_spikiness'] = peak / np.nansum(np.clip(ze, 0, None))
 
+    # -- One-frame spikes: how far the peak stands above its neighbours, and how strong
+    #    the event is without that frame (would it have been detected at all?) -- #
+    sides = [z[j] for j in (ip - 1, ip + 1) if 0 <= j < n and np.isfinite(z[j])]
+    out['lc_peak_over_neighbour'] = peak / max(max(sides), 1.0) if sides else np.nan
+    rest = np.delete(ze, ip - fs)
+    rest = rest[np.isfinite(rest)]
+    out['lc_despiked_peak_z'] = float(np.max(rest)) if rest.size else 0.0
+    out['lc_despiked_peak_ratio'] = out['lc_despiked_peak_z'] / peak
+
     zw = z[a:b + 1]
     pk, props = find_peaks(np.nan_to_num(zw), prominence=1.0)
     pk_abs = pk + a
@@ -585,11 +633,51 @@ def _lc_features(t, lc, fs, fe, cadence, bounds, cfg):
 _NEIGHBOURS = [(1, 1), (1, 2), (1, 3), (2, 1), (2, 3), (3, 1), (3, 2), (3, 3)]
 
 
+def _gauss_corr(img):
+    """Correlation of a 5x5 image with a symmetric Gaussian at its flux-weighted centroid."""
+    yy, xx = np.mgrid[0:5, 0:5]
+    w = np.clip(np.nan_to_num(img), 0, None)
+    fin = np.isfinite(img)
+    if w.sum() <= 0 or fin.sum() < 9 or np.std(img[fin]) == 0:
+        return np.nan
+    cy, cx = np.sum(w * yy) / w.sum(), np.sum(w * xx) / w.sum()
+    g = np.exp(-0.5 * ((yy - cy) ** 2 + (xx - cx) ** 2) / 0.9 ** 2)
+    return np.corrcoef(img[fin], g[fin])[0, 1]
+
+
+def _centroid_track(ev, frames):
+    """
+    Flux-weighted centroid path of a 5x5 stamp sequence through the given frames
+    that are at least half as bright as the brightest of them.
+    """
+    yy, xx = np.mgrid[0:5, 0:5]
+    total = np.nansum(ev[:, 1:4, 1:4], axis=(1, 2))
+    frames = [k for k in frames if np.isfinite(total[k])]
+    if not frames or np.max(total[frames]) <= 0:
+        return {}
+    top = np.max(total[frames])
+    cen = []
+    for k in frames:
+        w = np.clip(np.nan_to_num(ev[k]), 0, None)
+        if total[k] >= 0.5 * top and w.sum() > 0:
+            cen.append((np.sum(w * xx) / w.sum() - 2, np.sum(w * yy) / w.sum() - 2, k))
+    out = {}
+    if cen:
+        c = np.array(cen)
+        out['mean_offset'] = float(np.hypot(c[:, 0].mean(), c[:, 1].mean()))
+    if len(cen) >= 2:
+        steps = np.diff(c[:, :2], axis=0)
+        path = float(np.sum(np.hypot(steps[:, 0], steps[:, 1])))
+        disp = float(np.hypot(*(c[-1, :2] - c[0, :2])))
+        out.update(disp=disp, path=path, straightness=disp / path if path > 0 else np.nan,
+                   speed=disp / max(c[-1, 2] - c[0, 2], 1))
+    return out
+
+
 def _pixel_features(st, fs, fe, fm, noise):
     """Features of the 5x5 pixel stamp (already multiplied by flux_sign) through the event."""
     out = {}
     nt = st.shape[0]
-    yy, xx = np.mgrid[0:5, 0:5]
 
     # -- Brightest frame -- #
     img = st[fm]
@@ -602,15 +690,20 @@ def _pixel_features(st, fs, fe, fm, noise):
         pos = np.nansum(np.clip(img, 0, None))
         out['pix_neg_frac'] = -np.nansum(np.clip(img, None, 0)) / pos
         out['pix_outer_ratio'] = (np.nansum(img) - np.nansum(core)) / pos_core
-
-        w = np.clip(np.nan_to_num(img), 0, None)
-        cy, cx = np.sum(w * yy) / w.sum(), np.sum(w * xx) / w.sum()
-        g = np.exp(-0.5 * ((yy - cy) ** 2 + (xx - cx) ** 2) / 0.9 ** 2)
-        fin = np.isfinite(img)
-        if np.std(img[fin]) > 0:
-            out['pix_gauss_corr'] = np.corrcoef(img[fin], g[fin])[0, 1]
+        out['pix_gauss_corr'] = _gauss_corr(img)
         if noise is not None and noise[fm] > 0:
             out['pix_peak_pixel_z'] = np.nanmax(core) / noise[fm]
+
+        # What the brightest frame adds over its neighbours: PSF-shaped for a real brightening,
+        # sharp and concentrated for a cosmic ray -- alone, or landing on another event
+        sides = [st[j] for j in (fm - 1, fm + 1) if 0 <= j < nt and np.isfinite(st[j]).any()]
+        if sides:
+            excess = img - np.nanmean(sides, axis=0)
+            ecore = np.nansum(np.clip(excess[1:4, 1:4], 0, None))
+            out['pix_excess_frac'] = ecore / pos_core
+            if ecore > 0:
+                out['pix_excess_peak_frac'] = np.nanmax(excess[1:4, 1:4]) / ecore
+                out['pix_excess_gauss_corr'] = _gauss_corr(excess)
 
     # -- Do the PSF pixels brighten together (a real point source) or alone (a hit)? -- #
     lo, hi = max(fs - 1, 0), min(fe + 1, nt - 1)
@@ -634,24 +727,14 @@ def _pixel_features(st, fs, fe, fm, noise):
         out['pix_single_frac_max'] = float(np.nanmax(frac))
 
     # -- Centroid motion through the bright part of the event (asteroids move, stars don't) -- #
-    total = np.nansum(evcore, axis=(1, 2))
-    if np.isfinite(total).any() and np.nanmax(total) > 0:
-        cen = []
-        for k in np.flatnonzero(total >= 0.5 * np.nanmax(total)):
-            w = np.clip(np.nan_to_num(ev[k]), 0, None)
-            if w.sum() > 0:
-                cen.append((np.sum(w * xx) / w.sum() - 2, np.sum(w * yy) / w.sum() - 2, k))
-        if cen:
-            c = np.array(cen)
-            out['pix_cen_mean_offset'] = float(np.hypot(c[:, 0].mean(), c[:, 1].mean()))
-        if len(cen) >= 2:
-            steps = np.diff(c[:, :2], axis=0)
-            path = float(np.sum(np.hypot(steps[:, 0], steps[:, 1])))
-            disp = float(np.hypot(*(c[-1, :2] - c[0, :2])))
-            out['pix_cen_disp'] = disp
-            out['pix_cen_path'] = path
-            out['pix_cen_straightness'] = disp / path if path > 0 else np.nan
-            out['pix_cen_speed'] = disp / max(c[-1, 2] - c[0, 2], 1)
+    track = _centroid_track(ev, range(len(ev)))
+    for k in ['mean_offset', 'disp', 'path', 'straightness', 'speed']:
+        if k in track:
+            out[f'pix_cen_{k}'] = track[k]
+    # ... and without the brightest frame, so a cosmic ray on top doesn't hide the motion underneath
+    track = _centroid_track(ev, [k for k in range(len(ev)) if k != fm - fs])
+    out['pix_cen_disp_nopeak'] = track.get('disp', np.nan)
+    out['pix_cen_straightness_nopeak'] = track.get('straightness', np.nan)
     return out
 
 
@@ -695,6 +778,9 @@ def _event_features(ev, cd, cfg):
         med = np.nanmedian(noise)
         out['ctx_frame_noise_ratio'] = noise[fm] / med
         out['ctx_frame_noise_ratio_max'] = np.nanmax(noise[fs:fe + 1]) / med
+        # an unstable stretch of the cut: mean frame noise over the hours around the event
+        for hours in (3, 12):
+            out[f'ctx_frame_noise_{hours}h'] = np.nanmean(noise[np.abs(t - t[fm]) <= hours / 24]) / med
     return out
 
 
@@ -867,23 +953,33 @@ def build_feature_table(data_path='/fred/oz335/TESSdata', sector=None, cams=(1, 
 
 # ----------------------------- Labels ----------------------------- #
 
-def load_manual_labels(sort_dir):
+def load_manual_labels(sort_dir, rename=None):
     """
-    Labels from development/manual_sort.py: one folder per group holding the
-    sorted PNGs (S{s}C{cam}C{ccd}C{cut}O{objid}E{eventid}.png) and an
-    events.csv of their rows. The PNG names are the record of what was sorted
-    (the csv can miss rows); the csv supplies position/time for re-matching.
-    Events sorted into more than one group are dropped.
+    Labels from a manual sort (development/manual_sort.py or tools.manual_sort):
+    one folder per group holding the sorted PNGs
+    (S{s}C{cam}C{ccd}C{cut}O{objid}E{eventid}.png) and an events.csv of their
+    rows. The PNG names are the record of what was sorted (the csv can miss
+    rows); the csv supplies position/time for re-matching. Events sorted into
+    more than one group are dropped.
+
+    rename : dict mapping folder names to class names, e.g.
+        {'Other': 'Interesting', 'Cosmic Ray': 'CosmicRay'}; map a folder to
+        None to leave it out (e.g. {'Unsure': None}). Names outside CLASSES
+        become classes of their own and count as astrophysical.
     """
+    rename = rename or {}
     rows, info = [], []
     for group in sorted(os.listdir(sort_dir)):
         gdir = os.path.join(sort_dir, group)
         if not os.path.isdir(gdir):
             continue
+        label = rename.get(group, group)
+        if label is None:
+            continue
         for name in os.listdir(gdir):
             m = _IMAGE_NAME.match(name)
             if m:
-                rows.append({**dict(zip(KEY_COLS, map(int, m.groups()))), 'label': group})
+                rows.append({**dict(zip(KEY_COLS, map(int, m.groups()))), 'label': label})
         csv = os.path.join(gdir, 'events.csv')
         if os.path.exists(csv):
             df = pd.read_csv(csv)
@@ -895,7 +991,8 @@ def load_manual_labels(sort_dir):
     labels = pd.DataFrame(rows).drop_duplicates()
     unknown = sorted(set(labels.label) - set(CLASSES))
     if unknown:
-        warnings.warn(f'Groups not in the standard taxonomy, kept as their own classes: {unknown}')
+        warnings.warn(f'Groups not in {CLASSES} are kept as their own classes and counted as astrophysical: '
+                      f'{unknown}. Use rename= to map them.')
 
     conflict = labels.duplicated(KEY_COLS, keep=False)
     if conflict.any():

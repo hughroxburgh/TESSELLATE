@@ -13,8 +13,9 @@ Writes, under OUT (~300 MB for 5 cuts; takes a few minutes):
   eval/                                      ml_train_eval.py outputs, incl. truth_check.txt
 
 The injected classes are caricatures -- flares, moving asteroids, cosmic-ray
-hits, periodic variables, and several kinds of junk (flickering pixels,
-subtraction dipoles, scattered-light glints, momentum-dump frames). Good
+hits, periodic variables, several kinds of junk (flickering pixels,
+subtraction dipoles, scattered-light glints), and systematics (real-looking
+PSF blips at many positions at once, in a stretch of raised noise). Good
 results here only show that the plumbing works and that the features respond
 to the physics they target; they say nothing about performance on real data.
 """
@@ -136,8 +137,9 @@ def make_cut(rng, size, n_orbit):
             peaks.append(t0)
         objects.append(dict(cls='Flare', x=x, y=y, peaks=peaks))
 
-    # -- Asteroids: a PSF moving in a straight line past the event pixel -- #
-    for _ in range(8):
+    # -- Asteroids: a PSF moving in a straight line past the event pixel; on three of them a -- #
+    # -- cosmic ray lands on the track and dominates the peak (a Blend)                      -- #
+    for i in range(8):
         x, y = place(rng, taken, size)
         fc = int(rng.integers(80, n - 80))
         speed, ang = rng.uniform(0.08, 0.6), rng.uniform(0, 2 * np.pi)
@@ -145,7 +147,14 @@ def make_cut(rng, size, n_orbit):
         f = f[(f >= 0) & (f < n)]
         add_psf(flux, f, x + speed * np.cos(ang) * (f - fc), y + speed * np.sin(ang) * (f - fc),
                 np.exp(rng.uniform(np.log(120), np.log(500))))
-        objects.append(dict(cls='Asteroid', x=x, y=y, peaks=[fc], pipeline='Asteroid' if speed > 0.35 else '-'))
+        if i < 3:
+            fcr = fc + int(rng.integers(-int(1 / speed), int(1 / speed) + 1))
+            xi = int(round(x + speed * np.cos(ang) * (fcr - fc)))
+            yi = int(round(y + speed * np.sin(ang) * (fcr - fc)))
+            flux[fcr, yi, xi] += rng.uniform(400, 1000)
+            objects.append(dict(cls='Blend', x=x, y=y, peaks=[fcr], window=1, kind='cr_on_asteroid'))
+        else:
+            objects.append(dict(cls='Asteroid', x=x, y=y, peaks=[fc], pipeline='Asteroid' if speed > 0.35 else '-'))
 
     # -- Cosmic rays: one frame, one or two pixels -- #
     for _ in range(12):
@@ -194,21 +203,14 @@ def make_cut(rng, size, n_orbit):
             blob = np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * s ** 2))
             flux += (amp[:, None, None] * blob[None]).astype(np.float32)
             objects.append(dict(cls='Junk', x=x, y=y, peaks=[fc], kind='glint'))
-    for _ in range(2):      # momentum-dump frame: correlated structure everywhere at once
-        from scipy.ndimage import gaussian_filter
-        f = int(rng.integers(20, n - 20))
-        field = gaussian_filter(rng.normal(0, 1, (size, size)), 1.5)
-        field *= 110 / np.abs(field).max()
-        flux[f] += field.astype(np.float32)
-        spots = np.dstack(np.unravel_index(np.argsort(-field.ravel())[:40], field.shape))[0]
-        chosen = []
-        for yi, xi in spots:
-            if 3 <= xi < size - 3 and 3 <= yi < size - 3 and all(np.hypot(xi - a, yi - b) > 5 for a, b in chosen):
-                chosen.append((xi, yi))
-            if len(chosen) == 3:
-                break
-        for xi, yi in chosen:
-            objects.append(dict(cls='Junk', x=xi, y=yi, peaks=[f], window=0, kind='dump'))
+    for _ in range(2):      # systematic epoch: real-looking PSF blips at many positions at once,
+        f = int(rng.integers(60, n - 60))   # inside a few hours of raised noise
+        flux[f - 15:f + 15] += rng.normal(0, 0.7 * NOISE, (30, size, size)).astype(np.float32)
+        for _ in range(5):
+            x, y = place(rng, taken, size, min_sep=5)
+            k = int(rng.integers(1, 4))
+            add_psf(flux, np.arange(f, f + k), x, y, rng.uniform(150, 400) * np.exp(-np.arange(k)))
+            objects.append(dict(cls='Systematic', x=x, y=y, peaks=[f], window=1, kind='systematic'))
 
     for f in rng.choice(n, 4, replace=False):   # momentum-dump gaps
         flux[f] = np.nan

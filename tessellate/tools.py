@@ -627,8 +627,9 @@ def manual_sort(events_path, image_dir=None, sort_dir=None):
 
     Images are copied, not moved, so the same images can be sorted in several
     ways. Each category gets a folder of images plus an events.csv of their
-    rows -- the layout ml_classifier.load_manual_labels reads. Running again
-    with the same sort_dir carries on where it stopped.
+    rows -- the layout ml_classifier.load_manual_labels reads. If sort_dir
+    already holds a sort, you're asked whether to continue it, reset it, or
+    start a new one alongside it (sort_dir_2, sort_dir_3, ...).
 
     Keys: 1-9 sort, Enter skip, Backspace undo, Esc or q quit.
     """
@@ -641,20 +642,40 @@ def manual_sort(events_path, image_dir=None, sort_dir=None):
     name = os.path.splitext(os.path.basename(events_path))[0]
     image_dir = os.path.abspath(image_dir or os.path.join(base, 'images'))
     sort_dir = os.path.abspath(sort_dir or os.path.join(base, f'sort_{name}'))
-    order_file = os.path.join(sort_dir, 'categories.txt')
 
     events = pd.read_csv(events_path)
 
-    # -- Categories: carry on an existing sort, or ask for new ones -- #
+    # -- An existing sort: continue it, reset it, or start a new one alongside -- #
     classes = []
-    if os.path.exists(order_file):
-        with open(order_file) as f:
+    if os.path.exists(os.path.join(sort_dir, 'categories.txt')):
+        with open(os.path.join(sort_dir, 'categories.txt')) as f:
             classes = [line.strip() for line in f if line.strip()]
-        answer = input(f'Continue the sort in {sort_dir} with categories {classes}? [y/n] ')
-        if answer.strip().lower() != 'y':
-            print('Pass a different sort_dir to start a new sort.')
-            return
-    else:
+        n_sorted = sum(f.endswith('.png') for c in classes if os.path.isdir(os.path.join(sort_dir, c))
+                       for f in os.listdir(os.path.join(sort_dir, c)))
+        print(f'Found a sort in {sort_dir}\n  categories {classes}, {n_sorted} events sorted so far.')
+        answer = ''
+        while answer not in ('c', 'r', 'n'):
+            answer = input('  c = continue it,  r = reset it and start again,  n = start a new sort alongside it: ')
+            answer = answer.strip().lower()
+
+        if answer == 'r':
+            confirm = input(f'  This deletes the {n_sorted} sorted copies in {sort_dir} (your original images '
+                            f'are untouched). Type yes to confirm: ')
+            if confirm.strip().lower() != 'yes':
+                print('Nothing deleted.')
+                return
+            shutil.rmtree(sort_dir)
+            classes = []
+        elif answer == 'n':
+            k = 2
+            while os.path.exists(f'{sort_dir}_{k}'):
+                k += 1
+            sort_dir = f'{sort_dir}_{k}'
+            print(f'  New sort in {sort_dir}')
+            classes = []
+
+    order_file = os.path.join(sort_dir, 'categories.txt')
+    if not classes:
         print('Enter category names one at a time (up to 9); press Enter on an empty line to finish.')
         while len(classes) < 9:
             c = input(f'  Category {len(classes) + 1}: ').strip()

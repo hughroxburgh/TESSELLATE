@@ -613,6 +613,28 @@ def Frame_Bin(sector, camera, time, flux=None, frame_bin=1):
 
 
 
+def _Ask(prompt):
+    """
+    input() for terminals whose Backspace key isn't wired to erase (e.g. over
+    VNC): readline gives it normal line editing, and any backspace/delete
+    characters that still come through are applied rather than kept.
+    """
+    import importlib
+    import re
+    try:
+        importlib.import_module('readline')
+    except ImportError:
+        pass
+
+    text = []
+    for ch in re.sub(r'\x1b\[[0-9;]*[A-Za-z~]', '', input(prompt)):     # drop arrow-key escape codes
+        if ch in '\x08\x7f':
+            if text:
+                text.pop()
+        elif ch.isprintable():
+            text.append(ch)
+    return ''.join(text)
+
 def manual_sort(events_path, image_dir=None, sort_dir=None):
     """
     Sort events by eye into categories named when it starts (e.g. 'Real' and
@@ -655,11 +677,11 @@ def manual_sort(events_path, image_dir=None, sort_dir=None):
         print(f'Found a sort in {sort_dir}\n  categories {classes}, {n_sorted} events sorted so far.')
         answer = ''
         while answer not in ('c', 'r', 'n'):
-            answer = input('  c = continue it,  r = reset it and start again,  n = start a new sort alongside it: ')
+            answer = _Ask('  c = continue it,  r = reset it and start again,  n = start a new sort alongside it: ')
             answer = answer.strip().lower()
 
         if answer == 'r':
-            confirm = input(f'  This deletes the {n_sorted} sorted copies in {sort_dir} (your original images '
+            confirm = _Ask(f'  This deletes the {n_sorted} sorted copies in {sort_dir} (your original images '
                             f'are untouched). Type yes to confirm: ')
             if confirm.strip().lower() != 'yes':
                 print('Nothing deleted.')
@@ -678,7 +700,7 @@ def manual_sort(events_path, image_dir=None, sort_dir=None):
     if not classes:
         print('Enter category names one at a time (up to 9); press Enter on an empty line to finish.')
         while len(classes) < 9:
-            c = input(f'  Category {len(classes) + 1}: ').strip()
+            c = _Ask(f'  Category {len(classes) + 1}: ').strip()
             if not c:
                 break
             if c in classes or '/' in c or '\\' in c:

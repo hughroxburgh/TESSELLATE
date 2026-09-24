@@ -88,7 +88,7 @@ KEY_COLS = ['sector', 'camera', 'ccd', 'cut', 'objid', 'eventid']
 META_COLS = KEY_COLS + ['frame_bin', 'flux_sign', 'classification', 'xcentroid', 'ycentroid', 'mjd_max',
                         'crossbin_ids']
 FEATURE_GROUPS = ('tab', 'lc', 'shape', 'ctx', 'pix', 'xm')
-FEATURE_VERSION = 2
+FEATURE_VERSION = 3
 
 # Features (name prefixes) that say whether a star is at the event position: the Gaia / variable-catalogue
 # distances and bit 0 of the reduction's source mask (pixel on a catalogue star). Flare is defined by shape,
@@ -104,6 +104,8 @@ DEFAULT_CONFIG = {
     'n_shape': 16,                # points in the duration-normalised shape vector
     'frame_stats': True,          # per-frame noise of the whole cut (one pass over the cube)
     'crossmatch': True,           # Gaia / variable-catalogue context through CutWCS
+    'max_tagged': None,           # per cut, at most this many events of each pipeline tag (Junk / CosmicRay /
+                                  # Asteroid) get features; they're only weak labels. None = all of them
 }
 
 _IMAGE_NAME = re.compile(r'^S(\d+)C(\d+)C(\d+)C(\d+)O(\d+)E(\d+)\.png$', re.IGNORECASE)
@@ -414,17 +416,20 @@ def _fit_features(idx, zw, ip, rise, decay, cadence):
     if sst <= 0:
         return out
 
+    # scipy's default tolerances (1e-8) left ~2% of real-data fits running to maxfev and failing, which took most
+    # of the fitting time; at 1e-5 they converge and the fitted values move by ~1e-4
+    tol = dict(ftol=1e-5, xtol=1e-5, gtol=1e-5)
     rss = {}
     try:
         p, _ = curve_fit(_gauss, x, v, p0=[amp, ip, max(1.0, (rise + decay + 1) / 2.355), 0.0],
-                         bounds=([0, x.min(), 0.3, -np.inf], [np.inf, x.max(), 3 * span, np.inf]), maxfev=2000)
+                         bounds=([0, x.min(), 0.3, -np.inf], [np.inf, x.max(), 3 * span, np.inf]), maxfev=2000, **tol)
         rss['gauss'] = np.sum((v - _gauss(x, *p)) ** 2)
     except Exception:
         pass
     try:
         p, _ = curve_fit(_dexp, x, v, p0=[amp, ip, max(rise, 0.5), max(decay, 0.5), 0.0],
                          bounds=([0, x.min(), 0.1, 0.1, -np.inf], [np.inf, x.max(), 3 * span, 3 * span, np.inf]),
-                         maxfev=2000)
+                         maxfev=2000, **tol)
         rss['dexp'] = np.sum((v - _dexp(x, *p)) ** 2)
         out['lc_fit_log_tau_ratio'] = np.log10(p[3] / p[2])
         out['lc_fit_log_rise_days'] = np.log10(p[2] * cadence)
@@ -477,13 +482,15 @@ def _self_similarity(z, a, b, peak):
 
     cand = lags[ok]
     out['ctx_selfsim_max'] = float(np.max(ncc[cand]))
-    taken = []
+    blocked = np.zeros(len(lags), bool)          # lags within L of a copy already counted
+    n_similar = 0
     for lag in cand[np.argsort(-ncc[cand])][:5000]:
         if ncc[lag] < 0.7:
             break
-        if all(abs(lag - t) >= L for t in taken):
-            taken.append(lag)
-    out['ctx_n_similar'] = len(taken)
+        if not blocked[lag]:
+            n_similar += 1
+            blocked[max(lag - L + 1, 0):lag + L] = True
+    out['ctx_n_similar'] = n_similar
     return out
 
 
@@ -880,6 +887,14 @@ def extract_cut_features(data_path, sector, cam, ccd, cut, n=8, events=None, con
         wanted = events[['objid', 'eventid']].drop_duplicates()
         keep = all_events.reset_index().merge(wanted, on=['objid', 'eventid'])['index']
         selected = all_events.loc[keep]
+    if cfg['max_tagged'] is not None:
+        rng = np.random.default_rng([sector, cam, ccd, cut])
+        drop = []
+        for cls in PIPELINE_CLASSES:
+            idx = selected.index[selected['classification'] == cls]
+            if len(idx) > cfg['max_tagged']:
+                drop += list(rng.choice(idx, len(idx) - cfg['max_tagged'], replace=False))
+        selected = selected.drop(drop)
 
     cd = _CutData(data_path, sector, cam, ccd, cut, n, frame_stats=cfg['frame_stats'])
     rows, failed = [], 0
@@ -897,7 +912,10 @@ def extract_cut_features(data_path, sector, cam, ccd, cut, n=8, events=None, con
     parts = [selected[[c for c in META_COLS if c in selected]], tab.loc[selected.index],
              pd.DataFrame(rows, index=selected.index)]
     if cfg['crossmatch']:
-        parts.append(_crossmatch_features(selected, data_path, sector, cam, ccd, cut, n))
+        from astropy.wcs import FITSFixedWarning
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', FITSFixedWarning)   # astropy tidying the WCS header's dates
+            parts.append(_crossmatch_features(selected, data_path, sector, cam, ccd, cut, n))
     out = pd.concat(parts, axis=1)
 
     meta = [c for c in META_COLS if c in out]
@@ -949,7 +967,7 @@ def build_feature_table(data_path='/fred/oz335/TESSdata', sector=None, cams=(1, 
             for cut in cuts:
                 cache = None
                 if cache_dir is not None:
-                    cache = f'{cache_dir}/S{sector}C{cam}C{ccd}C{cut}_features.csv'
+                    cache = f'{cache_dir}/S{sector}C{cam}C{ccd}C{cut}_features_v{FEATURE_VERSION}.csv'
                     if overwrite and os.path.exists(cache):
                         os.remove(cache)
                 jobs.append((data_path, sector, cam, ccd, cut, n, events, config, cache))

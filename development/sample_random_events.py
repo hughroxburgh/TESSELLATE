@@ -4,10 +4,12 @@ them for manual sorting. Run this on the cluster (the plots need the flux cubes)
 
 A sector's events fall into three groups:
   tagged     the pipeline's Junk / CosmicRay / Asteroid tags (trusted as labels)
-  sorted     events already sorted by hand (found_flares.csv / non_flares.csv)
+  sorted     events with an image in one of the sort folders (SORT_DIRS)
   rest       everything else -- the pool this script samples from
-Groups 1 and 2 are covered completely, so a random sample of the rest is enough
-to get unbiased numbers for the whole sector. The group sizes are written to
+"Sorted" goes by the sorted images, not by the event lists given to the sorter, so
+anything left unsorted (e.g. an unfinished camera) stays in the pool. Groups 1 and
+2 are known completely, so a random sample of the rest is enough to get unbiased
+numbers for the whole sector. The group sizes are written to
 sample_summary.txt next to the sample.
 
 The draw is a fixed-seed shuffle of the pool, so raising N_SAMPLE later keeps the
@@ -19,6 +21,7 @@ sort_random) -- keep it separate from other sorts, its value is being random.
 """
 
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -35,14 +38,26 @@ N_SAMPLE = 300
 SEED = 55
 FRAME_BIN = 1               # the manual sort shows frame_bin 1 (coarser bins inherit its labels); None = every bin
 TAGGED = ['Junk', 'CosmicRay', 'Asteroid']   # pipeline classifications trusted as labels, so never sampled
-SORTED_CSVS = ['/fred/oz335/hroxburg/dev/final_localisation/found_flares.csv',   # events already sorted by hand
-               '/fred/oz335/hroxburg/dev/final_localisation/non_flares.csv']
+SORT_DIRS = ['/fred/oz335/hroxburg/dev/final_localisation/sort_found_flares',   # manual_sort outputs: events with
+             '/fred/oz335/hroxburg/dev/final_localisation/sort_non_flares']     # an image in these count as sorted
 
 OUT_DIR = f'/fred/oz335/hroxburg/dev/random_sample/Sector{SECTOR}'
 PLOT = True                 # draw a PNG per sampled event (same plot as plot_events.py)
 # ----------------
 
 KEY_COLS = ['sector', 'camera', 'ccd', 'cut', 'objid', 'eventid']
+_IMAGE_NAME = re.compile(r'^S(\d+)C(\d+)C(\d+)C(\d+)O(\d+)E(\d+)\.png$', re.IGNORECASE)
+
+
+def sorted_event_keys():
+    """(sector, camera, ccd, cut, objid, eventid) of every image in the sort folders."""
+    keys = set()
+    for sort_dir in SORT_DIRS:
+        if not os.path.isdir(sort_dir):
+            raise FileNotFoundError(f'Sort folder not found: {sort_dir}')
+        for _, _, files in os.walk(sort_dir):
+            keys.update(tuple(map(int, m.groups())) for m in map(_IMAGE_NAME.match, files) if m)
+    return keys
 
 
 def load_sector_events():
@@ -64,9 +79,8 @@ def draw_sample(events):
         events = events[events.frame_bin == FRAME_BIN]
     tagged = events.classification.isin(TAGGED)
 
-    sorted_keys = pd.concat([pd.read_csv(f, usecols=KEY_COLS)[KEY_COLS] for f in SORTED_CSVS], ignore_index=True)
-    sorted_keys = set(map(tuple, sorted_keys.drop_duplicates().to_numpy()))
-    is_sorted = np.array([tuple(k) in sorted_keys for k in events[KEY_COLS].to_numpy()])
+    sorted_keys = sorted_event_keys()
+    is_sorted = np.array([tuple(map(int, k)) in sorted_keys for k in events[KEY_COLS].to_numpy()])
 
     pool = events[~tagged & ~is_sorted].sort_values(KEY_COLS)
     order = np.random.default_rng(SEED).permutation(len(pool))
@@ -75,7 +89,7 @@ def draw_sample(events):
     lines = [f'Sector {SECTOR}, frame_bin {FRAME_BIN if FRAME_BIN is not None else "all"}, seed {SEED}',
              f'  all events            {len(events)}',
              f'  tagged by pipeline    {tagged.sum()}  ({", ".join(TAGGED)})',
-             f'  sorted by hand        {(is_sorted & ~tagged).sum()}  (of {len(sorted_keys)} in SORTED_CSVS)',
+             f'  sorted by hand        {(is_sorted & ~tagged).sum()}  (of {len(sorted_keys)} images in SORT_DIRS)',
              f'  rest (the pool)       {len(pool)}',
              f'  sampled               {len(sample)}  (fraction {len(sample) / max(len(pool), 1):.4f} of the pool)']
     if (is_sorted & tagged).any():

@@ -39,11 +39,13 @@ EVENTS_CSV = None           # a csv of events (sector/camera/ccd/cut/objid/event
                             # the sorted ones -- much faster than the whole sector. None = every event.
 N_JOBS = 16                 # parallel workers (and, with SLURM, the CPUs requested)
 CROSSMATCH = True           # Gaia / variable-catalogue features (needs the WCS + local catalogues)
-FRAME_STATS = True          # per-frame noise pass over each cube (~10 s per cut)
-OVERWRITE = False           # True = recompute cuts already in CACHE_DIR
+FRAME_STATS = True          # per-frame noise pass over each cube (~8 s per cut)
+TAGGED_PER_CUT = 100        # per cut, at most this many events of each pipeline tag (Junk/CosmicRay/Asteroid) get
+                            # features -- they're only weak labels, and ~45% of a cut. None = all of them
+OVERWRITE = False           # True = recompute cuts already in CACHE_DIR (do this if you change TAGGED_PER_CUT)
 
 SLURM = True                # True = submit as a SLURM job; False = run here
-TIME = '02:00:00'           # wall time (a sector should take well under an hour at 16 CPUs)
+TIME = '04:00:00'           # wall time: a sector takes ~1 h at 16 CPUs with TAGGED_PER_CUT = 100, ~2 h with None
 MEM_PER_CPU_GB = 4          # cubes are memory-mapped, so each worker needs little
 ACCOUNT = 'oz335'
 # ----------------
@@ -56,7 +58,8 @@ def main():
     start = time.time()
     features = build_feature_table(DATA_PATH, SECTOR, cams=CAMS, ccds=CCDS, cuts=CUTS, events=events,
                                    cache_dir=CACHE_DIR, overwrite=OVERWRITE, n_jobs=N_JOBS,
-                                   config={'crossmatch': CROSSMATCH, 'frame_stats': FRAME_STATS})
+                                   config={'crossmatch': CROSSMATCH, 'frame_stats': FRAME_STATS,
+                                           'max_tagged': TAGGED_PER_CUT})
     features.to_csv(OUT_FILE, index=False)
 
     elapsed = time.time() - start

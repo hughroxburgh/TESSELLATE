@@ -25,14 +25,15 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))   # use this checkout's tessellate
-from tessellate.ml_classifier import (ARTEFACT_CLASSES, FEATURE_GROUPS, EventClassifier, attach_labels, evaluate,
-                                      load_manual_labels, rank_for_review)
+from tessellate.ml_classifier import (ARTEFACT_CLASSES, FEATURE_GROUPS, HOST_FEATURES, KEY_COLS, EventClassifier,
+                                      attach_labels, evaluate, load_manual_labels, rank_for_review)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---- CONFIG ----
-FEATURES = [f'{HERE}/S55_features.csv.gz']   # one or more files from ml_extract_features.py
-SORT_DIR = f'{HERE}/images'                  # manual_sort.py output: one folder per group
+FEATURES = [f'{HERE}/S55/S55_features.csv.gz']   # one or more files from ml_extract_features.py
+SORT_DIR = [f'{HERE}/S55/sort_flares',           # one or more manual_sort outputs, each with one folder per group
+            f'{HERE}/S55/sort_non_flares']
 LABEL_RENAME = {'Other': 'Interesting'}      # sort folder name -> classifier class; None drops a folder.
                                              # Classes: Junk, CosmicRay, Systematic, Blend, Asteroid,
                                              # Flare, Variable, Interesting
@@ -41,6 +42,8 @@ OUT_DIR = f'{HERE}/ml_eval'
 PIPELINE_WEIGHT = 0.3       # weight of the pipeline's Junk/CosmicRay/Asteroid tags (0 = ignore them)
 CROSSBIN_WEIGHT = 0.5       # weight of labels inherited by other-frame-bin detections of a sorted event (0 = off)
 GROUPS = FEATURE_GROUPS     # feature groups to use: 'tab', 'lc', 'shape', 'ctx', 'pix', 'xm'
+EXCLUDE = HOST_FEATURES     # features left out: by default the ones saying whether a star is there, so Flare
+                            # is judged on shape alone (the ablation adds a run with them). () = use everything
 CLASS_BALANCE = 0.5         # 0 = natural class frequencies, 1 = fully balanced
 N_SPLITS = 5
 
@@ -51,8 +54,8 @@ REVIEW = 500                # write the N most useful unlabelled events to sort 
 TRUTH = None                # csv of true classes, for synthetic data only
 # ----------------
 
-ABLATIONS = [('tab',), ('tab', 'xm'), ('tab', 'lc', 'shape'), ('tab', 'lc', 'shape', 'ctx'),
-             ('tab', 'lc', 'shape', 'ctx', 'pix'), ('lc', 'shape', 'ctx', 'pix'), FEATURE_GROUPS]
+ABLATIONS = [('tab',), ('tab', 'lc', 'shape'), ('tab', 'lc', 'shape', 'ctx'), ('tab', 'lc', 'shape', 'ctx', 'pix'),
+             ('lc', 'shape', 'ctx', 'pix'), FEATURE_GROUPS]   # each with EXCLUDE; plus all groups without it
 
 
 def format_report(res, title):
@@ -161,20 +164,41 @@ def truth_check(predictions, labels, truth, path):
     print('\n' + '\n'.join(lines))
 
 
+def recall_by_folder(oof, manual, classes):
+    """Out-of-fold recall per class for each sort folder (labels matched by key)."""
+    df = oof[oof.label_source == 'manual'].merge(manual[KEY_COLS + ['sort_dir']].drop_duplicates(KEY_COLS),
+                                                  on=KEY_COLS)
+    pred = np.array(classes)[df[[f'p_{c}' for c in classes]].to_numpy().argmax(axis=1)]
+    stats = df.assign(correct=pred == df.label.to_numpy()).groupby(['label', 'sort_dir'])['correct'].agg(['mean', 'size'])
+    table = stats.apply(lambda r: f"{r['mean']:.2f} (n={int(r['size'])})", axis=1).unstack(fill_value='-')
+    lines = ['Recall by sort folder (out-of-fold, calibrated, manual labels)',
+             '=' * 62,
+             'sort_flares events have a Gaia match and sort_non_flares events do not. A clear gap in Flare recall',
+             'between them would mean the model still uses whether a star is there (see EXCLUDE).', '',
+             table.to_string()]
+    return '\n'.join(lines) + '\n'
+
+
 def run(features_files, sort_dir, out_dir, label_rename=None, pipeline_weight=0.3, crossbin_weight=0.5,
-        groups=FEATURE_GROUPS, class_balance=0.5, n_splits=5, ablation=False, importance=False, save_model=None,
-        review=None, truth=None):
+        groups=FEATURE_GROUPS, exclude=HOST_FEATURES, class_balance=0.5, n_splits=5, ablation=False,
+        importance=False, save_model=None, review=None, truth=None):
     os.makedirs(out_dir, exist_ok=True)
     features = pd.concat([pd.read_csv(f) for f in features_files], ignore_index=True)
-    manual = load_manual_labels(sort_dir, rename=label_rename) if sort_dir else None
+    manual = None
+    if sort_dir:
+        sort_dirs = [sort_dir] if isinstance(sort_dir, str) else sort_dir
+        manual = pd.concat([load_manual_labels(d, rename=label_rename).assign(sort_dir=os.path.basename(os.path.normpath(d)))
+                            for d in sort_dirs], ignore_index=True)
     labels = attach_labels(features, manual, pipeline_weight=pipeline_weight, crossbin_weight=crossbin_weight)
 
-    clf = EventClassifier(feature_groups=groups, class_balance=class_balance)
+    clf = EventClassifier(feature_groups=groups, exclude=exclude, class_balance=class_balance)
     clf.fit(features, labels, n_splits=n_splits, importance=importance)
     print(f'{len(clf.feature_names_)} features used')
 
     res = evaluate(clf.oof_)
     text = format_report(res, 'Out-of-fold, calibrated, manual labels')
+    if manual is not None and manual['sort_dir'].nunique() > 1:
+        text += '\n' + recall_by_folder(clf.oof_, manual, clf.classes_)
     text += '\n' + format_report(evaluate(clf.oof_raw_), 'Out-of-fold, uncalibrated, manual labels')
     with open(f'{out_dir}/report.txt', 'w') as f:
         f.write(text)
@@ -190,12 +214,12 @@ def run(features_files, sort_dir, out_dir, label_rename=None, pipeline_weight=0.
 
     if ablation:
         rows = []
-        for subset in ABLATIONS:
-            sub = EventClassifier(feature_groups=subset, class_balance=class_balance)
+        for subset, excl in [(s, exclude) for s in ABLATIONS] + [(FEATURE_GROUPS, ())]:
+            sub = EventClassifier(feature_groups=subset, exclude=excl, class_balance=class_balance)
             sub.fit(features, labels, n_splits=n_splits, verbose=False)
-            rows.append({'groups': '+'.join(subset), 'n_features': len(sub.feature_names_),
-                         **summary_row(evaluate(sub.oof_))})
-            print(f"  ablation {rows[-1]['groups']:28s} macro F1 {rows[-1]['macro_f1']:.3f}  AUC {rows[-1]['roc_auc']:.3f}")
+            name = '+'.join(subset) + ('' if excl else ' (incl. host)')
+            rows.append({'groups': name, 'n_features': len(sub.feature_names_), **summary_row(evaluate(sub.oof_))})
+            print(f"  ablation {rows[-1]['groups']:44s} macro F1 {rows[-1]['macro_f1']:.3f}  AUC {rows[-1]['roc_auc']:.3f}")
         pd.DataFrame(rows).to_csv(f'{out_dir}/ablation.csv', index=False)
         print('\n' + pd.DataFrame(rows).round(3).to_string(index=False))
 
@@ -213,5 +237,5 @@ def run(features_files, sort_dir, out_dir, label_rename=None, pipeline_weight=0.
 
 if __name__ == '__main__':
     run(FEATURES, SORT_DIR, OUT_DIR, label_rename=LABEL_RENAME, pipeline_weight=PIPELINE_WEIGHT,
-        crossbin_weight=CROSSBIN_WEIGHT, groups=GROUPS, class_balance=CLASS_BALANCE, n_splits=N_SPLITS,
+        crossbin_weight=CROSSBIN_WEIGHT, groups=GROUPS, exclude=EXCLUDE, class_balance=CLASS_BALANCE, n_splits=N_SPLITS,
         ablation=ABLATION, importance=IMPORTANCE, save_model=SAVE_MODEL, review=REVIEW, truth=TRUTH)

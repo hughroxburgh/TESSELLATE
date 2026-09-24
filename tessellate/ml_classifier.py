@@ -2,8 +2,9 @@
 Machine-learning classification of tessellate events.
 
 Classifies detected events (rows of detected_events.csv) into the manual-sort
-taxonomy -- Junk, CosmicRay, Asteroid, Flare, Variable, Interesting -- from
-several kinds of information, each a feature group with its own prefix:
+taxonomy -- Junk, CosmicRay, Systematic, Blend, Asteroid, Flare, Variable,
+Interesting -- from several kinds of information, each a feature group with
+its own prefix:
 
   tab_    statistics the pipeline already stores in the event table
   lc_     the event's own light-curve shape (duration-normalised)
@@ -12,6 +13,7 @@ several kinds of information, each a feature group with its own prefix:
           position: recurrence, periodicity, noise character, orbit edges
   pix_    the pixels around the event in the difference-imaged flux cube
   xm_     Gaia / variable-catalogue context, recomputed for every event
+          (extracted, but left out of the model by default: see HOST_FEATURES)
 
 The light curve is the same 3x3 box sum (tools.Generate_LC) shown in the
 Navigator plots used for manual sorting. Features are extracted per cut from
@@ -44,7 +46,12 @@ background. Classes:
   Blend        the record's measurements come from different sources (e.g. a cosmic
                ray on an asteroid track), so it can't be trusted as one object
   Asteroid, Flare, Variable
-               a flare on a variable star is a Flare -- the variability is its baseline
+               Flare means flare-shaped, whether or not a star is there: a flare in
+               empty sky (e.g. a GRB afterglow) is a Flare too. Whether it has a host
+               is decided afterwards from the localisation and the Gaia crossmatch, so
+               the features that encode it (HOST_FEATURES) are left out of the model
+               by default. A flare on a variable star is a Flare -- the variability is
+               its baseline.
   Interesting  real, but none of the above
 
 Junk, CosmicRay, Systematic and Blend count as artefacts. Sort folders can use
@@ -82,6 +89,13 @@ META_COLS = KEY_COLS + ['frame_bin', 'flux_sign', 'classification', 'xcentroid',
                         'crossbin_ids']
 FEATURE_GROUPS = ('tab', 'lc', 'shape', 'ctx', 'pix', 'xm')
 FEATURE_VERSION = 2
+
+# Features (name prefixes) that say whether a star is at the event position: the Gaia / variable-catalogue
+# distances and bit 0 of the reduction's source mask (pixel on a catalogue star). Flare is defined by shape,
+# star or no star, so these are left out of the model by default -- nearly every sorted flare is on a star,
+# and with them the model would learn to down-rank a flare in empty sky. Whether a star is there is decided
+# afterwards from the localisation and the crossmatch.
+HOST_FEATURES = ('xm_', 'tab_source_mask_b0')
 
 DEFAULT_CONFIG = {
     'detrend_days': 1.0,          # running-median window; keeps events up to a few hours intact
@@ -844,9 +858,9 @@ def _crossmatch_features(events, data_path, sector, cam, ccd, cut, n=8):
 
 # ----------------------------- Feature extraction ----------------------------- #
 
-def _feature_columns(columns, groups=FEATURE_GROUPS):
+def _feature_columns(columns, groups=FEATURE_GROUPS, exclude=()):
     prefixes = tuple(f'{g}_' for g in groups)
-    return [c for c in columns if c.startswith(prefixes)]
+    return [c for c in columns if c.startswith(prefixes) and not c.startswith(tuple(exclude))]
 
 
 def extract_cut_features(data_path, sector, cam, ccd, cut, n=8, events=None, config=None):
@@ -1165,13 +1179,17 @@ class EventClassifier():
     Gradient-boosted classifier over the ml_classifier feature groups.
 
     feature_groups : which prefixes to use (subset of FEATURE_GROUPS).
+    exclude : feature name prefixes to leave out; by default HOST_FEATURES, so
+        the model can't use whether a star is there. () = use everything.
     class_balance : 0 = natural class frequencies, 1 = fully balanced;
         intermediate values up-weight rare classes without distorting the
         probabilities as much (the calibration step removes the remaining shift).
     """
 
-    def __init__(self, feature_groups=FEATURE_GROUPS, class_balance=0.5, model_params=None, random_state=0):
+    def __init__(self, feature_groups=FEATURE_GROUPS, exclude=HOST_FEATURES, class_balance=0.5, model_params=None,
+                 random_state=0):
         self.feature_groups = tuple(feature_groups)
+        self.exclude = tuple(exclude)
         self.class_balance = class_balance
         self.model_params = {'learning_rate': 0.05, 'max_iter': 300, 'max_leaf_nodes': 31,
                              'min_samples_leaf': 20, 'l2_regularization': 1.0, 'early_stopping': False,
@@ -1206,7 +1224,7 @@ class EventClassifier():
         from sklearn.model_selection import StratifiedGroupKFold
 
         if not hasattr(self, 'feature_names_'):
-            self.feature_names_ = _feature_columns(features.columns, self.feature_groups)
+            self.feature_names_ = _feature_columns(features.columns, self.feature_groups, self.exclude)
         m, X, y, w, source = self._training_data(features, labels)
         classes = [c for c in CLASSES if c in set(y)] + sorted(set(y) - set(CLASSES))
         groups = _group_keys(features.loc[m])
@@ -1265,7 +1283,7 @@ class EventClassifier():
         cross-validation: the out-of-fold predictions fit the calibration, and
         a cross-fitted calibrated copy is kept as `oof_` for honest evaluation.
         """
-        self.feature_names_ = _feature_columns(features.columns, self.feature_groups)
+        self.feature_names_ = _feature_columns(features.columns, self.feature_groups, self.exclude)
         self.oof_ = None
         if calibrate:
             raw = self.cross_validate(features, labels, n_splits=n_splits, importance=importance, verbose=verbose)

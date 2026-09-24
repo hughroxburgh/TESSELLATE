@@ -67,7 +67,9 @@ features, so on their own they only teach the model to reproduce the rules.
 Columns the pipeline fills only for events the rules did not already tag
 (com_motion, gaussian_score, the gaia_id / nearest_gaia_* crossmatch, the
 variable-catalogue classification, asteroid_id) are never used as features --
-their missingness encodes the rule-based label. The equivalent information is
+their missingness encodes the rule-based label. The reverse case, filled only
+for tagged events (known_asteroid_dist_px), is extracted but always left out
+of the model (LEAKY_FEATURES). The equivalent information is
 recomputed for every event (pix_cen_*, lc_fit_*, xm_*).
 """
 
@@ -96,6 +98,11 @@ FEATURE_VERSION = 3
 # and with them the model would learn to down-rank a flare in empty sky. Whether a star is there is decided
 # afterwards from the localisation and the crossmatch.
 HOST_FEATURES = ('xm_', 'tab_source_mask_b0')
+
+# Features filled only for events the pipeline already tagged, so their presence gives the tag away (see the
+# leakage note in the module docstring). Always left out of the model; still extracted.
+#   tab_known_asteroid_dist_px: only set when an event matched a known MPC asteroid, which also tags it Asteroid
+LEAKY_FEATURES = ('tab_known_asteroid_dist_px',)
 
 DEFAULT_CONFIG = {
     'detrend_days': 1.0,          # running-median window; keeps events up to a few hours intact
@@ -870,18 +877,9 @@ def _feature_columns(columns, groups=FEATURE_GROUPS, exclude=()):
     return [c for c in columns if c.startswith(prefixes) and not c.startswith(tuple(exclude))]
 
 
-def extract_cut_features(data_path, sector, cam, ccd, cut, n=8, events=None, config=None):
-    """
-    Feature table for the events of one cut.
-
-    events : optional table (any columns incl. objid/eventid) restricting which
-        events to compute; statistics that need the whole cut (simultaneity,
-        per-object recurrence) still use every event in detected_events.csv.
-    """
-    cfg = {**DEFAULT_CONFIG, **(config or {})}
-    all_events = load_cut_events(data_path, sector, cam, ccd, cut, n)
-    tab = table_features(all_events)
-
+def _select_events(all_events, events, cfg, sector, cam, ccd, cut):
+    """The events of a cut that get features: those in `events` (all if None), keeping at most cfg['max_tagged']
+    of each pipeline tag (a fixed random choice per cut)."""
     selected = all_events
     if events is not None:
         wanted = events[['objid', 'eventid']].drop_duplicates()
@@ -895,6 +893,21 @@ def extract_cut_features(data_path, sector, cam, ccd, cut, n=8, events=None, con
             if len(idx) > cfg['max_tagged']:
                 drop += list(rng.choice(idx, len(idx) - cfg['max_tagged'], replace=False))
         selected = selected.drop(drop)
+    return selected
+
+
+def extract_cut_features(data_path, sector, cam, ccd, cut, n=8, events=None, config=None):
+    """
+    Feature table for the events of one cut.
+
+    events : optional table (any columns incl. objid/eventid) restricting which
+        events to compute; statistics that need the whole cut (simultaneity,
+        per-object recurrence) still use every event in detected_events.csv.
+    """
+    cfg = {**DEFAULT_CONFIG, **(config or {})}
+    all_events = load_cut_events(data_path, sector, cam, ccd, cut, n)
+    tab = table_features(all_events)
+    selected = _select_events(all_events, events, cfg, sector, cam, ccd, cut)
 
     cd = _CutData(data_path, sector, cam, ccd, cut, n, frame_stats=cfg['frame_stats'])
     rows, failed = [], 0
@@ -923,27 +936,46 @@ def extract_cut_features(data_path, sector, cam, ccd, cut, n=8, events=None, con
     return out[meta + feats].reset_index(drop=True)
 
 
-def _cut_job(data_path, sector, cam, ccd, cut, n, events, config, cache):
-    if cache is not None and os.path.exists(cache):
-        return pd.read_csv(cache)
+def _count_rows(path):
+    """Complete data rows in a csv (a row cut off mid-write doesn't count)."""
+    with open(path, 'rb') as f:
+        return max(sum(chunk.count(b'\n') for chunk in iter(lambda: f.read(1 << 20), b'')) - 1, 0)
+
+
+def _cut_job(data_path, sector, cam, ccd, cut, n, events, config, cache, return_table=True):
     if not os.path.exists(f'{_cut_path(data_path, sector, cam, ccd, cut, n)}/detected_events.csv'):
         return None
     if events is not None:
         events = events[(events.camera == cam) & (events.ccd == ccd) & (events.cut == cut)]
         if len(events) == 0:
             return None
+
+    def summary(n_events):
+        return pd.DataFrame([{'sector': sector, 'camera': cam, 'ccd': ccd, 'cut': cut, 'n_events': n_events}])
+
+    if cache is not None and os.path.exists(cache):
+        # a job killed while writing leaves a short file: only trust one with every expected event
+        cfg = {**DEFAULT_CONFIG, **(config or {})}
+        expected = len(_select_events(load_cut_events(data_path, sector, cam, ccd, cut, n), events, cfg,
+                                      sector, cam, ccd, cut))
+        n_rows = _count_rows(cache)
+        if n_rows == expected:
+            return pd.read_csv(cache, low_memory=False) if return_table else summary(n_rows)
+        print(f'  S{sector} C{cam} C{ccd} cut {cut}: cached file has {n_rows} of {expected} events; recomputing')
     try:
         df = extract_cut_features(data_path, sector, cam, ccd, cut, n, events=events, config=config)
     except Exception as e:
         print(f'  S{sector} C{cam} C{ccd} cut {cut}: skipped ({type(e).__name__}: {e})')
         return None
     if cache is not None:
-        df.to_csv(cache, index=False)
-    return df
+        df.to_csv(f'{cache}.part', index=False)
+        os.replace(f'{cache}.part', cache)          # the cache file only appears once it's complete
+    return df if return_table else summary(len(df))
 
 
 def build_feature_table(data_path='/fred/oz335/TESSdata', sector=None, cams=(1, 2, 3, 4), ccds=(1, 2, 3, 4),
-                        cuts=None, n=8, events=None, cache_dir=None, overwrite=False, n_jobs=1, config=None):
+                        cuts=None, n=8, events=None, cache_dir=None, overwrite=False, n_jobs=1, config=None,
+                        return_table=True):
     """
     Feature table for every event across cuts. Each cut's flux cube is read
     once (memory-mapped); with cache_dir, per-cut results are saved so an
@@ -951,7 +983,13 @@ def build_feature_table(data_path='/fred/oz335/TESSdata', sector=None, cams=(1, 
 
     events : optional table (sector/camera/ccd/cut/objid/eventid) restricting
         the computation, e.g. to the manually labelled events.
+    return_table : False = only fill cache_dir, and return the number of events
+        per cut. A whole sector is tens of millions of events -- too many to
+        hold in memory; development/ml_collect_features.py picks the rows
+        needed for training from the cache.
     """
+    if not return_table and cache_dir is None:
+        raise ValueError('return_table=False needs a cache_dir to write to.')
     from joblib import Parallel, delayed
     from tqdm import tqdm
 
@@ -970,7 +1008,7 @@ def build_feature_table(data_path='/fred/oz335/TESSdata', sector=None, cams=(1, 
                     cache = f'{cache_dir}/S{sector}C{cam}C{ccd}C{cut}_features_v{FEATURE_VERSION}.csv'
                     if overwrite and os.path.exists(cache):
                         os.remove(cache)
-                jobs.append((data_path, sector, cam, ccd, cut, n, events, config, cache))
+                jobs.append((data_path, sector, cam, ccd, cut, n, events, config, cache, return_table))
 
     if n_jobs == 1:
         results = [_cut_job(*job) for job in tqdm(jobs, desc=f'Sector {sector} features')]
@@ -1242,7 +1280,7 @@ class EventClassifier():
         from sklearn.model_selection import StratifiedGroupKFold
 
         if not hasattr(self, 'feature_names_'):
-            self.feature_names_ = _feature_columns(features.columns, self.feature_groups, self.exclude)
+            self.feature_names_ = _feature_columns(features.columns, self.feature_groups, self.exclude + LEAKY_FEATURES)
         m, X, y, w, source = self._training_data(features, labels)
         classes = [c for c in CLASSES if c in set(y)] + sorted(set(y) - set(CLASSES))
         groups = _group_keys(features.loc[m])
@@ -1301,7 +1339,7 @@ class EventClassifier():
         cross-validation: the out-of-fold predictions fit the calibration, and
         a cross-fitted calibrated copy is kept as `oof_` for honest evaluation.
         """
-        self.feature_names_ = _feature_columns(features.columns, self.feature_groups, self.exclude)
+        self.feature_names_ = _feature_columns(features.columns, self.feature_groups, self.exclude + LEAKY_FEATURES)
         self.oof_ = None
         if calibrate:
             raw = self.cross_validate(features, labels, n_splits=n_splits, importance=importance, verbose=verbose)

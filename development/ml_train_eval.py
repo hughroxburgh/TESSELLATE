@@ -32,7 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---- CONFIG ----
 FEATURES = [f'{HERE}/S55/S55_features.csv.gz']   # one or more files from ml_extract_features.py
-SORT_DIR = [f'{HERE}/S55/sort_flares',           # one or more manual_sort outputs, each with one folder per group
+SORT_DIR = [f'{HERE}/S55/sort_found_flares',          # one or more manual_sort outputs, each with one folder per group
             f'{HERE}/S55/sort_non_flares']
 LABEL_RENAME = {'Other': 'Interesting'}      # sort folder name -> classifier class; None drops a folder.
                                              # Classes: Junk, CosmicRay, Systematic, Blend, Asteroid,
@@ -173,8 +173,8 @@ def recall_by_folder(oof, manual, classes):
     table = stats.apply(lambda r: f"{r['mean']:.2f} (n={int(r['size'])})", axis=1).unstack(fill_value='-')
     lines = ['Recall by sort folder (out-of-fold, calibrated, manual labels)',
              '=' * 62,
-             'sort_flares events have a Gaia match and sort_non_flares events do not. A clear gap in Flare recall',
-             'between them would mean the model still uses whether a star is there (see EXCLUDE).', '',
+             'sort_found_flares events have a Gaia match and sort_non_flares events do not. A clear gap in Flare',
+             'recall between them would mean the model still uses whether a star is there (see EXCLUDE).', '',
              table.to_string()]
     return '\n'.join(lines) + '\n'
 

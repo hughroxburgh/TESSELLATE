@@ -22,7 +22,8 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))   # use this checkout's tessellate
-from tessellate.ml_classifier import FEATURE_GROUPS, build_feature_table
+import tessellate.ml_classifier
+from tessellate.ml_classifier import FEATURE_GROUPS, FEATURE_VERSION, build_feature_table
 
 # ---- CONFIG ----
 DATA_PATH = '/fred/oz335/TESSdata'
@@ -54,6 +55,8 @@ ACCOUNT = 'oz335'
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     events = pd.read_csv(EVENTS_CSV) if EVENTS_CSV else None
+    print(f'Using {tessellate.ml_classifier.__file__} (feature version {FEATURE_VERSION}); '
+          f'cache files: {CACHE_DIR}/S{SECTOR}C*_features_v{FEATURE_VERSION}.csv', flush=True)
 
     start = time.time()
     features = build_feature_table(DATA_PATH, SECTOR, cams=CAMS, ccds=CCDS, cuts=CUTS, events=events,

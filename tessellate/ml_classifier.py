@@ -133,7 +133,7 @@ def load_cut_events(data_path, sector, cam, ccd, cut, n=8):
     """
     import ast
 
-    events = pd.read_csv(f'{_cut_path(data_path, sector, cam, ccd, cut, n)}/detected_events.csv')
+    events = pd.read_csv(f'{_cut_path(data_path, sector, cam, ccd, cut, n)}/detected_events.csv', low_memory=False)
     if 'crossbin_ids' in events:
         events['crossbin_ids'] = events['crossbin_ids'].apply(
             lambda x: ast.literal_eval(x) if isinstance(x, str) else x

@@ -12,6 +12,17 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 
 from .tools import RoundToInt, Generate_LC, Frame_Bin
+from .localisation import CROSSMATCH_NSIGMA
+
+
+def _centroid_err(table):
+    """
+    1-sigma centroid error (pixels) of each row. Outputs from before centroid_err existed have x/ycentroid_err
+    instead (then a match radius); for those this is sqrt((x^2 + y^2) / 2), what the centroid_err filter cut on.
+    """
+    if 'centroid_err' in table:
+        return table['centroid_err']
+    return np.sqrt((table['xcentroid_err']**2 + table['ycentroid_err']**2) / 2)
 
 
 def _bazin_fit_worker(stamp_cube, sub_time, x_sub, y_sub, ccd_x, ccd_y,
@@ -343,7 +354,7 @@ class Navigator():
         if psf_like is not None:
             events = events.loc[events.psf_like>=psf_like]
         if centroid_err is not None:
-            events = events.loc[(events.xcentroid_err**2 + events.ycentroid_err**2) <= 2 * centroid_err**2]
+            events = events.loc[_centroid_err(events) <= centroid_err]
 
         return events
 
@@ -427,7 +438,7 @@ class Navigator():
         if psf_like is not None:
             objects = objects[objects.psf_maxsig>=psf_like]
         if centroid_err is not None:
-            objects = objects[objects.xcentroid_err**2+objects.ycentroid_err**2 <= 2*centroid_err**2]
+            objects = objects[_centroid_err(objects) <= centroid_err]
         if min_eventlength_frame is not None:
             objects = objects[objects.min_eventlength_frame>=min_eventlength_frame]
         if max_eventlength_frame is not None:
@@ -1212,8 +1223,11 @@ class Navigator():
             
             # error_x_rad = min(sigma*event.xcentroid_err,0.5)
             # error_y_rad = min(sigma*event.ycentroid_err,0.5)
-            error_x_rad = event.xcentroid_err
-            error_y_rad = event.ycentroid_err
+            if 'centroid_err' in event.index:      # draw the Gaia match region
+                error_x_rad = error_y_rad = CROSSMATCH_NSIGMA * event.centroid_err
+            else:
+                error_x_rad = event.xcentroid_err
+                error_y_rad = event.ycentroid_err
             errorX = event.xcentroid + error_x_rad*np.cos(theta)
             errorY = event.ycentroid + error_y_rad*np.sin(theta)
 
@@ -1227,8 +1241,11 @@ class Navigator():
 
             # error_x_rad = min(sigma*obj.xcentroid_err,0.5)
             # error_y_rad = min(sigma*obj.ycentroid_err,0.5)
-            error_x_rad = obj.xcentroid_err
-            error_y_rad = obj.ycentroid_err
+            if 'centroid_err' in obj.index:        # draw the Gaia match region
+                error_x_rad = error_y_rad = CROSSMATCH_NSIGMA * obj.centroid_err
+            else:
+                error_x_rad = obj.xcentroid_err
+                error_y_rad = obj.ycentroid_err
             errorX = obj.xcentroid + error_x_rad*np.cos(theta)
             errorY = obj.ycentroid + error_y_rad*np.sin(theta)
     

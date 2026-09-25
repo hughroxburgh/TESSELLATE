@@ -9,7 +9,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 from .tools import RoundToInt, load_table, table_exists
 
-GLOBAL_PSF_Y_OFFSET = 0.0226
+from .localisation import CROSSMATCH_NSIGMA    # crossmatch radius, in units of the 1-sigma centroid_err
 
 # ----------------------------------------------------------------------------------------------------------------------------- #
 # ----------------------------------------------------------------------------------------------------------------------------- # 
@@ -933,27 +933,22 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_func, exposure_time, big_size
         snr = snrs[idx]
         stacked_psf_fit = 0
 
-    if snr < 0:
+    if not snr > 0:
         xcentroid = np.nan
         ycentroid = np.nan
-        xcentroid_err_psf = np.nan
-        ycentroid_err_psf = np.nan
+        centroid_err_psf = np.nan
         psf_like = 0
         psf_diff = np.nan
         stacked_psf_fit = 0
     else:
 
         # --- PSF fit --- #
-        unc_x = uncertainty_func(snr,95,'x')  # use the 95% confidence interval as the metric of interest
-        unc_y = uncertainty_func(snr,95,'y')  
-
         fitter = PSF_Fitter(small_size, prf)
         fitter.fit_psf(centred_flux, limx=0.5, limy=0.5)
 
-        xcentroid = fitter.source_x + brightest_x
-        ycentroid = fitter.source_y + brightest_y - GLOBAL_PSF_Y_OFFSET
-        xcentroid_err_psf = unc_x
-        ycentroid_err_psf = unc_y
+        xcentroid = fitter.source_x + brightest_x      # raw fit; the radial shift is removed from xcentroid/ycentroid later
+        ycentroid = fitter.source_y + brightest_y
+        centroid_err_psf = float(uncertainty_func(snr))   # 1 sigma per axis, pixels
 
         psf_like = np.corrcoef(centred_flux.flatten(), fitter.psf.flatten())[0, 1]
 
@@ -963,8 +958,7 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_func, exposure_time, big_size
     event['xcentroid_psf'] = xcentroid
     event['ycentroid_psf'] = ycentroid
     event['snr_psf'] = snr
-    event['xcentroid_err_psf'] = xcentroid_err_psf
-    event['ycentroid_err_psf'] = ycentroid_err_psf
+    event['centroid_err_psf'] = centroid_err_psf
     event['psf_like'] = psf_like
     event['psf_diff'] = psf_diff
     event['psf_stacked'] = stacked_psf_fit
@@ -1061,17 +1055,15 @@ def _Isolate_events(objid,time,flux,sources,sector,cam,ccd,cut,prf,
         # -- Fit PSF -- #
         event = _Fit_psf(flux,event,prf,frames,snr_to_localisation_func,exposure_time,psf_stacked=psf_stacked)
         
-        # -- If event is quite PSF-like, centroid likely good -- #
+        # -- If event is quite PSF-like, centroid likely good; otherwise no calibrated error (and no star crossmatch) -- #
         if event['psf_like']>0.5:
             event['xcentroid'] = event['xcentroid_psf']
             event['ycentroid'] = event['ycentroid_psf']
-            event['xcentroid_err'] = event['xcentroid_err_psf']
-            event['ycentroid_err'] = event['ycentroid_err_psf']
+            event['centroid_err'] = event['centroid_err_psf']
         else:
             event['xcentroid'] = event['xcentroid_det']
             event['ycentroid'] = event['ycentroid_det']
-            event['xcentroid_err'] = 0.5
-            event['ycentroid_err'] = 0.5
+            event['centroid_err'] = np.nan
 
         event['xint'] = RoundToInt(event['xcentroid'])
         event['yint'] = RoundToInt(event['ycentroid'])
@@ -1312,6 +1304,7 @@ class Detector():
         self.cut = None
         self.bkg = None
 
+        self.injection = injection
         self._inj_path = injection_dir if injection else '.'
 
         if part is None:
@@ -1648,7 +1641,7 @@ class Detector():
         from joblib import Parallel, delayed 
         from tqdm import tqdm
         from .dataprocessor import DataProcessor
-        from .localisation import get_snr_to_localisation_func #, get_wcs_uncertainty
+        from .localisation import get_snr_to_localisation_func, radial_shift #, get_wcs_uncertainty
         from .tools import Frame_Bin
         from PRF import TESS_PRF
         from astropy.io import fits
@@ -1703,6 +1696,16 @@ class Detector():
         events['xccd'] = RoundToInt(events['xint'] + cutCornerPx[self.cut-1][0])
         events['yccd'] = RoundToInt(events['yint'] + cutCornerPx[self.cut-1][1])
 
+        # -- Remove the radial shift of PSF-fit positions toward the optical axis (real sky only: injections are
+        #    injected and fitted with the same PRF). xcentroid_psf/ycentroid_psf and xint/yint/xccd/yccd keep the
+        #    fitted image position; xcentroid/ycentroid (-> ra/dec) are corrected. -- #
+        if not self.injection:
+            psf = (events['psf_like'] > 0.5).to_numpy()
+            if psf.any():
+                sx, sy = radial_shift(events.loc[psf, 'xccd'], events.loc[psf, 'yccd'], self.cam, self.ccd)
+                events.loc[psf, 'xcentroid'] = events.loc[psf, 'xcentroid'] - sx
+                events.loc[psf, 'ycentroid'] = events.loc[psf, 'ycentroid'] - sy
+
         # -- Pull the uncertainty on WCS and combine with PSF fit centroid error -- #
         # wcs_unc = get_wcs_uncertainty(self.data_path,self.sector,self.cam,self.ccd,self.cut,self.n)
         # if np.isnan(wcs_unc).any():
@@ -1747,8 +1750,9 @@ class Detector():
         dra_dy = (ra_py - events['ra']) / delta
         ddec_dy = (dec_py - events['dec']) / delta
         
-        events['ra_err'] = np.sqrt((dra_dx * events['xcentroid_err'])**2 + (dra_dy * events['ycentroid_err'])**2)
-        events['dec_err'] = np.sqrt((ddec_dx * events['xcentroid_err'])**2 + (ddec_dy * events['ycentroid_err'])**2)
+        # centroid_err is 1 sigma in both x and y, so these are 1 sigma too (NaN if the event isn't PSF-like)
+        events['ra_err'] = np.sqrt(dra_dx**2 + dra_dy**2) * events['centroid_err']
+        events['dec_err'] = np.sqrt(ddec_dx**2 + ddec_dy**2) * events['centroid_err']
 
         events['ra_err'] = np.abs(events['ra_err'] * np.cos(np.radians(events['dec'])))   # account for cos(dec) factor in RA
 
@@ -1884,6 +1888,11 @@ class Detector():
 
         gaia_id and nearest_gaia_id are guaranteed to match whenever gaia_id is
         set, since both are derived from the same single best-scoring candidate.
+
+        A match (Gaia star or catalogued variable) is within CROSSMATCH_NSIGMA
+        times the event's 1-sigma ra_err / dec_err. Events without a calibrated
+        centroid_err (not PSF-like) and tagged Asteroid / CosmicRay / Junk events
+        are not crossmatched: their gaia_id stays '-' and nearest_gaia_* empty.
         """
 
         events = deepcopy(self.events)
@@ -1901,8 +1910,10 @@ class Detector():
         gaia_rpmag_all = gaia.RPmag.values
         gaia_gmag_all = gaia.Gmag.values
 
+        crossmatch = ~events.classification.isin(['Asteroid', 'CosmicRay', 'Junk']) & np.isfinite(events.centroid_err)
+
         for i, event in events.iterrows():
-            if event.classification not in ['Asteroid', 'CosmicRay', 'Junk']:
+            if crossmatch[i]:
 
                 dra_raw = gaia.ra - event.ra
                 dra_wrapped = (dra_raw + 180) % 360 - 180
@@ -1946,7 +1957,7 @@ class Detector():
                     events.loc[i, 'nearest_gaia_dy'] = nearest_dy
 
                     # gaia_id is set to this SAME best-scoring candidate, only if it
-                    # falls within the event's error ellipse
+                    # is within CROSSMATCH_NSIGMA sigma of the event
                     ra_err_arcsec = event.ra_err * 3600
                     dec_err_arcsec = event.dec_err * 3600
 
@@ -1958,17 +1969,20 @@ class Detector():
 
                     mahalanobis = np.sqrt((dra_arcsec / ra_err_arcsec)**2 + (ddec_arcsec / dec_err_arcsec)**2)
 
-                    if mahalanobis <= 1:
+                    if mahalanobis <= CROSSMATCH_NSIGMA:
                         events.loc[i, 'gaia_id'] = nearest_id
 
         # -- Cross matches location to variable catalog -- #
         variables = pd.read_csv(f'{self.path}/Cut{self.cut}of{self.n**2}/variable_catalog.csv')
         for i, event in events.iterrows():
-            if event.classification not in ['Asteroid', 'CosmicRay', 'Junk']:
-                inside = variables[(abs(variables.ra - event.ra) < event.ra_err) &
-                                    (abs(variables.dec - event.dec) < event.dec_err)]
-                if len(inside) > 0:
-                    events.loc[i, 'classification'] = inside.iloc[0].Type
+            if crossmatch[i] and len(variables):
+                # same rule as Gaia: on-sky offsets (RA wrapped, x cos dec) within CROSSMATCH_NSIGMA sigma
+                dra = ((variables.ra.values - event.ra + 180) % 360 - 180) * np.cos(np.radians(event.dec)) * 3600
+                ddec = (variables.dec.values - event.dec) * 3600
+                mahalanobis = np.sqrt((dra / (event.ra_err * 3600))**2 + (ddec / (event.dec_err * 3600))**2)
+                j = np.argmin(mahalanobis)
+                if mahalanobis[j] <= CROSSMATCH_NSIGMA:
+                    events.loc[i, 'classification'] = variables.iloc[j].Type
 
         self.events = events
 
@@ -2300,7 +2314,7 @@ class Detector():
 
             # Centroid Positions
             'xcentroid', 'ycentroid',
-            'xcentroid_err','ycentroid_err',
+            'centroid_err','centroid_err_psf',
             'xint', 'yint','xccd', 'yccd',
             'xcentroid_det', 'ycentroid_det', 
             'xcentroid_psf', 'ycentroid_psf',
@@ -2425,7 +2439,7 @@ class Detector():
 
         columns = [
             'frame_bin','objid', 'sector', 'cam', 'ccd', 'cut', 'xcentroid', 'ycentroid', 
-            'ra', 'dec', 'gal_l', 'gal_b', 'xcentroid_err','ycentroid_err','ra_err','dec_err',
+            'ra', 'dec', 'gal_l', 'gal_b', 'centroid_err','ra_err','dec_err',
             'lc_sig_max', 'flux_maxsig', 'frame_maxsig',
             'mjd_maxsig','psf_maxsig','flux_sign', 'n_events',
             'min_eventlength_frame', 'max_eventlength_frame',
@@ -2462,8 +2476,7 @@ class Detector():
                 'dec': maxevent['dec'],
                 'gal_l': maxevent['gal_l'],
                 'gal_b': maxevent['gal_b'],
-                'xcentroid_err': maxevent['xcentroid_err'],
-                'ycentroid_err': maxevent['ycentroid_err'],
+                'centroid_err': maxevent['centroid_err'],
                 'ra_err': maxevent['ra_err'],
                 'dec_err': maxevent['dec_err'],
                 'image_sig_max': maxevent['image_sig_max'],

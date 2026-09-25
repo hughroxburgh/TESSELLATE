@@ -130,3 +130,11 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# development: keep the scripts, ignore everything else (data, notebooks, images,
+# synthetic test data, Claude Code's scratch folder)
+development/*
+!development/*.py
+
+# instructions Claude Code reads at the start of each session; local only
+/CLAUDE.md

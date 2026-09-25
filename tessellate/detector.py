@@ -1886,11 +1886,12 @@ class Detector():
         flux-weighted detection is far more likely to be dominated by a brighter
         star's position even if a fainter star is marginally closer.
 
-        gaia_id and nearest_gaia_id are guaranteed to match whenever gaia_id is
-        set, since both are derived from the same single best-scoring candidate.
-
         A match (Gaia star or catalogued variable) is within CROSSMATCH_NSIGMA
-        times the event's 1-sigma ra_err / dec_err. Events without a calibrated
+        times the event's 1-sigma ra_err / dec_err. gaia_id is the best-scoring
+        star (effective distance) among the stars inside that region, so a
+        brighter star just outside it can't block one inside. nearest_gaia_* is
+        the matched star if there is one, otherwise the best-scoring star in the
+        whole box; gaia_id and nearest_gaia_id always agree when gaia_id is set. Events without a calibrated
         centroid_err (not PSF-like) and tagged Asteroid / CosmicRay / Junk events
         are not crossmatched: their gaia_id stays '-' and nearest_gaia_* empty.
         """
@@ -1946,31 +1947,27 @@ class Detector():
                     mag_rel = mag - np.nanmin(mag)
 
                     effective_dist = sep_pix + mag_weight * mag_rel
-                    best_idx = np.argmin(effective_dist)
 
-                    nearest_id = str(diag_source[best_idx])
-                    nearest_dx = float(dx_pix[best_idx])
-                    nearest_dy = float(dy_pix[best_idx])
+                    # on-sky offset of every candidate, in units of the event's 1-sigma errors
+                    cand_ra = gaia.ra.values[diag_box_mask]
+                    cand_dec = gaia.dec.values[diag_box_mask]
+                    dra_arcsec = ((cand_ra - event.ra + 180) % 360 - 180) * np.cos(np.radians(event.dec)) * 3600
+                    ddec_arcsec = (cand_dec - event.dec) * 3600
+                    mahalanobis = np.sqrt((dra_arcsec / (event.ra_err * 3600))**2 +
+                                          (ddec_arcsec / (event.dec_err * 3600))**2)
 
-                    events.loc[i, 'nearest_gaia_id'] = nearest_id
-                    events.loc[i, 'nearest_gaia_dx'] = nearest_dx
-                    events.loc[i, 'nearest_gaia_dy'] = nearest_dy
+                    # the match: the best-scoring star inside the region; none inside -> no match, and
+                    # nearest_gaia_* is the best-scoring star in the whole box
+                    inside = mahalanobis <= CROSSMATCH_NSIGMA
+                    if inside.any():
+                        best_idx = np.flatnonzero(inside)[np.argmin(effective_dist[inside])]
+                        events.loc[i, 'gaia_id'] = str(diag_source[best_idx])
+                    else:
+                        best_idx = np.argmin(effective_dist)
 
-                    # gaia_id is set to this SAME best-scoring candidate, only if it
-                    # is within CROSSMATCH_NSIGMA sigma of the event
-                    ra_err_arcsec = event.ra_err * 3600
-                    dec_err_arcsec = event.dec_err * 3600
-
-                    nearest_ra = gaia.ra.values[diag_box_mask][best_idx]
-                    nearest_dec = gaia.dec.values[diag_box_mask][best_idx]
-
-                    dra_arcsec = ((nearest_ra - event.ra + 180) % 360 - 180) * np.cos(np.radians(event.dec)) * 3600
-                    ddec_arcsec = (nearest_dec - event.dec) * 3600
-
-                    mahalanobis = np.sqrt((dra_arcsec / ra_err_arcsec)**2 + (ddec_arcsec / dec_err_arcsec)**2)
-
-                    if mahalanobis <= CROSSMATCH_NSIGMA:
-                        events.loc[i, 'gaia_id'] = nearest_id
+                    events.loc[i, 'nearest_gaia_id'] = str(diag_source[best_idx])
+                    events.loc[i, 'nearest_gaia_dx'] = float(dx_pix[best_idx])
+                    events.loc[i, 'nearest_gaia_dy'] = float(dy_pix[best_idx])
 
         # -- Cross matches location to variable catalog -- #
         variables = pd.read_csv(f'{self.path}/Cut{self.cut}of{self.n**2}/variable_catalog.csv')

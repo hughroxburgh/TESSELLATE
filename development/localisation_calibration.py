@@ -10,7 +10,7 @@ Regenerate the localisation constants in tessellate/localisation.py:
 3. Injection core: recovered injected flares in INJ_CSV (dx, dy = recovered - injected), fitted with a Gaussian core
    plus a wide outlier component: sigma_inj(snr) = sqrt((A snr^-B)^2 + floor_inj^2). The same PRF injects and fits,
    so this is the fitting noise alone.
-4. Real-sky floor: manually sorted flares (EVENT_CSVS + SORT_DIRS) with the radial shift removed, fitted with
+4. Real-sky floor: manually sorted flares (EVENT_CSVS + LABELS) with the radial shift removed, fitted with
    sigma(snr) = sqrt(sigma_inj(snr)^2 + sys^2) plus outliers. LOCALISATION_FLOOR = sqrt(floor_inj^2 + sys^2).
    A fit with A, B and the floor all free on the sorted flares is reported as a check.
 
@@ -18,6 +18,8 @@ The model: 2D circular offsets, so the radial offset follows a Rayleigh mixture
     p(r) = (1 - eps) Rayleigh(r; sigma(snr)) + eps Rayleigh(r; sig_out),  eps = expit(e0 + e1 log10(snr / SNR_REF))
 truncated at the sample's maximum offset. sigma is the 1-sigma error per axis (centroid_err in the pipeline).
 
+The inputs for the current constants are in development/localisation_calibration_data/, trimmed to the columns
+used here; sort_labels_S55.csv is the record of the manual sort (from the sorted images' names).
 Writes OUT_DIR/report.txt and plots, and prints the constants block to paste into tessellate/localisation.py.
 Edit the CONFIG block, then:  python localisation_calibration.py
 """
@@ -38,10 +40,11 @@ warnings.filterwarnings('ignore')
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---- CONFIG ----
-CALIB_CSV = f'{HERE}/all_events.csv'                 # flare stars from a run without GLOBAL_PSF_Y_OFFSET (S27-39)
-INJ_CSV = f'{HERE}/injections.csv'                   # SourceInjector.filter_transients() output, several cuts
-EVENT_CSVS = [f'{HERE}/found_flares.csv', f'{HERE}/non_flares.csv']              # event lists given to the sorter
-SORT_DIRS = [f'{HERE}/S55/sort_found_flares', f'{HERE}/S55/sort_non_flares']     # their manual_sort outputs
+DATA = f'{HERE}/localisation_calibration_data'        # the inputs used for the constants in localisation.py
+CALIB_CSV = f'{DATA}/all_events_S27-39.csv'           # flare stars (variable == 0) from a run without GLOBAL_PSF_Y_OFFSET
+INJ_CSV = f'{DATA}/injections_S32_S35_S38.csv'        # SourceInjector.filter_transients() output, several cuts
+EVENT_CSVS = [f'{DATA}/found_flares_S55.csv', f'{DATA}/non_flares_S55.csv']      # event lists given to the sorter
+LABELS = f'{DATA}/sort_labels_S55.csv'                # labels as a csv (KEY + label), or a list of manual_sort folders
 LABEL = 'Flare'
 CAMERAS = [1, 2, 3, 4]
 ASSUME_FLARE = {EVENT_CSVS[0]: [4]}    # unsorted events of this list in these cameras count as LABEL
@@ -157,7 +160,9 @@ def load_sorted():
     """Sorted flares with raw PSF-fit offsets from the pipeline's chosen star (event - star, px)."""
     ev = pd.concat([pd.read_csv(f, low_memory=False).assign(src=f) for f in EVENT_CSVS],
                    ignore_index=True).drop_duplicates(KEY)
-    ev = ev.merge(pd.concat([sorted_labels(d) for d in SORT_DIRS], ignore_index=True), on=KEY, how='left')
+    labels = (pd.read_csv(LABELS)[KEY + ['label']] if isinstance(LABELS, str)
+              else pd.concat([sorted_labels(d) for d in LABELS], ignore_index=True))
+    ev = ev.merge(labels, on=KEY, how='left')
     assumed = pd.Series(False, index=ev.index)
     for f, cams in ASSUME_FLARE.items():
         assumed |= (ev.src == f) & ev.camera.isin(cams) & ev.label.isna()

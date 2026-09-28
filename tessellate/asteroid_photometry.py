@@ -1016,22 +1016,25 @@ def _pool_cut_offset(detected_df, pred_groups, offset_search_px, min_offset_pair
     property of the cut/epoch, not of any one object). Falls back to
     zero offset if too few pairs fall within the search radius to trust
     a pooled estimate."""
-    all_dx, all_dy = [], []
-    for _, det in detected_df.groupby(detected_id_col):
-        det = det.sort_values("frame")
-        for pred in pred_groups.values():
-            merged = det.merge(pred, on="frame", how="inner")
-            if len(merged) == 0:
-                continue
-            dx = merged[detected_x_col].values - merged["x"].values
-            dy = merged[detected_y_col].values - merged["y"].values
-            close = np.hypot(dx, dy) <= offset_search_px
-            all_dx.extend(dx[close])
-            all_dy.extend(dy[close])
+    pairs = _frame_pairs(detected_df, pred_groups, detected_id_col, detected_x_col, detected_y_col)
+    dx = pairs[detected_x_col].values - pairs["x"].values
+    dy = pairs[detected_y_col].values - pairs["y"].values
+    close = np.hypot(dx, dy) <= offset_search_px
 
-    if len(all_dx) < min_offset_pairs:
+    if close.sum() < min_offset_pairs:
         return 0.0, 0.0
-    return float(np.median(all_dx)), float(np.median(all_dy))
+    return float(np.median(dx[close])), float(np.median(dy[close]))
+
+
+def _frame_pairs(detected_df, pred_groups, detected_id_col, detected_x_col, detected_y_col):
+    """Every (detected row, predicted position) pair sharing a frame, from ONE
+    join on frame -- not a separate merge per (object, asteroid) pair, which
+    cost ~1 ms each and took hours on cuts with many objects and tracks."""
+    pred = pd.concat([g.assign(designation=name) for name, g in pred_groups.items()],
+                     ignore_index=True) if pred_groups else \
+        pd.DataFrame(columns=["frame", "x", "y", "designation"])
+    return detected_df[[detected_id_col, "frame", detected_x_col, detected_y_col]].merge(
+        pred[["designation", "frame", "x", "y"]], on="frame", how="inner")
 
 
 def identify_known_asteroids(detected_df, predicted_df, max_dist_px=MATCH_MAX_DIST_PX,
@@ -1077,36 +1080,20 @@ def identify_known_asteroids(detected_df, predicted_df, max_dist_px=MATCH_MAX_DI
         offset_x, offset_y = _pool_cut_offset(detected_df, pred_groups, offset_search_px, min_offset_pairs,
                                                 detected_id_col, detected_x_col, detected_y_col)
 
-    rows = []
-    for obj_id, det in detected_df.groupby(detected_id_col):
-        det = det.sort_values("frame")
-        best = None
-        for designation, pred in pred_groups.items():
-            merged = det.merge(pred, on="frame", how="inner")
-            if len(merged) == 0:
-                continue
+    pairs = _frame_pairs(detected_df, pred_groups, detected_id_col, detected_x_col, detected_y_col)
+    pairs["dist_px"] = np.hypot(pairs[detected_x_col].values - (pairs["x"].values + offset_x),
+                                pairs[detected_y_col].values - (pairs["y"].values + offset_y))
+    # closest approach per object over all asteroids and frames, within max_dist_px
+    best = (pairs[pairs["dist_px"] <= max_dist_px]
+            .sort_values("dist_px", kind="stable")
+            .drop_duplicates(detected_id_col)
+            [[detected_id_col, "designation", "dist_px", "frame"]])
 
-            dist = np.hypot(merged[detected_x_col].values - (merged["x"].values + offset_x),
-                             merged[detected_y_col].values - (merged["y"].values + offset_y))
-            i = int(np.argmin(dist))
-            min_dist = float(dist[i])
-            if min_dist > max_dist_px:
-                continue
-
-            candidate = dict(designation=designation, dist_px=min_dist,
-                              frame=int(merged["frame"].values[i]))
-            if best is None or candidate["dist_px"] < best["dist_px"]:
-                best = candidate
-
-        row = {detected_id_col: obj_id}
-        if best is not None:
-            row.update(best)
-            row["matched_known_asteroid"] = True
-        else:
-            row.update(dict(designation=None, dist_px=np.nan, frame=None))
-            row["matched_known_asteroid"] = False
-        row["cut_offset_x"] = offset_x
-        row["cut_offset_y"] = offset_y
-        rows.append(row)
-
-    return pd.DataFrame(rows)
+    out = pd.DataFrame({detected_id_col: np.sort(detected_df[detected_id_col].unique())})
+    out = out.merge(best, on=detected_id_col, how="left")
+    out["matched_known_asteroid"] = out["designation"].notna()
+    out["designation"] = out["designation"].astype(object).where(out["matched_known_asteroid"], None)
+    out["frame"] = out["frame"].astype(float)  # NaN when unmatched, as before
+    out["cut_offset_x"] = offset_x
+    out["cut_offset_y"] = offset_y
+    return out

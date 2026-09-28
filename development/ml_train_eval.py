@@ -1,6 +1,6 @@
 """
 Train and evaluate the tessellate event classifier from extracted features
-(ml_extract_features.py) and manual_sort.py labels.
+(ml_extract_features.py, then ml_collect_features.py) and manual_sort.py labels.
 
 Edit the CONFIG block, then:  python ml_train_eval.py
 
@@ -31,7 +31,7 @@ from tessellate.ml_classifier import (ARTEFACT_CLASSES, FEATURE_GROUPS, HOST_FEA
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---- CONFIG ----
-FEATURES = [f'{HERE}/S55/S55_features.csv.gz']   # one or more files from ml_extract_features.py
+FEATURES = [f'{HERE}/S55/S55_training_features.csv.gz']   # one or more files from ml_collect_features.py
 SORT_DIR = [f'{HERE}/S55/sort_found_flares',          # one or more manual_sort outputs, each with one folder per group
             f'{HERE}/S55/sort_non_flares']
 LABEL_RENAME = {'Other': 'Interesting'}      # sort folder name -> classifier class; None drops a folder.
@@ -179,6 +179,22 @@ def recall_by_folder(oof, manual, classes):
     return '\n'.join(lines) + '\n'
 
 
+def pipeline_agreement(oof, classes):
+    """How often the out-of-fold prediction for a pipeline-tagged event matches its tag."""
+    df = oof[oof.label_source == 'pipeline']
+    if not len(df):
+        return ''
+    pred = np.array(classes)[df[[f'p_{c}' for c in classes]].to_numpy().argmax(axis=1)]
+    table = pd.crosstab(pd.Series(df.label.to_numpy(), name='tag'), pd.Series(pred, name='predicted'),
+                        normalize='index').round(3)
+    table.insert(0, 'n', df.label.value_counts())
+    lines = ['Pipeline tags recovered (out-of-fold; rows = tag, columns = prediction)', '=' * 70,
+             "These are the rules' own easy cases, so this checks the model hasn't lost what the rules know --",
+             'not how well it finds what they miss (that is the manual-label numbers above).', '',
+             table.to_string()]
+    return '\n'.join(lines) + '\n'
+
+
 def run(features_files, sort_dir, out_dir, label_rename=None, pipeline_weight=0.3, crossbin_weight=0.5,
         groups=FEATURE_GROUPS, exclude=HOST_FEATURES, class_balance=0.5, n_splits=5, ablation=False,
         importance=False, save_model=None, review=None, truth=None):
@@ -199,6 +215,7 @@ def run(features_files, sort_dir, out_dir, label_rename=None, pipeline_weight=0.
     text = format_report(res, 'Out-of-fold, calibrated, manual labels')
     if manual is not None and manual['sort_dir'].nunique() > 1:
         text += '\n' + recall_by_folder(clf.oof_, manual, clf.classes_)
+    text += '\n' + pipeline_agreement(clf.oof_, clf.classes_)
     text += '\n' + format_report(evaluate(clf.oof_raw_), 'Out-of-fold, uncalibrated, manual labels')
     with open(f'{out_dir}/report.txt', 'w') as f:
         f.write(text)
@@ -236,6 +253,7 @@ def run(features_files, sort_dir, out_dir, label_rename=None, pipeline_weight=0.
 
 
 if __name__ == '__main__':
+    sys.stdout.reconfigure(line_buffering=True)   # print progress as it happens, even into a log file
     run(FEATURES, SORT_DIR, OUT_DIR, label_rename=LABEL_RENAME, pipeline_weight=PIPELINE_WEIGHT,
         crossbin_weight=CROSSBIN_WEIGHT, groups=GROUPS, exclude=EXCLUDE, class_balance=CLASS_BALANCE, n_splits=N_SPLITS,
         ablation=ABLATION, importance=IMPORTANCE, save_model=SAVE_MODEL, review=REVIEW, truth=TRUTH)

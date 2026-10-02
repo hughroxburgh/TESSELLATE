@@ -31,25 +31,41 @@ from tessellate.ml_classifier import (ARTEFACT_CLASSES, FEATURE_GROUPS, HOST_FEA
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---- CONFIG ----
-FEATURES = [f'{HERE}/S55/S55_training_features.csv.gz']   # one or more files from ml_collect_features.py
-SORT_DIR = [f'{HERE}/S55/sort_found_flares',          # one or more manual_sort outputs, each with one folder per group
-            f'{HERE}/S55/sort_non_flares']
-LABEL_RENAME = {'Other': 'Interesting'}      # sort folder name -> classifier class; None drops a folder.
+FEATURES = [f'{HERE}/ml_data/S27-55_training_features.csv.gz',   # one or more files from ml_collect_features.py
+            f'{HERE}/ml_data/S27-55_training_features_pool.csv.gz']   # (an event in several is kept once)
+LABELS_CSV = [f'{HERE}/ml_data/manual_labels.csv',
+              f'{HERE}/ml_data/manual_labels_random.csv',   # the random sort (ml_pick_sort_sample.py)
+              f'{HERE}/ml_data/manual_labels_tagcheck.csv']  # pipeline Asteroid tags checked by eye   # label tables from ml_build_labels.py (its `source` column
+                                                     # plays the part of the sort folder in the report)
+SORT_DIR = []               # manual_sort outputs read directly, each with one folder per group (used together
+                            # with LABELS_CSV; the S55 sorts are already in manual_labels.csv)
+LABEL_RENAME = {'Other': None, 'Interesting': None}  # sort folder name -> classifier class; None drops a folder.
                                              # Classes: Junk, CosmicRay, Systematic, Blend, Asteroid,
-                                             # Flare, Variable, Interesting
-OUT_DIR = f'{HERE}/ml_eval'
+                                             # Flare, Variable, Interesting (left out for now: not pure enough)
+OUT_DIR = f'{HERE}/ml_eval_stage1_pw0_tc'
 
-PIPELINE_WEIGHT = 0.3       # weight of the pipeline's Junk/CosmicRay/Asteroid tags (0 = ignore them)
+FRAME_BINS = [1]            # train and classify only these frame bins (the manual sorts are all frame_bin 1).
+                            # None = all bins
+CLASS_MERGE = {'Systematic': 'Junk', 'Blend': 'Junk', 'Noise': 'Junk'}   # manual classes folded into another
+VARIABLE_TAGS = False       # events the pipeline matched to a variable-star catalogue (classification V...) get a
+                            # weak Variable label at PIPELINE_WEIGHT, like the Junk/CosmicRay/Asteroid tags
+VARIABLE_TAG_EXCLUDE = ()   # catalogue classes not used as Variable weak labels, e.g. ('VRM', 'VST')
+PIPELINE_WEIGHT = 0.0       # weight of the pipeline's Junk/CosmicRay/Asteroid tags (0 = ignore them). 0 since
+                            # 2026-10-01: the tags taught 'long = Asteroid' (random sort: 76% -> 96.5% junk removed)
 CROSSBIN_WEIGHT = 0.5       # weight of labels inherited by other-frame-bin detections of a sorted event (0 = off)
 GROUPS = FEATURE_GROUPS     # feature groups to use: 'tab', 'lc', 'shape', 'ctx', 'pix', 'xm'
-EXCLUDE = HOST_FEATURES     # features left out: by default the ones saying whether a star is there, so Flare
-                            # is judged on shape alone (the ablation adds a run with them). () = use everything
+EXCLUDE = HOST_FEATURES + ('tab_abs_gal_b',)
+                            # features left out: the ones saying whether a star is there, so Flare is judged on
+                            # shape alone (the ablation adds a run with them), and galactic latitude (sky position;
+                            # the highlat labels are all |b| > 15, so it would tell sorted from tagged). () = all
 CLASS_BALANCE = 0.5         # 0 = natural class frequencies, 1 = fully balanced
-N_SPLITS = 5
+CV_GROUP = 'sector'         # what each cross-validation fold holds out: 'sector' (a sector never seen in training)
+                            # or 'cut'
+N_SPLITS = 14               # with CV_GROUP = 'sector', the number of sectors = leave one sector out
 
-ABLATION = True             # also score subsets of feature groups (slower)
+ABLATION = False            # also score subsets of feature groups (slower: one more full CV per subset)
 IMPORTANCE = True           # permutation importance per feature and per group
-SAVE_MODEL = f'{HERE}/event_classifier.joblib'   # None = don't save
+SAVE_MODEL = f'{HERE}/ml_data/event_classifier_stage1_pw0_tc.joblib'   # None = don't save
 REVIEW = 500                # write the N most useful unlabelled events to sort next (None = skip)
 TRUTH = None                # csv of true classes, for synthetic data only
 # ----------------
@@ -195,19 +211,107 @@ def pipeline_agreement(oof, classes):
     return '\n'.join(lines) + '\n'
 
 
+def read_label_tables(paths):
+    """Manual labels from ml_build_labels.py tables, in load_manual_labels' layout (source -> sort_dir)."""
+    parts = []
+    for path in ([paths] if isinstance(paths, str) else paths):
+        df = pd.read_csv(path)
+        df = df[df.label.notna()].rename(columns={'source': 'sort_dir'})
+        parts.append(df[[c for c in KEY_COLS + ['label', 'frame_bin', 'xcentroid', 'ycentroid', 'mjd_max', 'sort_dir']
+                         if c in df]])
+    return pd.concat(parts, ignore_index=True)
+
+
+def by_sector(oof, classes):
+    """Out-of-fold recall per class for each sector (manual labels). With CV_GROUP = 'sector' each sector was
+    scored by a model that never saw it."""
+    df = oof[oof.label_source == 'manual']
+    pred = np.array(classes)[df[[f'p_{c}' for c in classes]].to_numpy().argmax(axis=1)]
+    art = df.label.isin(ARTEFACT_CLASSES).to_numpy()
+    p_art = df[[f'p_{c}' for c in classes if c in ARTEFACT_CLASSES]].sum(axis=1).to_numpy()
+    d = df.assign(correct=pred == df.label.to_numpy(), coarse_ok=(p_art > 0.5) == art)
+    table = d.groupby(['sector', 'label'])['correct'].agg(['mean', 'size'])
+    table = table.apply(lambda r: f"{r['mean']:.2f} ({int(r['size'])})", axis=1).unstack(fill_value='-')
+    table['artefact_vs_astro'] = d.groupby('sector')['coarse_ok'].mean().round(3)
+    lines = ['Recall by sector (out-of-fold, calibrated, manual labels; n in brackets)', '=' * 70,
+             'artefact_vs_astro = fraction right on the coarse question, at p(artefact) > 0.5.', '',
+             table.to_string()]
+    return '\n'.join(lines) + '\n'
+
+
+def flares_on_variables(oof, classes):
+    """Recall of sorted flares that sit on a catalogued variable star: with Variable weak labels from catalogue
+    matches, these are the flares most at risk of being called Variable."""
+    df = oof[(oof.label_source == 'manual') & (oof.label == 'Flare')]
+    pred = pd.Series(np.array(classes)[df[[f'p_{c}' for c in classes]].to_numpy().argmax(axis=1)], index=df.index)
+    on_var = df['classification'].astype(str).str.startswith('V')
+    rows = []
+    for name, sel in [('on a catalogued variable', on_var), ('not on one', ~on_var)]:
+        rows.append({'sorted flares': name, 'n': int(sel.sum()), 'recall': round(float((pred[sel] == 'Flare').mean()), 3),
+                     'called Variable': int((pred[sel] == 'Variable').sum())})
+    by_type = pd.crosstab(df.loc[on_var, 'classification'], pred[on_var])
+    lines = ['Sorted flares on catalogued variable stars (out-of-fold)', '=' * 55, pd.DataFrame(rows).to_string(index=False),
+             '', 'by catalogue class (rows) and prediction (columns):', by_type.to_string()]
+    return '\n'.join(lines) + '\n'
+
+
+def candidate_summary(predictions, features, classes, out_dir):
+    """How the model classes the catalogue-variable candidates (never labelled), saved for review."""
+    if 'kept_as' not in features:
+        return ''
+    cand = predictions[features['kept_as'].reindex(predictions.index).eq('catalogue_variable').to_numpy()]
+    if not len(cand):
+        return ''
+    cand.to_csv(f'{out_dir}/catalogue_variable_predictions.csv', index=False)
+    counts = cand['pred_class'].value_counts() if 'pred_class' in cand else pd.Series(dtype=int)
+    lines = ['Catalogue-variable events (on a catalogued variable star; weak Variable labels if VARIABLE_TAGS)', '=' * 88,
+             f'{len(cand)} events; predicted class:', counts.to_string(),
+             f'saved with probabilities to catalogue_variable_predictions.csv']
+    return '\n'.join(lines) + '\n'
+
+
 def run(features_files, sort_dir, out_dir, label_rename=None, pipeline_weight=0.3, crossbin_weight=0.5,
         groups=FEATURE_GROUPS, exclude=HOST_FEATURES, class_balance=0.5, n_splits=5, ablation=False,
-        importance=False, save_model=None, review=None, truth=None):
+        importance=False, save_model=None, review=None, truth=None, labels_csv=None, cv_group='cut',
+        frame_bins=None, class_merge=None, variable_tags=False, variable_tag_exclude=()):
     os.makedirs(out_dir, exist_ok=True)
-    features = pd.concat([pd.read_csv(f) for f in features_files], ignore_index=True)
-    manual = None
+    features = pd.concat([pd.read_csv(f, low_memory=False) for f in features_files], ignore_index=True)
+    features = features.drop_duplicates(KEY_COLS).reset_index(drop=True)
+    print(f'{len(features)} feature rows from {len(features_files)} files (duplicates dropped)', flush=True)
+    if frame_bins is not None:
+        features = features[features.frame_bin.isin(frame_bins)].reset_index(drop=True)
+        print(f'{len(features)} rows in frame bins {list(frame_bins)}', flush=True)
+    manual = []
+    if labels_csv:
+        tables = read_label_tables(labels_csv)
+        dropped = [lab for lab in tables.label.unique() if (label_rename or {}).get(lab, lab) is None]
+        if dropped:
+            print(f'Leaving out labels {dropped} (LABEL_RENAME): {tables.label.isin(dropped).sum()} events')
+        manual.append(tables[~tables.label.isin(dropped)])
     if sort_dir:
         sort_dirs = [sort_dir] if isinstance(sort_dir, str) else sort_dir
-        manual = pd.concat([load_manual_labels(d, rename=label_rename).assign(sort_dir=os.path.basename(os.path.normpath(d)))
-                            for d in sort_dirs], ignore_index=True)
+        manual += [load_manual_labels(d, rename=label_rename).assign(sort_dir=os.path.basename(os.path.normpath(d)))
+                   for d in sort_dirs]
+    manual = pd.concat(manual, ignore_index=True) if manual else None
+    if manual is not None:
+        manual = manual.drop_duplicates(KEY_COLS + ['label'])
+        conflict = manual.duplicated(KEY_COLS, keep=False)
+        if conflict.any():
+            print(f'{conflict.sum()} label rows disagree between sources; dropping those events')
+            manual = manual[~conflict]
+        if class_merge:
+            manual['label'] = manual['label'].replace(class_merge)
+        print('Manual labels:\n' + manual.groupby(['sort_dir', 'label']).size().unstack(fill_value=0).to_string())
     labels = attach_labels(features, manual, pipeline_weight=pipeline_weight, crossbin_weight=crossbin_weight)
+    if variable_tags and pipeline_weight > 0:
+        cls = features['classification'].astype(str)
+        m = (cls.str.startswith('V') & ~cls.isin(variable_tag_exclude) & labels.label.isna()).to_numpy()
+        labels.loc[m, 'label'] = 'Variable'
+        labels.loc[m, 'label_source'] = 'pipeline'
+        labels.loc[m, 'weight'] = pipeline_weight
+        print(f'Variable weak labels (catalogue matches): {m.sum()} (weight {pipeline_weight})')
 
-    clf = EventClassifier(feature_groups=groups, exclude=exclude, class_balance=class_balance)
+    clf = EventClassifier(feature_groups=groups, exclude=exclude, class_balance=class_balance, cv_group=cv_group)
     clf.fit(features, labels, n_splits=n_splits, importance=importance)
     print(f'{len(clf.feature_names_)} features used')
 
@@ -215,7 +319,11 @@ def run(features_files, sort_dir, out_dir, label_rename=None, pipeline_weight=0.
     text = format_report(res, 'Out-of-fold, calibrated, manual labels')
     if manual is not None and manual['sort_dir'].nunique() > 1:
         text += '\n' + recall_by_folder(clf.oof_, manual, clf.classes_)
+    if 'sector' in clf.oof_ and clf.oof_.sector.nunique() > 1:
+        text += '\n' + by_sector(clf.oof_, clf.classes_)
     text += '\n' + pipeline_agreement(clf.oof_, clf.classes_)
+    if variable_tags:
+        text += '\n' + flares_on_variables(clf.oof_, clf.classes_)
     text += '\n' + format_report(evaluate(clf.oof_raw_), 'Out-of-fold, uncalibrated, manual labels')
     with open(f'{out_dir}/report.txt', 'w') as f:
         f.write(text)
@@ -232,7 +340,7 @@ def run(features_files, sort_dir, out_dir, label_rename=None, pipeline_weight=0.
     if ablation:
         rows = []
         for subset, excl in [(s, exclude) for s in ABLATIONS] + [(FEATURE_GROUPS, ())]:
-            sub = EventClassifier(feature_groups=subset, exclude=excl, class_balance=class_balance)
+            sub = EventClassifier(feature_groups=subset, exclude=excl, class_balance=class_balance, cv_group=cv_group)
             sub.fit(features, labels, n_splits=n_splits, verbose=False)
             name = '+'.join(subset) + ('' if excl else ' (incl. host)')
             rows.append({'groups': name, 'n_features': len(sub.feature_names_), **summary_row(evaluate(sub.oof_))})
@@ -243,8 +351,13 @@ def run(features_files, sort_dir, out_dir, label_rename=None, pipeline_weight=0.
     if save_model:
         clf.save(save_model)
 
-    if review or truth is not None:
+    if review or truth is not None or 'kept_as' in features:
         predictions = clf.predict(features)
+        extra = candidate_summary(predictions, features, clf.classes_, out_dir)
+        if extra:
+            with open(f'{out_dir}/report.txt', 'a') as f:
+                f.write('\n' + extra)
+            print('\n' + extra)
         if review:
             rank_for_review(predictions, labels, n=review).to_csv(f'{out_dir}/review_queue.csv', index=False)
         if truth is not None:
@@ -256,4 +369,6 @@ if __name__ == '__main__':
     sys.stdout.reconfigure(line_buffering=True)   # print progress as it happens, even into a log file
     run(FEATURES, SORT_DIR, OUT_DIR, label_rename=LABEL_RENAME, pipeline_weight=PIPELINE_WEIGHT,
         crossbin_weight=CROSSBIN_WEIGHT, groups=GROUPS, exclude=EXCLUDE, class_balance=CLASS_BALANCE, n_splits=N_SPLITS,
-        ablation=ABLATION, importance=IMPORTANCE, save_model=SAVE_MODEL, review=REVIEW, truth=TRUTH)
+        ablation=ABLATION, importance=IMPORTANCE, save_model=SAVE_MODEL, review=REVIEW, truth=TRUTH,
+        labels_csv=LABELS_CSV, cv_group=CV_GROUP, frame_bins=FRAME_BINS, class_merge=CLASS_MERGE,
+        variable_tags=VARIABLE_TAGS, variable_tag_exclude=VARIABLE_TAG_EXCLUDE)

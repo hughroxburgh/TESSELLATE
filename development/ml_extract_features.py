@@ -44,7 +44,7 @@ from tessellate.ml_classifier import FEATURE_VERSION, PIPELINE_CLASSES, _cut_pat
 
 # ---- CONFIG ----
 DATA_PATH = '/fred/oz335/TESSdata'
-SECTORS = list(range(27, 40))           # done one after another in the same job
+SECTORS = list(range(27, 40)) + [55]   # done one after another in the same job
 CAMS = [1, 2, 3, 4]
 CCDS = [1, 2, 3, 4]
 CUTS = range(1, 65)                     # all 64 cuts (with LABELS_CSV, only the labelled ones among these)
@@ -53,7 +53,7 @@ OUT_DIR = '/fred/oz335/hroxburg/dev/ml_classifier'
 CACHE_NAME = 'S{sector}_feature_cache_labelled'   # per-sector cache folder in OUT_DIR. Keep it different from a
                                                   # whole-sector cache: a cut's file only holds the events asked for
 
-LABELS_CSV = '/fred/oz335/hroxburg/dev/ml_classifier/ml_labels/manual_labels.csv'   # None = every event
+LABELS_CSV = '/fred/oz335/hroxburg/dev/ml_classifier/manual_labels_all.csv'   # None = every event
 VARIABLES_PER_CUT = 50      # with LABELS_CSV: catalogue-variable events per cut (None = all)
 RANDOM_PER_CUT = 50         # with LABELS_CSV: other untagged events per cut
 SEED = 0
@@ -61,7 +61,8 @@ SEED = 0
 EVENTS_CSV = None           # without LABELS_CSV: a csv of events (sector/camera/ccd/cut/objid/eventid) to restrict
                             # to. None = every event.
 N_JOBS = 16                 # parallel workers (and, with SLURM, the CPUs requested)
-CROSSMATCH = True           # Gaia / variable-catalogue features (needs the WCS + local catalogues)
+CROSSMATCH = False          # Gaia / variable-catalogue features (needs the WCS + local catalogues). Off: stage 1
+                            # uses no localisation, and S55's radial-branch columns break it
 FRAME_STATS = True          # per-frame noise pass over each cube (~8 s per cut)
 TAGGED_PER_CUT = 100        # per cut, at most this many events of each pipeline tag (Junk/CosmicRay/Asteroid) get
                             # features -- they're only weak labels, and ~45% of a cut. None = all of them

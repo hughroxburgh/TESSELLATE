@@ -1,0 +1,70 @@
+"""
+Plot the ML sort sample on the cluster, ready for tools.manual_sort.
+
+Reads sort_sample.csv (from ml_pick_sort_sample.py: event keys only), fetches each event's full row from its
+cut's detected_events.csv, and saves
+  EVENTS_OUT   the full rows -- the csv to give manual_sort
+  IMAGE_DIR    one S{s}C{cam}C{ccd}C{cut}O{objid}E{eventid}.png per event (nav.plot_lc, as in the sig10 sorts)
+Images already made are skipped, so it can be stopped and rerun.
+
+Edit the CONFIG block, then:  python ml_plot_sort_sample.py
+Then sort (with a GROUPS key for 'Unsure'), e.g.
+  from tessellate.tools import manual_sort
+  manual_sort(EVENTS_OUT, image_dir=IMAGE_DIR, sort_dir=SORT_DIR)
+"""
+
+import os
+
+import pandas as pd
+from tqdm import tqdm
+
+from tessellate import Navigator
+
+# ---- CONFIG ----
+DATA_PATH = '/fred/oz335/TESSdata'
+SAMPLE_CSV = '/fred/oz335/hroxburg/dev/ml_classifier/sort_sample/sort_sample.csv'
+EVENTS_OUT = '/fred/oz335/hroxburg/dev/ml_classifier/sort_sample/sort_sample_events.csv'
+IMAGE_DIR = '/fred/oz335/hroxburg/dev/ml_classifier/sort_sample/images'
+EXTERNAL_PHOT = True
+# ----------------
+
+KEY_COLS = ['sector', 'camera', 'ccd', 'cut', 'objid', 'eventid']
+
+
+def full_rows(sample):
+    rows = []
+    for (sector, cam, ccd, cut), keys in sample.groupby(['sector', 'camera', 'ccd', 'cut']):
+        path = f'{DATA_PATH}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of64/detected_events.csv'
+        ev = pd.read_csv(path)
+        ev = ev.merge(keys[['objid', 'eventid', 'frame_bin']], on=['objid', 'eventid', 'frame_bin'])
+        rows.append(ev)
+    return pd.concat(rows, ignore_index=True)
+
+
+def main():
+    sample = pd.read_csv(SAMPLE_CSV)
+    if os.path.exists(EVENTS_OUT):
+        events = pd.read_csv(EVENTS_OUT)
+    else:
+        events = full_rows(sample)
+        events.to_csv(EVENTS_OUT, index=False)
+    missing = len(sample) - len(events)
+    print(f'{len(events)} events' + (f' ({missing} not found in detected_events)' if missing else ''))
+
+    os.makedirs(IMAGE_DIR, exist_ok=True)
+    for (sector, cam, ccd), grp in events.groupby(['sector', 'camera', 'ccd']):
+        nav = Navigator(sector, cam, ccd)
+        for _, event in tqdm(grp.iterrows(), total=len(grp), desc=f'S{sector} C{cam} C{ccd}', ascii=True):
+            name = f'S{event.sector}C{event.camera}C{event.ccd}C{event.cut}O{event.objid}E{event.eventid}.png'
+            if os.path.exists(f'{IMAGE_DIR}/{name}'):
+                continue
+            try:
+                nav.plot_lc(event, external_phot=EXTERNAL_PHOT, save_combined_path=IMAGE_DIR, verbose=False)
+            except Exception as e:
+                print(f'  {name}: not plotted ({type(e).__name__}: {e})')
+    n_png = len([f for f in os.listdir(IMAGE_DIR) if f.endswith('.png')])
+    print(f'{n_png} images in {IMAGE_DIR}')
+
+
+if __name__ == '__main__':
+    main()

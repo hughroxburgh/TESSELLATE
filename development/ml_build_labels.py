@@ -31,9 +31,13 @@ SORTS = {
     # sig10 off-star sorts: filter_events(starkiller='hard', lc_sig_max=10, centroid_err=0.1 (old 95% radius),
     # psf_like=0.75, frame_bin=1, max_frame_duration=40, flux_sign=1, |b| > 15, asteroid/CR killers), old run
     'highlat_sig10': ['/fred/oz335/projects/highlat_transients/sig10/Sector*'],
-    # S55 sorts (found_flares = Gaia-matched list, non_flares = the rest); edit to the cluster paths
-    # 'S55_found_flares': ['/path/to/sort_found_flares'],
-    # 'S55_non_flares': ['/path/to/sort_non_flares'],
+    # S55 localisation sorts (found_flares = Gaia-matched list, non_flares = the rest; cameras 1-4)
+    'S55_found_flares': ['/fred/oz335/hroxburg/dev/final_localisation/sort_found_flares'],
+    'S55_non_flares': ['/fred/oz335/hroxburg/dev/final_localisation/sort_non_flares'],
+    # the stratified random sort of the frame-bin-1 stream (ml_random_pool.py -> ml_pick_sort_sample.py)
+    'random_sort': ['/fred/oz335/hroxburg/dev/ml_classifier/sort_sample/sort_sort_sample_events'],
+    # pipeline Asteroid tags checked by eye (blind: model said Variable / Junk / Asteroid)
+    'tag_check': ['/fred/oz335/hroxburg/dev/ml_classifier/tag_check/sort_tag_check_events'],
 }
 
 # Folder name -> fine class. Folders not listed here are reported and left out.
@@ -43,12 +47,13 @@ GROUP_TO_LABEL = {
     'Asteroid': 'Asteroid', 'Asteroids': 'Asteroid',
     'CosmicRay': 'CosmicRay', 'Cosmic Ray': 'CosmicRay', 'Cosmic_Ray': 'CosmicRay',
     'Junk': 'Junk', 'Systematic': 'Systematic', 'Blend': 'Blend',
+    'Noise': 'Junk',          # the random sort's Noise key: can't be told apart from Junk reliably (Hugh, 2026-10-01)
     'Interesting': 'Interesting', 'Other': 'Interesting',
 }
 
 # Folders left out on purpose (not reported as unknown). Interesting: not pure enough yet (Hugh, 2026-09-28);
 # remove it from this list to bring those events back (as stage1 Flare, see STAGE1).
-EXCLUDE_GROUPS = ['Interesting', 'Other']
+EXCLUDE_GROUPS = ['Interesting', 'Other', 'Unsure']
 
 # Fine class -> stage-1 class. Interesting = flare-like events that may be extragalactic transients: Flare-like
 # in stage 1; the fine label keeps them apart as stage-2 candidates.
@@ -57,8 +62,8 @@ STAGE1 = {
     'Asteroid': 'Asteroid', 'Flare': 'Flare', 'Variable': 'Variable', 'Interesting': 'Flare',
 }
 
-OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ml_labels')
-OUT_NAME = 'manual_labels.csv'
+OUT_DIR = '/fred/oz335/hroxburg/dev/ml_classifier'
+OUT_NAME = 'manual_labels_all.csv'
 # ---- END CONFIG ----
 
 KEY_COLS = ['sector', 'camera', 'ccd', 'cut', 'objid', 'eventid']

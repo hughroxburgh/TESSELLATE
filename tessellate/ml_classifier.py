@@ -90,7 +90,9 @@ KEY_COLS = ['sector', 'camera', 'ccd', 'cut', 'objid', 'eventid']
 META_COLS = KEY_COLS + ['frame_bin', 'flux_sign', 'classification', 'xcentroid', 'ycentroid', 'mjd_max',
                         'crossbin_ids']
 FEATURE_GROUPS = ('tab', 'lc', 'shape', 'ctx', 'pix', 'xm')
-FEATURE_VERSION = 3
+FEATURE_VERSION = 4     # 4: image at before / peak / after and first / second half (pix_ep_*), gaps in the event
+                        # window (lc_gap_frames, lc_spans_gap, lc_event_nan_frac), hour-scale and ring-relative
+                        # variability (ctx_red_noise, ctx_ring_corr, ctx_core_ring_ratio), ctx_peak_over_p99
 
 # Features (name prefixes) that say whether a star is at the event position: the Gaia / variable-catalogue
 # distances and bit 0 of the reduction's source mask (pixel on a catalogue star). Flare is defined by shape,
@@ -393,6 +395,20 @@ def _running_median(y, mask, window, bounds):
     return trend
 
 
+def _block_mean(y, k):
+    """Mean of consecutive blocks of k values (NaNs ignored; a block needs at least half its values)."""
+    if k <= 1:
+        return np.asarray(y, float)
+    m = len(y) // k
+    if m == 0:
+        return np.array([])
+    blocks = np.asarray(y[:m * k], float).reshape(m, k)
+    ok = np.isfinite(blocks).sum(axis=1) >= max(1, k // 2)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        return np.where(ok, np.nanmean(blocks, axis=1), np.nan)
+
+
 def _gauss(t, A, t0, sigma, c):
     return A * np.exp(-0.5 * ((t - t0) / sigma) ** 2) + c
 
@@ -575,6 +591,20 @@ def _lc_features(t, lc, fs, fe, cadence, bounds, cfg):
     edges = np.array([t[s] for bound in bounds for s in (bound[0], bound[1] - 1)])
     out['ctx_edge_dist_days'] = float(np.min(np.minimum(np.abs(edges - t[fs]), np.abs(edges - t[fe]))))
 
+    # -- Does the event window run across missing data (a downlink or a gap)? Almost always junk -- #
+    dt_ev = np.diff(t[fs:fe + 1])
+    gap = dt_ev > 1.5 * cadence
+    out['lc_gap_frames'] = float(np.sum(np.round(dt_ev[gap] / cadence) - 1)) if gap.any() else 0.0
+    out['lc_spans_gap'] = float(any(fs < s <= fe for bound in bounds for s in (bound[0],)))
+    out['lc_event_nan_frac'] = float(np.mean(~np.isfinite(lc[fs:fe + 1])))
+
+    # -- Variability on ~hour timescales after the day-scale detrend (stochastic variables), as a
+    #    multiple of what white noise at this level would give -- #
+    k = max(1, int(round((1 / 24) / cadence)))
+    binned = _block_mean(np.where(outside, det, np.nan), k)
+    if np.isfinite(binned).sum() >= 10:
+        out['ctx_red_noise'] = _robust_std(binned[np.isfinite(binned)]) / (sig / np.sqrt(k))
+
     # -- Shape of the event itself -- #
     ze = z[fs:fe + 1]
     if not np.isfinite(ze).any():
@@ -650,6 +680,9 @@ def _lc_features(t, lc, fs, fe, cadence, bounds, cfg):
     out['ctx_rate_comparable50'] = out['ctx_n_comparable50'] / span_days
     out['ctx_n_neg_comparable50'] = int(neg.size)
     out['ctx_peak_over_max_other'] = peak / np.nanmax(zc) if np.nanmax(zc) > 0 else np.nan
+    # against the star's usual range rather than its single largest excursion (robust to one outlier)
+    p99 = np.nanpercentile(zc, 99) if np.isfinite(zc).sum() >= 100 else np.nan
+    out['ctx_peak_over_p99'] = peak / p99 if p99 > 0 else np.nan
 
     out.update(_self_similarity(z, a, b, peak))
     out.update(_periodicity(t, z, outside, t[ip], peak, dur * cadence, cfg))
@@ -766,6 +799,126 @@ def _pixel_features(st, fs, fe, fm, noise):
     return out
 
 
+def _mean_image(st, lo, hi):
+    """Mean of stamp frames [lo, hi) clipped to the series, or None if there are none."""
+    lo, hi = max(lo, 0), min(hi, st.shape[0])
+    if hi <= lo or not np.isfinite(st[lo:hi]).any():
+        return None
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        return np.nanmean(st[lo:hi], axis=0)
+
+
+def _corr(a, b):
+    m = np.isfinite(a) & np.isfinite(b)
+    if m.sum() < 9 or np.std(a[m]) == 0 or np.std(b[m]) == 0:
+        return np.nan
+    return float(np.corrcoef(a[m], b[m])[0, 1])
+
+
+def _centroid5(img):
+    """Flux-weighted (positive pixels) centroid of a 5x5 image, relative to its centre."""
+    yy, xx = np.mgrid[0:5, 0:5]
+    w = np.clip(np.nan_to_num(img), 0, None)
+    if w.sum() <= 0:
+        return None
+    return np.sum(w * xx) / w.sum() - 2, np.sum(w * yy) / w.sum() - 2
+
+
+def _epoch_features(st, fs, fe, fm, noise):
+    """
+    The image at three epochs: just BEFORE the event, its PEAK, and just AFTER -- defined for every event,
+    one frame long or forty. A real new source is absent before and after; a residual of a star that is
+    always there (poor subtraction, a variable's other cycles) shows the same pattern before and after.
+    For events of 3+ frames, the FIRST half against the SECOND half: an asteroid's image shifts, a star's
+    doesn't. Stacking each half averages down the noise that makes frame-to-frame centroids jump around.
+    st: 9x9 stamp series (already multiplied by flux_sign).
+    """
+    out = {}
+    c = st.shape[1] // 2
+    inner = slice(c - 2, c + 3)       # the 5x5 around the event
+    core = slice(c - 1, c + 2)        # its 3x3 core
+    dur = fe - fs + 1
+    nb = int(np.clip(dur, 3, 10))
+
+    peak = st[fm]
+    pk_core = np.nansum(np.clip(peak[core, core], 0, None))
+    if not pk_core > 0:
+        return out
+    pk5 = peak[inner, inner]
+    for name, img, frames in [('before', _mean_image(st, fs - nb, fs), np.arange(fs - nb, fs)),
+                              ('after', _mean_image(st, fe + 1, fe + 1 + nb), np.arange(fe + 1, fe + 1 + nb))]:
+        if img is None:
+            continue
+        out[f'pix_ep_{name}_frac'] = float(np.nansum(img[core, core]) / pk_core)
+        out[f'pix_ep_{name}_corr'] = _corr(img[inner, inner], pk5)
+        if noise is not None:
+            fr = frames[(frames >= 0) & (frames < len(noise))]
+            nz = np.nanmedian(noise[fr]) / np.sqrt(len(fr)) if len(fr) else np.nan
+            if nz > 0:
+                out[f'pix_ep_{name}_absz'] = float(np.nanmean(np.abs(img[core, core])) / nz)
+
+    if dur >= 3:
+        half = -(-dur // 2)
+        first = _mean_image(st, fs, fs + half)
+        second = _mean_image(st, fe + 1 - half, fe + 1)
+        if first is not None and second is not None:
+            a, b = first[inner, inner], second[inner, inner]
+            ca, cb = _centroid5(a), _centroid5(b)
+            if ca is not None and cb is not None:
+                out['pix_ep_shift'] = float(np.hypot(cb[0] - ca[0], cb[1] - ca[1]))
+            zero = _corr(a, b)
+            best, best_shift = zero, 0.0
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    if dx == 0 and dy == 0:
+                        continue
+                    r = _corr(a, second[c - 2 + dy:c + 3 + dy, c - 2 + dx:c + 3 + dx])
+                    if np.isfinite(r) and (not np.isfinite(best) or r > best):
+                        best, best_shift = r, float(np.hypot(dx, dy))
+            out['pix_ep_corr_zero'] = zero
+            out['pix_ep_corr_gain'] = best - zero if np.isfinite(best) and np.isfinite(zero) else np.nan
+            out['pix_ep_best_shift'] = best_shift
+            g = [_gauss_corr(a), _gauss_corr(pk5), _gauss_corr(b)]
+            out['pix_ep_gauss_first'], out['pix_ep_gauss_last'] = g[0], g[2]
+            out['pix_ep_gauss_min'] = float(np.nanmin(g)) if np.isfinite(g).any() else np.nan
+    return out
+
+
+def _ring_lc_features(t, st, fs, fe, cadence, bounds, cfg):
+    """
+    The event pixel's light curve against the ring of pixels around it, away from the event, on ~1 h bins
+    after the day-scale detrend: scattered light and poor subtraction move the whole neighbourhood together
+    (high correlation, ratio ~1); a variable star varies at its own position.
+    """
+    out = {}
+    n, size = st.shape[0], st.shape[1]
+    c = size // 2
+    ring_mask = np.ones((size, size), bool)
+    ring_mask[c - 2:c + 3, c - 2:c + 3] = False
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        core = np.nanmean(st[:, c - 1:c + 2, c - 1:c + 2], axis=(1, 2))
+        ring = np.nanmean(st[:, ring_mask], axis=1)
+    dur = fe - fs + 1
+    pad = max(3, dur)
+    in_window = np.zeros(n, bool)
+    in_window[max(fs - pad, 0):min(fe + pad, n - 1) + 1] = True
+    window = max(5, int(round(cfg['detrend_days'] / cadence)) | 1)
+    k = max(1, int(round((1 / 24) / cadence)))
+    det = []
+    for lc in (core, ring):
+        d = lc - _running_median(lc, in_window, window, bounds)
+        det.append(_block_mean(np.where(in_window, np.nan, d), k))
+    bc, br = det
+    m = np.isfinite(bc) & np.isfinite(br)
+    if m.sum() >= 10:
+        out['ctx_ring_corr'] = _corr(bc[m], br[m]) if m.sum() >= 9 else np.nan
+        sr = _robust_std(br[m])
+        out['ctx_core_ring_ratio'] = _robust_std(bc[m]) / sr if sr > 0 else np.nan
+    return out
+
+
 def _ring_features(img, noise_fm):
     """Extended structure around the event at its brightest frame (glints, scattered light)."""
     out = {}
@@ -801,6 +954,9 @@ def _event_features(ev, cd, cfg):
 
     out.update(_lc_features(t, lc, fs, fe, cadence, bounds, cfg))
     out.update(_pixel_features(st, fs, fe, fm, noise))
+    st9 = cd.stamp(x, y, 4, fb) * sign
+    out.update(_epoch_features(st9, fs, fe, fm, noise))
+    out.update(_ring_lc_features(t, st9, fs, fe, cadence, bounds, cfg))
     out.update(_ring_features(cd.image(x, y, 7, fb, fm) * sign, None if noise is None else noise[fm]))
     if noise is not None:
         med = np.nanmedian(noise)
@@ -1180,8 +1336,11 @@ def attach_labels(features, manual=None, pipeline_weight=0.3, crossbin_weight=0.
 
 # ----------------------------- Model ----------------------------- #
 
-def _group_keys(df):
-    """Cross-validation groups: whole cuts, so no object (or its crossbin copies) spans train and test."""
+def _group_keys(df, by='cut'):
+    """Cross-validation groups: whole cuts, so no object (or its crossbin copies) spans train and test; or,
+    with by='sector', whole sectors (tests how the model carries over to a sector it has never seen)."""
+    if by == 'sector':
+        return df['sector'].astype(str).to_numpy()
     return (df['sector'].astype(str) + '_' + df['camera'].astype(str) + '_' +
             df['ccd'].astype(str) + '_' + df['cut'].astype(str)).to_numpy()
 
@@ -1243,7 +1402,7 @@ class EventClassifier():
     """
 
     def __init__(self, feature_groups=FEATURE_GROUPS, exclude=HOST_FEATURES, class_balance=0.5, model_params=None,
-                 random_state=0):
+                 random_state=0, cv_group='cut'):
         self.feature_groups = tuple(feature_groups)
         self.exclude = tuple(exclude)
         self.class_balance = class_balance
@@ -1251,6 +1410,7 @@ class EventClassifier():
                              'min_samples_leaf': 20, 'l2_regularization': 1.0, 'early_stopping': False,
                              **(model_params or {})}
         self.random_state = random_state
+        self.cv_group = cv_group            # 'cut' or 'sector': what a cross-validation fold holds out
         self.version = FEATURE_VERSION
         self.calibration_ = None
 
@@ -1283,7 +1443,7 @@ class EventClassifier():
             self.feature_names_ = _feature_columns(features.columns, self.feature_groups, self.exclude + LEAKY_FEATURES)
         m, X, y, w, source = self._training_data(features, labels)
         classes = [c for c in CLASSES if c in set(y)] + sorted(set(y) - set(CLASSES))
-        groups = _group_keys(features.loc[m])
+        groups = _group_keys(features.loc[m], getattr(self, 'cv_group', 'cut'))
         k = min(n_splits, len(np.unique(groups)))
         if k < 2:
             raise ValueError('Cross-validation needs labelled events from at least two cuts.')

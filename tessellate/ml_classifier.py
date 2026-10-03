@@ -1005,8 +1005,13 @@ def _crossmatch_features(events, data_path, sector, cam, ccd, cut, n=8):
         mag = np.where(np.isfinite(rp), rp, mag)
     tree = cKDTree(np.c_[gx, gy])
     d, i = tree.query(pts, k=1)
-    err = np.hypot(pd.to_numeric(events['xcentroid_err'], errors='coerce'),
-                   pd.to_numeric(events['ycentroid_err'], errors='coerce')).to_numpy()[ok]
+    if 'centroid_err' in events:
+        # radial-localisation outputs: one 1-sigma error per axis (older outputs: per-axis 95% radii, so
+        # xm_gaia_sep_norm isn't on the same scale across the two; xm_ features are left out of the model)
+        err = np.sqrt(2) * pd.to_numeric(events['centroid_err'], errors='coerce').to_numpy()[ok]
+    else:
+        err = np.hypot(pd.to_numeric(events['xcentroid_err'], errors='coerce'),
+                       pd.to_numeric(events['ycentroid_err'], errors='coerce')).to_numpy()[ok]
     idx = events.index[ok]
     out.loc[idx, 'xm_gaia_sep'] = d
     out.loc[idx, 'xm_gaia_sep_norm'] = d / err

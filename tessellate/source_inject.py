@@ -1043,8 +1043,7 @@ PYTHONUNBUFFERED=1\n\
         match_score_o  = np.full(n, np.nan)
         dx_o          = np.full(n, np.nan)
         dy_o          = np.full(n, np.nan)
-        xcentroid_err_o = np.full(n, np.nan)
-        ycentroid_err_o = np.full(n, np.nan)
+        centroid_err_o = np.full(n, np.nan)
         z_x_o          = np.full(n, np.nan)
         z_y_o          = np.full(n, np.nan)
 
@@ -1137,10 +1136,11 @@ PYTHONUNBUFFERED=1\n\
                 match_score_o[i]  = score[b]
                 dx_o[i]             = (best.xcentroid - x0)
                 dy_o[i]             = (best.ycentroid - y0)
-                xcentroid_err_o[i]  = best.xcentroid_err_psf
-                ycentroid_err_o[i]  = best.ycentroid_err_psf
-                z_x_o[i]          = (best.xcentroid - x0) / best.xcentroid_err_psf
-                z_y_o[i]          = (best.ycentroid - y0) / best.ycentroid_err_psf
+                # 1-sigma error; runs from before centroid_err_psf stored a per-axis match radius instead
+                err = best.centroid_err_psf if 'centroid_err_psf' in best.index else best.xcentroid_err_psf
+                centroid_err_o[i]  = err
+                z_x_o[i]          = (best.xcentroid - x0) / err
+                z_y_o[i]          = (best.ycentroid - y0) / err
 
                 found = True
                 break
@@ -1170,8 +1170,7 @@ PYTHONUNBUFFERED=1\n\
         non_vars["match_score"]   = match_score_o
         non_vars["dx"]            = dx_o
         non_vars["dy"]            = dy_o
-        non_vars["xcentroid_err_psf"] = xcentroid_err_o
-        non_vars["ycentroid_err_psf"] = ycentroid_err_o
+        non_vars["centroid_err_psf"] = centroid_err_o
         non_vars["z_xcentroid"]   = z_x_o
         non_vars["z_ycentroid"]   = z_y_o
 

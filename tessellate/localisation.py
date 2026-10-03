@@ -1,9 +1,6 @@
 import numpy as np
 import os
 import pandas as pd
-import pickle
-from pathlib import Path
-from scipy.interpolate import interp1d
 
 
 class CutWCS():
@@ -398,56 +395,69 @@ class PSF_Fitter():
 #     return xstd, ystd
 
 
-_MODEL_PATH = Path(__file__).parent / "snr_localisation_model.pkl"  # adjust to wherever you store it
+# ----------------------------------------------------------------------------------------------------------------------------- #
+# Localisation model for PSF-fit positions (psf_like > 0.5). Constants from development/localisation_calibration.py.
+#
+# centroid_err: the 1-sigma error per axis (pixels) of a PSF-fit position,
+#     sigma(snr_psf) = sqrt((LOCALISATION_A * snr_psf**-LOCALISATION_B)**2 + LOCALISATION_FLOOR**2)
+# A and B come from injection-recovery, which injects and fits with the same PRF (fitting noise alone).
+# LOCALISATION_FLOOR adds, in quadrature to the injection floor, a real-sky term measured on manually sorted S55
+# flare stars after the radial shift below is removed.
+#
+# Radial shift: PSF-fit positions of flares sit closer to the camera's optical axis than their Gaia star, by an
+# amount that depends only on the distance r from the axis (the same curve for every camera and CCD): ~0.02 px at
+# r = 300 px, ~0.06 px at 2000 px. OPTICAL_AXIS_PX is the axis in each CCD's 0-based FFI pixels (xccd, yccd), from
+# tess-point's focal-plane geometry; RADIAL_SHIFT_COEF is a cubic in r / 1000 px (highest power first), with r
+# clipped to RADIAL_SHIFT_RANGE.
+# ----------------------------------------------------------------------------------------------------------------------------- #
 
-def _bound_model(snr, a, b, floor):
-    return np.sqrt((a * snr**(-b))**2 + floor**2)
+CROSSMATCH_NSIGMA = 3.0          # an event matches a Gaia star / catalogued variable within this many centroid_err
 
-def get_snr_to_localisation_func(model_path=_MODEL_PATH):
+LOCALISATION_A = 0.6118
+LOCALISATION_B = 0.8828
+LOCALISATION_FLOOR = 0.0407      # injection floor 0.0247 (+) real-sky 0.0324
+
+OPTICAL_AXIS_PX = {
+    (1, 1): (2147.7, 2103.6),
+    (1, 2): (-16.9, 2101.9),
+    (1, 3): (2152.8, 2096.3),
+    (1, 4): (-12.0, 2096.7),
+    (2, 1): (2154.1, 2097.1),
+    (2, 2): (-11.7, 2098.9),
+    (2, 3): (2146.2, 2103.1),
+    (2, 4): (-18.6, 2103.3),
+    (3, 1): (2151.0, 2094.0),
+    (3, 2): (-12.0, 2094.6),
+    (3, 3): (2146.7, 2106.6),
+    (3, 4): (-16.5, 2104.1),
+    (4, 1): (2147.4, 2088.4),
+    (4, 2): (-15.9, 2090.4),
+    (4, 3): (2151.3, 2114.9),
+    (4, 4): (-12.3, 2114.7),
+}
+RADIAL_SHIFT_COEF = (-0.012561, 0.039098, -0.006985, 0.020670)
+RADIAL_SHIFT_RANGE = (200, 3000)
+
+
+def localisation_sigma(snr_psf):
+    """1-sigma error per axis (pixels) of a PSF-fit position with this snr_psf (> 0)."""
+    snr = np.asarray(snr_psf, dtype=float)
+    return np.hypot(LOCALISATION_A * snr**(-LOCALISATION_B), LOCALISATION_FLOOR)
+
+
+def get_snr_to_localisation_func():
+    """The SNR -> centroid_err function (localisation_sigma): f(snr_psf) -> 1-sigma error per axis, pixels."""
+    return localisation_sigma
+
+
+def radial_shift(xccd, yccd, cam, ccd):
     """
-    Loads the fitted SNR -> localisation-error model and returns a callable:
-
-        f(snr_psf, percentage, axis=None) -> radius  or  {"x": radius, "y": radius}
-
-    Returns a single symmetric error radius r such that `percentage`% of
-    sources at that SNR have |error| <= r, for the given axis. axis must be
-    'x', 'y', or None (returns both as a dict). percentage is capped at the
-    fitted max (95%). SNR is extrapolated freely above the fitted range
-    (smooth analytic power law), but must be > 0.
-
-    Wing shape (a, b) is derived from PSF injection-recovery; the asymptotic
-    floor is calibrated against real flare stars with snr_psf above the
-    model's stored high_snr_cut, to correct for systematics (registration
-    error, subtraction bias) not present in injections.
+    (dx, dy) in pixels to SUBTRACT from PSF-fit positions at CCD pixels (xccd, yccd) of camera cam, CCD ccd: the
+    shift toward the optical axis that real flares show relative to Gaia. Not for injections (no such shift).
     """
-    with open(model_path, "rb") as f:
-        model = pickle.load(f)
-
-    percentages = model["percentages"]
-    pct_lo, pct_hi = percentages.min(), percentages.max()
-
-    def _eval_axis(snr_arr, percentage, axis):
-        params = model["params"][axis]
-        vals = np.array([_bound_model(snr_arr, *params[p]) for p in percentages])  # (n_pct, n_snr)
-        interp = interp1d(percentages, vals, axis=0)(percentage)
-        out = np.maximum(interp, 0)
-        return out if out.size > 1 else out.item()
-
-    def localisation_func(snr_psf, percentage, axis=None):
-        if axis not in ("x", "y", None):
-            raise ValueError("axis must be 'x', 'y', or None")
-        if not (pct_lo <= percentage <= pct_hi):
-            raise ValueError(f"percentage must be in [{pct_lo}, {pct_hi}] (got {percentage})")
-
-        snr_arr = np.atleast_1d(snr_psf).astype(float)
-        if np.any(snr_arr <= 0):
-            raise ValueError("snr_psf must be > 0")
-
-        if axis is None:
-            return {
-                "x": _eval_axis(snr_arr, percentage, "x"),
-                "y": _eval_axis(snr_arr, percentage, "y"),
-            }
-        return _eval_axis(snr_arr, percentage, axis)
-
-    return localisation_func
+    ax, ay = OPTICAL_AXIS_PX[(int(cam), int(ccd))]
+    vx = ax - np.asarray(xccd, dtype=float)
+    vy = ay - np.asarray(yccd, dtype=float)
+    r = np.hypot(vx, vy)
+    shift = np.polyval(RADIAL_SHIFT_COEF, np.clip(r, *RADIAL_SHIFT_RANGE) / 1000)
+    return shift * vx / r, shift * vy / r

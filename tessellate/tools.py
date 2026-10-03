@@ -635,7 +635,26 @@ def _Ask(prompt):
             text.append(ch)
     return ''.join(text)
 
-def manual_sort(events_path, image_dir=None, sort_dir=None):
+def _screen_size():
+    """(width, height) of the display the windows open on: screeninfo, then tkinter, else 1920 x 1080."""
+    try:
+        from screeninfo import get_monitors
+        m = get_monitors()[0]
+        return m.width, m.height
+    except Exception:
+        pass
+    try:
+        import tkinter
+        root = tkinter.Tk()
+        root.withdraw()
+        size = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.destroy()
+        return size
+    except Exception:
+        return 1920, 1080
+
+
+def manual_sort(events_path, image_dir=None, sort_dir=None, screen_size=None):
     """
     Sort events by eye into categories named when it starts (e.g. 'Real' and
     'Not real'), one keypress per event, in an OpenCV window like
@@ -646,6 +665,9 @@ def manual_sort(events_path, image_dir=None, sort_dir=None):
         S{sector}C{cam}C{ccd}C{cut}O{objid}E{eventid}.png made by plot_lc
         (e.g. development/plot_events.py). Default: 'images' next to the csv.
     sort_dir : where the sorted copies go. Default: 'sort_{csv name}' next to the csv.
+    screen_size : (width, height) of the screen in pixels, if the detected size (printed at the start) is
+        wrong -- e.g. (1680, 1050) for a VNC desktop of that size. Images are shrunk to fit above the
+        controls box.
 
     Images are copied, not moved, so the same images can be sorted in several
     ways. Each category gets a folder of images plus an events.csv of their
@@ -739,12 +761,9 @@ def manual_sort(events_path, image_dir=None, sort_dir=None):
         return
 
     # -- Windows -- #
-    screen_w, screen_h = 1920, 1080
-    try:
-        from screeninfo import get_monitors
-        screen_w, screen_h = get_monitors()[0].width, get_monitors()[0].height
-    except Exception:
-        pass
+    screen_w, screen_h = screen_size or _screen_size()
+    print(f'Screen {screen_w} x {screen_h} px' + ('' if screen_size else
+          ' (detected; pass screen_size=(w, h) if the windows don\'t fit)'))
 
     # Two columns (categories | navigation) so the window stays short enough for a VNC screen
     col1 = ['  CONTROLS  '] + [f'{k + 1} : {c}' for k, c in enumerate(classes)]
@@ -781,9 +800,12 @@ def manual_sort(events_path, image_dir=None, sort_dir=None):
             print(f'Could not read {fname}, skipping.')
             i += 1
             continue
-        if img.shape[1] > 0.8 * screen_w:
-            scale = 0.8 * screen_w / img.shape[1]
-            img = cv2.resize(img, (int(img.shape[1] * scale), int(img.shape[0] * scale)))
+        # fit the width and the height left above the controls box (plus room for window title bars)
+        avail_h = screen_h - height - 120
+        scale = min(0.95 * screen_w / img.shape[1], avail_h / img.shape[0], 1.0)
+        if scale < 1:
+            img = cv2.resize(img, (int(img.shape[1] * scale), int(img.shape[0] * scale)),
+                             interpolation=cv2.INTER_AREA)
         cv2.imshow('Image Sorter', img)
         cv2.moveWindow('Image Sorter', 0, 0)
         print(f'[{i + 1}/{len(todo)}] {fname}')

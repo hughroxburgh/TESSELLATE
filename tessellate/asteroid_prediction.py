@@ -41,6 +41,7 @@ TESS-measured brightness, not just the MPC's catalogue H-magnitude.
 """
 import math
 import os
+import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -112,6 +113,57 @@ def load_assist_ephem(data_dir=None):
         f"{data_dir}/assist/linux_p1550p2650.440", f"{data_dir}/assist/sb441-n16.bsp",
     )
     return _assist_ephem_cache
+
+
+# The 16 massive asteroids ASSIST includes as perturbers (NAIF IDs 2000000 + n in sb441-n16.bsp).
+# Integrated as a test particle, one of these is pulled by its own ephemeris copy at near-zero
+# separation and flung out: production precise_ephemeris put (1) Ceres and (4) Vesta at r ~ 44 au
+# after a 2,100-day gap (Horizons: 2.98 / 2.51 au) while non-perturbers matched to < 0.1", and
+# none of the 16 is in the TESSELLATE asteroid catalogue. The self-encounter also crushes IAS15's
+# shared timestep for every particle in the same simulation, which is why snapshot shard 0 (the
+# lowest-numbered bulk rows) never finished. Their positions come from the ephemeris instead.
+ASSIST_PERTURBER_NUMBERS = frozenset({1, 2, 3, 4, 7, 10, 15, 16, 31, 52, 65, 87, 88, 107, 511, 704})
+_perturber_index_cache = None
+
+
+def _mpc_number(row):
+    """MPC number of an MPCORB/snapshot row, or None if unnumbered. Reads the readable
+    designation "(n) Name" when present, else an all-digit 5-character packed designation
+    (enough for the perturbers, all numbered below 1000)."""
+    m = re.match(r"\((\d+)\)", str(getattr(row, "designation", "") or ""))
+    if m:
+        return int(m.group(1))
+    packed = str(getattr(row, "designation_packed", "") or "").strip()
+    return int(packed) if packed.isdigit() else None
+
+
+def assist_perturber_indices(data_dir=None):
+    """{MPC number: ASSIST particle index} for the perturbers. ASSIST stores them at indices 11-26
+    in an order that does not follow MPC number, so each index is matched by heliocentric position
+    against the same sb441-n16.bsp read through SPICE."""
+    global _perturber_index_cache
+    if _perturber_index_cache is not None:
+        return _perturber_index_cache
+    import spiceypy as sp
+
+    data_dir = data_dir or default_data_dir()
+    ephem = load_assist_ephem(data_dir)
+    sp.furnsh(f"{data_dir}/assist/sb441-n16.bsp")
+    sun = ephem.get_particle(0, 0.0)
+    assist_helio = {k: np.array([p.x - sun.x, p.y - sun.y, p.z - sun.z])
+                    for k in range(11, 27) for p in [ephem.get_particle(k, 0.0)]}
+    mapping = {}
+    for n in ASSIST_PERTURBER_NUMBERS:
+        spice_helio = np.array(sp.spkgps(2000000 + n, 0.0, "J2000", 10)[0]) / AU_KM
+        k, d = min(((k, np.linalg.norm(v - spice_helio)) for k, v in assist_helio.items()),
+                   key=lambda kv: kv[1])
+        if d > 1e-6:
+            raise RuntimeError(f"no ASSIST particle matches perturber ({n}): closest {d:.2e} au")
+        mapping[n] = k
+    if len(set(mapping.values())) != len(mapping):
+        raise RuntimeError(f"ambiguous ASSIST perturber mapping: {mapping}")
+    _perturber_index_cache = mapping
+    return mapping
 
 
 def furnish_spice_generic(data_dir=None):
@@ -808,10 +860,13 @@ def build_sector_mpcorb_snapshot(target_mjd, data_dir=None, out_path=None,
 
     common_epoch = pd.Series(epoch_mjd).mode().iloc[0]
     on_common = np.isclose(epoch_mjd, common_epoch)
-    is_bulk = on_common & (q >= neo_perihelion_au)
-    is_neo_warm = on_common & (q < neo_perihelion_au) & (q >= hot_perihelion_au)
-    is_neo_hot = on_common & (q < hot_perihelion_au)
-    is_minority = ~on_common
+    numbers = pd.to_numeric(mpcorb["designation"].astype(str).str.extract(r"^\((\d+)\)")[0],
+                            errors="coerce")
+    is_perturber = numbers.isin(ASSIST_PERTURBER_NUMBERS).values  # from the ephemeris, never integrated
+    is_bulk = on_common & (q >= neo_perihelion_au) & ~is_perturber
+    is_neo_warm = on_common & (q < neo_perihelion_au) & (q >= hot_perihelion_au) & ~is_perturber
+    is_neo_hot = on_common & (q < hot_perihelion_au) & ~is_perturber
+    is_minority = ~on_common & ~is_perturber
 
     ephem = load_assist_ephem(data_dir)
     jd_ref = ephem.jd_ref
@@ -866,8 +921,27 @@ def build_sector_mpcorb_snapshot(target_mjd, data_dir=None, out_path=None,
         out["epoch_mjd"] = target_mjd
         return out
 
+    def perturbers_from_ephemeris(sub_df, sub_numbers):
+        """ASSIST's own perturbers: state at t_target straight from the ephemeris (see
+        ASSIST_PERTURBER_NUMBERS), converted to elements exactly as integrate_group does."""
+        idx = assist_perturber_indices(data_dir)
+        sun = ephem.get_particle("Sun", t_target_days)
+        ps = [ephem.get_particle(idx[int(n)], t_target_days) for n in sub_numbers]
+        helio_pos = np.array([[p.x - sun.x, p.y - sun.y, p.z - sun.z] for p in ps])
+        helio_vel = np.array([[p.vx - sun.vx, p.vy - sun.vy, p.vz - sun.vz] for p in ps])
+        mu = (np.radians(sub_df["mean_daily_motion_degrees"].values) ** 2
+              * sub_df["semimajor_axis_au"].values ** 3)
+        out = pd.DataFrame(_state_to_elements(helio_pos, helio_vel, mu))
+        out["designation_packed"] = sub_df["designation_packed"].values
+        out["magnitude_H"] = sub_df["magnitude_H"].values
+        out["magnitude_G"] = sub_df["magnitude_G"].values
+        out["epoch_mjd"] = target_mjd
+        return out
+
     results = []
     if shard_index == 0:
+        results.append(perturbers_from_ephemeris(mpcorb[is_perturber].reset_index(drop=True),
+                                                 numbers[is_perturber].values))
         # the small groups are cheap and only need doing once, regardless of how many
         # shards the bulk population is split across -- warm and hot NEOs are integrated
         # separately so the rare very-close-perihelion outliers don't force their crushed
@@ -1128,17 +1202,21 @@ def precise_ephemeris(mpcorb_row, frame_mjds, data_dir=None, allow_download=True
     ephem = load_assist_ephem(data_dir)
     jd_ref = ephem.jd_ref
 
-    t_ref, helio_pos, helio_vel = _state_vector_at_epoch(mpcorb_row, data_dir)
-    t_ref_days = t_ref.tdb - jd_ref
-    sun_ref = ephem.get_particle("Sun", t_ref_days)
-    bary_pos = helio_pos + np.array([sun_ref.x, sun_ref.y, sun_ref.z])
-    bary_vel = helio_vel + np.array([sun_ref.vx, sun_ref.vy, sun_ref.vz])
+    number = _mpc_number(mpcorb_row)
+    perturber_idx = (assist_perturber_indices(data_dir)[number]
+                     if number in ASSIST_PERTURBER_NUMBERS else None)
+    if perturber_idx is None:
+        t_ref, helio_pos, helio_vel = _state_vector_at_epoch(mpcorb_row, data_dir)
+        t_ref_days = t_ref.tdb - jd_ref
+        sun_ref = ephem.get_particle("Sun", t_ref_days)
+        bary_pos = helio_pos + np.array([sun_ref.x, sun_ref.y, sun_ref.z])
+        bary_vel = helio_vel + np.array([sun_ref.vx, sun_ref.vy, sun_ref.vz])
 
-    sim = rebound.Simulation()
-    assist.Extras(sim, ephem)
-    sim.t = t_ref_days
-    sim.add(x=bary_pos[0], y=bary_pos[1], z=bary_pos[2],
-            vx=bary_vel[0], vy=bary_vel[1], vz=bary_vel[2])
+        sim = rebound.Simulation()
+        assist.Extras(sim, ephem)
+        sim.t = t_ref_days
+        sim.add(x=bary_pos[0], y=bary_pos[1], z=bary_pos[2],
+                vx=bary_vel[0], vy=bary_vel[1], vz=bary_vel[2])
 
     order = np.argsort(frame_mjds)
     sorted_mjds = np.asarray(frame_mjds)[order]
@@ -1165,8 +1243,11 @@ def precise_ephemeris(mpcorb_row, frame_mjds, data_dir=None, allow_download=True
         sun_vec = None
         for _ in range(4):
             t_em = t_target_days - light_time
-            sim.integrate(t_em)
-            p = sim.particles[0]
+            if perturber_idx is None:
+                sim.integrate(t_em)
+                p = sim.particles[0]
+            else:  # one of ASSIST's own perturbers: read it from the ephemeris (see above)
+                p = ephem.get_particle(perturber_idx, t_em)
             obj_pos = np.array([p.x, p.y, p.z])
             vec = obj_pos - tess_bary_pos
             sun_em = ephem.get_particle("Sun", t_em)

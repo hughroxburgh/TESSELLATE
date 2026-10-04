@@ -42,6 +42,7 @@ TESS-measured brightness, not just the MPC's catalogue H-magnitude.
 import math
 import os
 import re
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -80,6 +81,12 @@ def load_mpcorb(data_dir=None):
 
     data_dir = data_dir or default_data_dir()
     path = f"{data_dir}/mpc/MPCORB.DAT"
+    # Parsing the 316 MB text file took 35 s of a profiled 5.6-min cut, repeated by every cut job.
+    # A parquet copy written beside it is reused while it is newer than MPCORB.DAT.
+    cache = f"{path}.parquet"
+    if os.path.exists(cache) and os.path.getmtime(cache) >= os.path.getmtime(path):
+        _mpcorb_cache = pd.read_parquet(cache)
+        return _mpcorb_cache
     with open(path, "rb") as f:
         df = mpc.load_mpcorb_dataframe(f)
 
@@ -97,6 +104,13 @@ def load_mpcorb(data_dir=None):
     # required for the orbit itself
     required_cols = [c for c in numeric_cols if c not in ("magnitude_H", "magnitude_G")]
     df = df.dropna(subset=required_cols).reset_index(drop=True)
+
+    try:  # write to a temporary name and rename, so concurrent jobs never read a partial file
+        tmp = f"{cache}.{os.getpid()}.tmp"
+        df.to_parquet(tmp, index=False)
+        os.replace(tmp, cache)
+    except Exception as ex:  # read-only directory etc.: just parse again next time
+        print(f"  MPCORB parquet cache not written ({ex})", flush=True)
 
     _mpcorb_cache = df
     return df
@@ -1174,10 +1188,31 @@ def _precompute_frame_geometry(frame_mjds, data_dir=None, allow_download=True):
 _frame_geometry_cache = None
 
 
-def precise_ephemeris(mpcorb_row, frame_mjds, data_dir=None, allow_download=True, frame_geometry=None):
+LT_TOL_DAYS = 1e-10      # light-time convergence (~9 us; the object moves < 1 m in that time)
+LT_MAX_ITER = 6
+DEFAULT_NODE_SPACING_DAYS = 1.0 / 24   # precise nodes ~hourly, spline-interpolated to every frame
+DEFAULT_COARSE_SPACING_DAYS = 0.25     # crossing pre-check before the dense pass
+_EPH_COLUMNS = ["mjd", "ra", "dec", "r_helio_au", "delta_au", "phase_angle_deg"]
+
+
+def precise_ephemeris(mpcorb_row, frame_mjds, data_dir=None, allow_download=True, frame_geometry=None,
+                      node_spacing_days=None, footprint=None, coarse_spacing_days=DEFAULT_COARSE_SPACING_DAYS):
     """Full ASSIST-perturbed, light-time corrected TESS-relative RA/Dec for
     one object at every given frame time. Returns a DataFrame with one row
     per frame: mjd, ra, dec.
+
+    Speed (profiled on Sector 44 Cam1 Ccd2 Cut19: the multi-year integration from the MPCORB epoch
+    is ~2% of this function's time; the per-frame light-time loop is the rest):
+      - the light-time iteration stops on convergence (LT_TOL_DAYS), seeded from the previous
+        frame, instead of a fixed four integrator calls per frame;
+      - node_spacing_days (None = exact at every frame, the original behaviour): evaluate the
+        light-time-corrected object position and the Sun only at a frame subsample ~that far
+        apart and cubic-spline them to every frame. TESS's own position stays exact per frame,
+        so the parallax is not interpolated -- only the object's smooth heliocentric motion;
+      - footprint=(ra_deg, dec_deg, radius_deg): a coarse pass every coarse_spacing_days first
+        finds the time ranges where the object can be within the footprint; frames outside them
+        are dropped (they cannot be in the footprint) and an object that never comes near returns
+        an empty frame without the dense pass.
 
     Uses a single REBOUND simulation stepped forward through the frames in
     time order, rather than re-integrating from the object's MPCORB epoch
@@ -1196,7 +1231,6 @@ def precise_ephemeris(mpcorb_row, frame_mjds, data_dir=None, allow_download=True
     import rebound
     import spiceypy as sp
     from astropy.time import Time
-    from skyfield.functions import to_polar
 
     data_dir = data_dir or default_data_dir()
     ephem = load_assist_ephem(data_dir)
@@ -1218,54 +1252,108 @@ def precise_ephemeris(mpcorb_row, frame_mjds, data_dir=None, allow_download=True
         sim.add(x=bary_pos[0], y=bary_pos[1], z=bary_pos[2],
                 vx=bary_vel[0], vy=bary_vel[1], vz=bary_vel[2])
 
-    order = np.argsort(frame_mjds)
-    sorted_mjds = np.asarray(frame_mjds)[order]
+    sorted_mjds = np.sort(np.asarray(frame_mjds, dtype=float))
+    n = len(sorted_mjds)
+    if n == 0:
+        return pd.DataFrame(columns=_EPH_COLUMNS)
 
     geometry = frame_geometry if frame_geometry is not None else _frame_geometry_cache
-
-    rows = [None] * len(sorted_mjds)
-    light_time = 0.0
-    for out_i, mjd in zip(order, sorted_mjds):
+    T = np.empty(n)          # TDB days from jd_ref
+    TP = np.empty((n, 3))    # TESS barycentric position, au (exact at every frame)
+    for i, mjd in enumerate(sorted_mjds):
         cached = geometry.get(float(mjd)) if geometry is not None else None
         if cached is not None:
-            t_target_days, tess_bary_pos = cached
+            T[i], TP[i] = cached
         else:
             get_tess_kernel_for_epoch(mjd, data_dir, allow_download=allow_download)
             t_obs = Time(mjd, format="mjd", scale="utc")
-            t_target_days = t_obs.tdb.jd - jd_ref
+            T[i] = t_obs.tdb.jd - jd_ref
             et = sp.str2et(t_obs.isot)
             tess_off_km, _ = sp.spkpos("-95", et, "J2000", "NONE", "EARTH")
-            tess_off_au = np.array(tess_off_km) / AU_KM
-            earth_obs = ephem.get_particle("Earth", t_target_days)
-            tess_bary_pos = np.array([earth_obs.x, earth_obs.y, earth_obs.z]) + tess_off_au
+            earth_obs = ephem.get_particle("Earth", T[i])
+            TP[i] = np.array([earth_obs.x, earth_obs.y, earth_obs.z]) + np.array(tess_off_km) / AU_KM
 
-        vec = None
-        sun_vec = None
-        for _ in range(4):
-            t_em = t_target_days - light_time
+    state = {"lt": 0.0}
+
+    def evaluate(t_target, tess_pos):
+        """Light-time-corrected object position and the Sun at the emission time."""
+        lt = state["lt"]
+        for _ in range(LT_MAX_ITER):
+            t_em = t_target - lt
             if perturber_idx is None:
                 sim.integrate(t_em)
                 p = sim.particles[0]
             else:  # one of ASSIST's own perturbers: read it from the ephemeris (see above)
                 p = ephem.get_particle(perturber_idx, t_em)
-            obj_pos = np.array([p.x, p.y, p.z])
-            vec = obj_pos - tess_bary_pos
-            sun_em = ephem.get_particle("Sun", t_em)
-            sun_vec = obj_pos - np.array([sun_em.x, sun_em.y, sun_em.z])  # Sun -> object
-            light_time = np.linalg.norm(vec) * LIGHT_TIME_AU_DAYS
+            obj = np.array([p.x, p.y, p.z])
+            new_lt = np.linalg.norm(obj - tess_pos) * LIGHT_TIME_AU_DAYS
+            converged = abs(new_lt - lt) < LT_TOL_DAYS
+            lt = new_lt
+            if converged:
+                break
+        state["lt"] = lt
+        sun = ephem.get_particle("Sun", t_em)
+        return obj, np.array([sun.x, sun.y, sun.z])
 
-        _, dec_rad, ra_rad = to_polar(vec)
-        delta = float(np.linalg.norm(vec))       # object-observer (TESS) distance, AU
-        r_helio = float(np.linalg.norm(sun_vec))  # object-Sun distance, AU
-        cos_alpha = np.dot(sun_vec, vec) / (r_helio * delta)
-        phase_angle_deg = math.degrees(math.acos(np.clip(cos_alpha, -1.0, 1.0)))
-        rows[out_i] = dict(mjd=mjd, ra=math.degrees(ra_rad) % 360, dec=math.degrees(dec_rad),
-                            r_helio_au=r_helio, delta_au=delta, phase_angle_deg=phase_angle_deg)
+    keep = np.ones(n, dtype=bool)
+    OBJ = np.full((n, 3), np.nan)
+    SUN = np.full((n, 3), np.nan)
 
-    return pd.DataFrame(rows)
+    if node_spacing_days is None:
+        for i in range(n):
+            OBJ[i], SUN[i] = evaluate(T[i], TP[i])
+    else:
+        dt_frame = float(np.median(np.diff(T))) if n > 1 else node_spacing_days
+        k = max(1, int(round(node_spacing_days / dt_frame)))
+        if footprint is not None and n > 1:
+            ra0, dec0, rad0 = (math.radians(v) for v in footprint)
+            centre = np.array([math.cos(dec0) * math.cos(ra0), math.cos(dec0) * math.sin(ra0), math.sin(dec0)])
+            kc = max(k, int(round(coarse_spacing_days / dt_frame)))
+            ci = np.unique(np.r_[np.arange(0, n, kc), n - 1])
+            dirs = []
+            for i in ci:
+                OBJ[i], SUN[i] = evaluate(T[i], TP[i])
+                v = OBJ[i] - TP[i]
+                dirs.append(v / np.linalg.norm(v))
+            dirs = np.array(dirs)
+            sep = np.arccos(np.clip(dirs @ centre, -1, 1))
+            move = np.arccos(np.clip(np.sum(dirs[:-1] * dirs[1:], 1), -1, 1))
+            keep[:] = False
+            for j in range(len(ci) - 1):
+                # could the object dip inside the footprint between these two coarse nodes?
+                if min(sep[j], sep[j + 1]) - 1.5 * move[j] <= rad0 + math.radians(0.01):
+                    keep[ci[j]:ci[j + 1] + 1] = True
+            if not keep.any():
+                return pd.DataFrame(columns=_EPH_COLUMNS)
+        idx = np.where(keep)[0]
+        segments = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
+        from scipy.interpolate import CubicSpline
+        for seg in segments:
+            nodes = np.unique(np.r_[seg[::k], seg[-1]])
+            if len(nodes) < 4:
+                for i in seg:
+                    OBJ[i], SUN[i] = evaluate(T[i], TP[i])
+                continue
+            for i in nodes:
+                if np.isnan(OBJ[i, 0]):
+                    OBJ[i], SUN[i] = evaluate(T[i], TP[i])
+            OBJ[seg] = CubicSpline(T[nodes], OBJ[nodes], axis=0)(T[seg])
+            SUN[seg] = CubicSpline(T[nodes], SUN[nodes], axis=0)(T[seg])
+
+    vec = OBJ[keep] - TP[keep]                 # TESS -> object
+    sun_vec = OBJ[keep] - SUN[keep]            # Sun -> object
+    delta = np.linalg.norm(vec, axis=1)
+    r_helio = np.linalg.norm(sun_vec, axis=1)
+    cos_alpha = np.sum(sun_vec * vec, axis=1) / (r_helio * delta)
+    return pd.DataFrame(dict(
+        mjd=sorted_mjds[keep],
+        ra=np.degrees(np.arctan2(vec[:, 1], vec[:, 0])) % 360,
+        dec=np.degrees(np.arcsin(np.clip(vec[:, 2] / delta, -1, 1))),
+        r_helio_au=r_helio, delta_au=delta,
+        phase_angle_deg=np.degrees(np.arccos(np.clip(cos_alpha, -1, 1)))))
 
 
-def _pool_worker_init(data_dir, frame_geometry=None):
+def _pool_worker_init(data_dir, frame_geometry=None, wcs=None, footprint=None):
     """Pre-load the ~1GB ASSIST ephemeris and SPICE leapseconds kernel once
     per worker process, so each of the (many) precise_ephemeris calls a
     worker handles reuses them instead of reloading from disk every time.
@@ -1273,26 +1361,132 @@ def _pool_worker_init(data_dir, frame_geometry=None):
     _precompute_frame_geometry) computed once in the main process, so
     every survivor this worker handles reuses it instead of recomputing
     the same time-only SPICE lookups redundantly."""
-    global _frame_geometry_cache
+    global _frame_geometry_cache, _worker_wcs, _worker_footprint
     load_assist_ephem(data_dir)
     furnish_spice_generic(data_dir)
     if frame_geometry is not None:
         _frame_geometry_cache = frame_geometry
+    _worker_wcs, _worker_footprint = wcs, footprint
 
 
-def _precise_ephemeris_worker(row, frame_mjds, data_dir, allow_download):
-    return precise_ephemeris(row, frame_mjds, data_dir, allow_download=allow_download)
+def _predict_object_worker(row, frame_mjds, data_dir, allow_download, node_spacing_days, use_footprint):
+    """Precise ephemeris for one object, cut to the frames inside the footprint, with pixel
+    positions -- done here rather than per result in the main process, which left the pool's
+    workers idle for ~a third of the time on a profiled Sector 44 cut."""
+    ra0, dec0, rad0 = _worker_footprint
+    eph = precise_ephemeris(row, frame_mjds, data_dir, allow_download=allow_download,
+                            node_spacing_days=node_spacing_days,
+                            footprint=_worker_footprint if use_footprint else None)
+    if len(eph) == 0:
+        return eph
+    ra, dec = np.radians(eph["ra"].values.astype(float)), np.radians(eph["dec"].values.astype(float))
+    c0 = np.array([math.cos(math.radians(dec0)) * math.cos(math.radians(ra0)),
+                   math.cos(math.radians(dec0)) * math.sin(math.radians(ra0)), math.sin(math.radians(dec0))])
+    cos_sep = np.cos(dec) * np.cos(ra) * c0[0] + np.cos(dec) * np.sin(ra) * c0[1] + np.sin(dec) * c0[2]
+    in_fov = cos_sep >= math.cos(math.radians(rad0))
+    if not in_fov.any():
+        return eph.iloc[0:0]
+    eph = eph[in_fov].copy()
+    x, y = _worker_wcs.world_to_pixel_values(eph["ra"].values, eph["dec"].values)
+    eph["x"], eph["y"] = x, y
+    return eph
+
+
+_ROW_PARALLEL_STATE = None
+_worker_wcs = None
+_worker_footprint = None
+
+
+def _row_chunk_task(kind, start, stop, kwargs):
+    df, epoch = _ROW_PARALLEL_STATE
+    sub = df.iloc[start:stop].reset_index(drop=True)
+    if kind == "ecliptic":
+        return ecliptic_reachable_mask(sub, epoch[start:stop], **kwargs)
+    return coarse_position_mask(sub, return_hit_samples=True, **kwargs)
+
+
+def _rows_in_parallel(kind, df, epoch, kwargs):
+    """Stage 1 ("ecliptic") or stage 2 ("coarse") over row chunks on the allocated CPUs. Both are
+    per-row and vectorised over the catalogue, but single-threaded: on a profiled Sector 44 cut
+    they were 44 of 83 s at one core while the other seven sat idle. Workers are forked after the
+    catalogue is set as a module global, so rows are read in place rather than pickled to them.
+    Falls back to one serial call where fork is unavailable (macOS) or the input is small."""
+    import multiprocessing
+    global _ROW_PARALLEL_STATE
+
+    def serial():
+        if kind == "ecliptic":
+            return ecliptic_reachable_mask(df, epoch, **kwargs)
+        return coarse_position_mask(df, return_hit_samples=True, **kwargs)
+
+    n_cpu = _available_cpus()
+    if n_cpu <= 1 or len(df) < 20000 or "fork" not in multiprocessing.get_all_start_methods() \
+            or sys.platform == "darwin":
+        return serial()
+    bounds = np.linspace(0, len(df), 2 * n_cpu + 1).astype(int)   # a few chunks per worker
+    _ROW_PARALLEL_STATE = (df, epoch)
+    try:
+        with ProcessPoolExecutor(max_workers=n_cpu,
+                                 mp_context=multiprocessing.get_context("fork")) as pool:
+            parts = list(pool.map(_row_chunk_task, [kind] * (len(bounds) - 1), bounds[:-1],
+                                  bounds[1:], [kwargs] * (len(bounds) - 1)))
+    finally:
+        _ROW_PARALLEL_STATE = None
+    if kind == "ecliptic":
+        return np.concatenate(parts)
+    keep = np.concatenate([p[0] for p in parts])
+    hits, rates = {}, {}
+    for start, (_, h, r) in zip(bounds[:-1], parts):
+        hits.update({int(start) + i: v for i, v in h.items()})
+        rates.update({int(start) + i: v for i, v in r.items()})
+    return keep, hits, rates
+
+
+def _available_cpus():
+    """CPUs this process may actually use (the SLURM allocation), not the node's core count:
+    os.cpu_count() gave 36 on a job allocated 8, so the pool ran 35 workers on 8 cores."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:  # macOS
+        return os.cpu_count() or 4
 
 
 # ---------------------------------------------------------------------------
 # Top-level: predict every catalogued asteroid crossing a footprint
 # ---------------------------------------------------------------------------
 
+def _coarse_sampling(mjd_start, mjd_end, radius_deg, n_coarse_samples=None):
+    """Coarse sample epochs across the observing window, shared by stages 1 and 2 (both
+    propagate the same way, at the same epochs, just over different-sized candidate sets)."""
+    max_motion_deg_per_day = 1.5
+    if n_coarse_samples is None:
+        # pick enough samples that the between-sample motion margin stays
+        # comparable to the footprint radius itself, rather than dwarfing
+        # it -- this stage is cheap (vectorized Kepler propagation over
+        # the whole catalogue) so there's no reason to under-sample and
+        # pass a huge, slow-to-refine candidate list into stage 2/precise
+        window_days = mjd_end - mjd_start
+        target_spacing = max(radius_deg / max_motion_deg_per_day, window_days / 500)
+        n_coarse_samples = int(np.clip(np.ceil(window_days / target_spacing) + 1, 5, 500))
+    sample_mjds = np.linspace(mjd_start, mjd_end, n_coarse_samples)
+    sample_spacing = sample_mjds[1] - sample_mjds[0] if n_coarse_samples > 1 else (mjd_end - mjd_start)
+    coarse_margin = radius_deg + max_motion_deg_per_day * sample_spacing
+    return sample_mjds, sample_spacing, coarse_margin, max_motion_deg_per_day
+
+
+def _load_catalogue(data_dir, sector_snapshot_path):
+    if sector_snapshot_path is not None:
+        mpcorb = load_mpcorb_snapshot(sector_snapshot_path)
+        return mpcorb, mpcorb["epoch_mjd"].values
+    mpcorb = load_mpcorb(data_dir)
+    return mpcorb, _mpc_packed_epoch_to_mjd(mpcorb["epoch_packed"].values)
+
+
 def predict_asteroids_for_footprint(ra_center_deg, dec_center_deg, radius_deg,
                                        mjd_start, mjd_end, frame_mjds, wcs,
                                        n_coarse_samples=None, faint_limit_mag=20.8,
                                        data_dir=None, plot_path=None, allow_download=True,
-                                       sector_snapshot_path=None):
+                                       sector_snapshot_path=None, exact_ephemeris=False):
     """Predict every MPCORB-catalogued object crossing a circular footprint
     (ra_center, dec_center, radius) at any point in [mjd_start, mjd_end],
     and build a precise per-frame ephemeris (ra, dec, x, y, flux, mag where
@@ -1324,42 +1518,37 @@ def predict_asteroids_for_footprint(ra_center_deg, dec_center_deg, radius_deg,
     behaviour unchanged, correct exactly when this module's docstring assumption holds: the
     observing window is close to MPCORB.DAT's own epoch already.
     """
+
     from astropy.coordinates import SkyCoord
     import astropy.units as u
 
     data_dir = data_dir or default_data_dir()
     if not allow_download:
         verify_data_available(data_dir, frame_mjds=frame_mjds)
-    if sector_snapshot_path is not None:
-        mpcorb = load_mpcorb_snapshot(sector_snapshot_path)
-        epoch_mjd = mpcorb["epoch_mjd"].values
-    else:
-        mpcorb = load_mpcorb(data_dir)
-        epoch_mjd = _mpc_packed_epoch_to_mjd(mpcorb["epoch_packed"].values)
-
-    # Coarse sample epochs across the observing window -- hoisted above stage 1 (it used to
-    # sit between stage 1b and stage 2) because stage 1 now needs it too: both stages
-    # propagate the same way, at the same epochs, just over different-sized candidate sets.
-    max_motion_deg_per_day = 1.5
-    if n_coarse_samples is None:
-        # pick enough samples that the between-sample motion margin stays
-        # comparable to the footprint radius itself, rather than dwarfing
-        # it -- this stage is cheap (vectorized Kepler propagation over
-        # the whole catalogue) so there's no reason to under-sample and
-        # pass a huge, slow-to-refine candidate list into stage 2/precise
-        window_days = mjd_end - mjd_start
-        target_spacing = max(radius_deg / max_motion_deg_per_day, window_days / 500)
-        n_coarse_samples = int(np.clip(np.ceil(window_days / target_spacing) + 1, 5, 500))
-    sample_mjds = np.linspace(mjd_start, mjd_end, n_coarse_samples)
-    sample_spacing = sample_mjds[1] - sample_mjds[0] if n_coarse_samples > 1 else (mjd_end - mjd_start)
-    coarse_margin = radius_deg + max_motion_deg_per_day * sample_spacing
+    mpcorb, epoch_mjd = _load_catalogue(data_dir, sector_snapshot_path)
+    sample_mjds, sample_spacing, coarse_margin, max_rate = _coarse_sampling(
+        mjd_start, mjd_end, radius_deg, n_coarse_samples)
 
     ecl = SkyCoord(ra=ra_center_deg * u.deg, dec=dec_center_deg * u.deg).barycentrictrueecliptic
-    stage1 = ecliptic_reachable_mask(mpcorb, epoch_mjd, sample_mjds, ecl.lat.deg,
-                                     margin_deg=coarse_margin)
+    stage1 = _rows_in_parallel("ecliptic", mpcorb, epoch_mjd,
+                               dict(sample_mjds=sample_mjds, target_ecl_lat_deg=ecl.lat.deg,
+                                    margin_deg=coarse_margin))
     print(f"  Stage 1 (ecliptic reachability): {stage1.sum()} / {len(mpcorb)} survive", flush=True)
+    result = _refine_footprint(mpcorb[stage1].reset_index(drop=True), ra_center_deg, dec_center_deg,
+                               radius_deg, frame_mjds, wcs, sample_mjds, sample_spacing, coarse_margin,
+                               max_rate, faint_limit_mag, data_dir, allow_download, exact_ephemeris)
+    if plot_path is not None:
+        plot_asteroid_trails(result, plot_path)
+    return result
 
-    stage1b_input = mpcorb[stage1].reset_index(drop=True)
+
+def _refine_footprint(stage1b_input, ra_center_deg, dec_center_deg, radius_deg, frame_mjds, wcs,
+                      sample_mjds, sample_spacing, coarse_margin, max_motion_deg_per_day,
+                      faint_limit_mag, data_dir, allow_download, exact_ephemeris):
+    """Stage 1b onward for one footprint: brightness, coarse position, frame narrowing, then the
+    precise ephemeris pool. exact_ephemeris=True evaluates every narrowed frame exactly (the
+    original behaviour); otherwise hourly precise nodes are spline-interpolated per frame after
+    a crossing pre-check (see precise_ephemeris)."""
     stage1b = brightness_reachable_mask(stage1b_input, faint_limit_mag=faint_limit_mag)
     print(f"  Stage 1b (best-case brightness <= {faint_limit_mag}): "
           f"{stage1b.sum()} / {len(stage1b_input)} survive", flush=True)
@@ -1368,9 +1557,10 @@ def predict_asteroids_for_footprint(ra_center_deg, dec_center_deg, radius_deg,
     # margin: footprint radius + typical geocentric motion budget between consecutive coarse
     # samples (NOT the full window -- an object can only drift so far between adjacent
     # samples, however long the overall window is). Same coarse_margin stage 1 uses above.
-    stage2, hit_samples_by_row, rate_by_row = coarse_position_mask(
-        stage2_input, ra_center_deg, dec_center_deg, radius_deg + coarse_margin, sample_mjds,
-        return_hit_samples=True)
+    stage2, hit_samples_by_row, rate_by_row = _rows_in_parallel(
+        "coarse", stage2_input, None,
+        dict(ra_center_deg=ra_center_deg, dec_center_deg=dec_center_deg,
+             radius_deg=radius_deg + coarse_margin, sample_mjds=sample_mjds))
     survivors = stage2_input[stage2].reset_index(drop=True)
     print(f"  Stage 2 (coarse position): {len(survivors)} / {len(stage2_input)} survive", flush=True)
 
@@ -1416,26 +1606,23 @@ def predict_asteroids_for_footprint(ra_center_deg, dec_center_deg, radius_deg,
         # ProcessPoolExecutor rejects max_workers=0 -- a cut with zero stage-2 survivors (a real,
         # common case for high-ecliptic-latitude footprints) would otherwise crash here instead
         # of legitimately returning an empty result
-        n_workers = min(len(survivors), max(1, (os.cpu_count() or 4) - 1))
+        n_workers = min(len(survivors), max(1, _available_cpus()))
+        footprint = (ra_center_deg, dec_center_deg, radius_deg)
         with ProcessPoolExecutor(max_workers=n_workers, initializer=_pool_worker_init,
-                                  initargs=(data_dir, frame_geometry)) as pool:
-            futures = {pool.submit(_precise_ephemeris_worker, row, narrowed_frames[k], data_dir, allow_download): row
+                                  initargs=(data_dir, frame_geometry, wcs, footprint)) as pool:
+            node = None if exact_ephemeris else DEFAULT_NODE_SPACING_DAYS
+            futures = {pool.submit(_predict_object_worker, row, narrowed_frames[k], data_dir,
+                                   allow_download, node, not exact_ephemeris): row
                        for k, (_, row) in enumerate(survivors.iterrows())}
             for fut in as_completed(futures):
                 row = futures[fut]
                 try:
-                    eph = fut.result()
+                    eph = fut.result()   # already cut to the footprint, with pixel positions
                 except Exception as ex:
                     print(f"  {row.designation}: precise ephemeris failed: {ex}", flush=True)
                     continue
-                sky = SkyCoord(ra=eph["ra"].values * u.deg, dec=eph["dec"].values * u.deg)
-                sep = SkyCoord(ra=ra_center_deg * u.deg, dec=dec_center_deg * u.deg).separation(sky).deg
-                in_fov = sep <= radius_deg
-                if not in_fov.any():
+                if len(eph) == 0:
                     continue
-                eph = eph[in_fov].copy()
-                x, y = wcs.world_to_pixel(sky[in_fov])
-                eph["x"], eph["y"] = x, y
                 eph["frame"] = eph["mjd"].map(mjd_to_frame)
                 eph["designation"] = row.designation
                 eph["magnitude_H"] = row.magnitude_H
@@ -1446,16 +1633,10 @@ def predict_asteroids_for_footprint(ra_center_deg, dec_center_deg, radius_deg,
                 all_rows.append(eph)
 
     if not all_rows:
-        result = pd.DataFrame(columns=["designation", "mjd", "frame", "ra", "dec", "x", "y",
-                                        "r_helio_au", "delta_au", "phase_angle_deg",
-                                        "magnitude_H", "magnitude_G", "mag_expected"])
-    else:
-        result = pd.concat(all_rows, ignore_index=True)
-
-    if plot_path is not None:
-        plot_asteroid_trails(result, plot_path)
-
-    return result
+        return pd.DataFrame(columns=["designation", "mjd", "frame", "ra", "dec", "x", "y",
+                                     "r_helio_au", "delta_au", "phase_angle_deg",
+                                     "magnitude_H", "magnitude_G", "mag_expected"])
+    return pd.concat(all_rows, ignore_index=True)
 
 
 def _mag_to_alpha(mag, bright_ref=14.0, faint_limit=20.8, alpha_min=0.12, alpha_max=1.0):

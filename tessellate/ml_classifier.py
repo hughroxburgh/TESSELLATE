@@ -90,7 +90,9 @@ KEY_COLS = ['sector', 'camera', 'ccd', 'cut', 'objid', 'eventid']
 META_COLS = KEY_COLS + ['frame_bin', 'flux_sign', 'classification', 'xcentroid', 'ycentroid', 'mjd_max',
                         'crossbin_ids']
 FEATURE_GROUPS = ('tab', 'lc', 'shape', 'ctx', 'pix', 'xm')
-FEATURE_VERSION = 4     # 4: image at before / peak / after and first / second half (pix_ep_*), gaps in the event
+FEATURE_VERSION = 5     # 5: event margin for the baseline capped at max_mask_pad_days (long events kept their
+                        # light-curve features blank before), tab_chain_* (fast-asteroid detection chains)
+                        # 4: image at before / peak / after and first / second half (pix_ep_*), gaps in the event
                         # window (lc_gap_frames, lc_spans_gap, lc_event_nan_frac), hour-scale and ring-relative
                         # variability (ctx_red_noise, ctx_ring_corr, ctx_core_ring_ratio), ctx_peak_over_p99
 
@@ -108,6 +110,7 @@ LEAKY_FEATURES = ('tab_known_asteroid_dist_px',)
 
 DEFAULT_CONFIG = {
     'detrend_days': 1.0,          # running-median window; keeps events up to a few hours intact
+    'max_mask_pad_days': 0.5,     # margin hidden either side of an event for the baseline: min(duration, this)
     'ls_min_period_days': 0.02,
     'ls_max_period_days': 2.0,    # longer periods are unreliable after the reduction's trend removal
     'n_shape': 16,                # points in the duration-normalised shape vector
@@ -319,6 +322,56 @@ def _time_crowding(events, windows_hr=(3, 12), sep_px=3.0):
     return out
 
 
+def _chain_features(events, max_frames=3, min_px=1.5, max_px=20.0):
+    """
+    A fast asteroid crosses a 5x5 stamp in a frame or two, so each of its detections looks stationary -- but
+    it leaves a short chain of OTHER objects' detections stepping across the image in the frames either side.
+    Per event, the other-object detections (same cut and frame bin) within +/- max_frames frames and
+    min_px-max_px away:
+      tab_chain_n            how many there are
+      tab_chain_cos          cosine of the angle between the best before / after pair as seen from this event
+                             (-1: on opposite sides along a line, i.e. a track through it)
+      tab_chain_speed_ratio  their speeds (px per frame), smaller over larger: ~1 for a steady track
+    """
+    from scipy.spatial import cKDTree
+
+    cols = ['tab_chain_n', 'tab_chain_cos', 'tab_chain_speed_ratio']
+    out = pd.DataFrame(np.nan, index=events.index, columns=cols)
+    if not {'frame_max', 'frame_bin', 'xcentroid', 'ycentroid', 'objid'} <= set(events):
+        return out
+    keys = [k for k in ['sector', 'camera', 'ccd', 'cut', 'frame_bin'] if k in events]
+    scale = max_px / max_frames                 # one frame counts as this many pixels in the search
+    for idx in events.groupby(keys, sort=False).groups.values():
+        g = events.loc[idx]
+        x, y = g['xcentroid'].to_numpy(float), g['ycentroid'].to_numpy(float)
+        f = g['frame_max'].to_numpy(float)
+        obj = g['objid'].to_numpy()
+        ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(f)
+        pts = np.c_[x, y, f * scale]
+        tree = cKDTree(pts[ok])
+        okidx = np.flatnonzero(ok)
+        res = np.full((len(g), 3), np.nan)
+        for j, nb in zip(okidx, tree.query_ball_point(pts[ok], np.hypot(max_px, max_px))):
+            nb = okidx[nb]
+            df = f[nb] - f[j]
+            dx, dy = x[nb] - x[j], y[nb] - y[j]
+            d = np.hypot(dx, dy)
+            keep = (obj[nb] != obj[j]) & (np.abs(df) >= 1) & (np.abs(df) <= max_frames) & (d >= min_px) & (d <= max_px)
+            res[j, 0] = keep.sum()
+            before, after = np.flatnonzero(keep & (df < 0)), np.flatnonzero(keep & (df > 0))
+            if len(before) and len(after):
+                vb = np.c_[dx[keep & (df < 0)], dy[keep & (df < 0)]]
+                va = np.c_[dx[keep & (df > 0)], dy[keep & (df > 0)]]
+                cos = (vb @ va.T) / np.outer(np.hypot(*vb.T), np.hypot(*va.T))
+                ib, ia = np.unravel_index(np.argmin(cos), cos.shape)
+                res[j, 1] = cos[ib, ia]
+                sb = np.hypot(*vb[ib]) / abs(df[before[ib]])
+                sa = np.hypot(*va[ia]) / abs(df[after[ia]])
+                res[j, 2] = min(sb, sa) / max(sb, sa)
+        out.loc[idx] = res
+    return out
+
+
 def _object_gap_cv(events):
     """
     Coefficient of variation of the gaps between an object's event peak times
@@ -373,7 +426,7 @@ def table_features(events):
 
     f['tab_n_crossbin'] = events['crossbin_ids'].apply(_n_crossbin) if 'crossbin_ids' in events else np.nan
     f['tab_obj_gap_cv'] = _object_gap_cv(events)
-    return pd.concat([f, _time_crowding(events)], axis=1)
+    return pd.concat([f, _time_crowding(events), _chain_features(events)], axis=1)
 
 
 # ----------------------------- Light-curve features ----------------------------- #
@@ -392,6 +445,8 @@ def _running_median(y, mask, window, bounds):
     for a, b in bounds:
         seg = s.iloc[a:b].rolling(window, center=True, min_periods=max(3, window // 5)).median()
         trend[a:b] = seg.interpolate(limit_direction='both').to_numpy()
+    if np.isnan(trend).any():       # a segment with nothing unmasked: fall back to the light curve's median
+        trend[np.isnan(trend)] = np.nanmedian(s.to_numpy())
     return trend
 
 
@@ -557,7 +612,9 @@ def _lc_features(t, lc, fs, fe, cadence, bounds, cfg):
     out = {}
     n = len(lc)
     dur = fe - fs + 1
-    pad = max(3, dur)
+    # hide the event plus a margin before estimating the baseline -- capped, or a multi-day event's
+    # margin swallows a whole orbit and leaves no baseline at all
+    pad = max(3, min(dur, int(round(cfg['max_mask_pad_days'] / cadence))))
     a, b = max(fs - pad, 0), min(fe + pad, n - 1)
     in_window = np.zeros(n, bool)
     in_window[a:b + 1] = True
@@ -901,7 +958,9 @@ def _ring_lc_features(t, st, fs, fe, cadence, bounds, cfg):
         core = np.nanmean(st[:, c - 1:c + 2, c - 1:c + 2], axis=(1, 2))
         ring = np.nanmean(st[:, ring_mask], axis=1)
     dur = fe - fs + 1
-    pad = max(3, dur)
+    # hide the event plus a margin before estimating the baseline -- capped, or a multi-day event's
+    # margin swallows a whole orbit and leaves no baseline at all
+    pad = max(3, min(dur, int(round(cfg['max_mask_pad_days'] / cadence))))
     in_window = np.zeros(n, bool)
     in_window[max(fs - pad, 0):min(fe + pad, n - 1) + 1] = True
     window = max(5, int(round(cfg['detrend_days'] / cadence)) | 1)

@@ -37,6 +37,34 @@ from .tools import _Save_space, _Remove_emptys, _Extract_fits, _Print_buff, save
 
 #     return wcsItem
 
+_CUT_WRITE_JOBS = None
+
+
+def _write_one_cut(k):
+    processor, (eph, cutFolder, base, corner, cutSize) = _CUT_WRITE_JOBS[k]
+    processor._write_cut_asteroids(eph, cutFolder, base, corner, cutSize)
+    return k
+
+
+def _write_cuts_parallel(processor, jobs):
+    """Write per-cut asteroid outputs in a forked pool sized to the job's CPUs (the subsets reach
+    the workers through fork, not pickling)."""
+    global _CUT_WRITE_JOBS
+    import multiprocessing
+    from .asteroid_prediction import _available_cpus
+    _CUT_WRITE_JOBS = [(processor, j) for j in jobs]
+    n_workers = max(1, min(len(jobs), _available_cpus()))
+    try:
+        if n_workers == 1:
+            for k in range(len(jobs)):
+                _write_one_cut(k)
+        else:
+            with multiprocessing.get_context("fork").Pool(n_workers) as pool:
+                pool.map(_write_one_cut, range(len(jobs)))
+    finally:
+        _CUT_WRITE_JOBS = None
+
+
 def _cut_properties(wcsItem,n,overlap): 
 
         intervals = 2048/n
@@ -556,29 +584,153 @@ class DataProcessor():
                 print(f'Cannot predict asteroids for Cam {cam} Ccd {ccd} Cut {cut}{part_label}: {e}')
                 continue
 
-            # store x,y local to the cut (matching the cut TPF's own pixel indexing),
-            # not full-CCD, so results line up directly with the cut's reduced data
-            if len(ephemeris):
-                ephemeris['x'] -= cut_corner[0]
-                ephemeris['y'] -= cut_corner[1]
-                in_fov = ephemeris['x'].between(0,2*cutSize) & ephemeris['y'].between(0,2*cutSize)
-            else:
-                in_fov = ephemeris.index
-
-            # every asteroid output except the asteroids.txt marker (checked directly in the
-            # cut folder, matching cut.txt/reduced.txt's convention) lives in its own
-            # subdirectory rather than cluttering the cut folder alongside everything else
-            _Save_space(f'{cutFolder}/asteroids')
-            save_table(ephemeris,f'{cutFolder}/asteroids/{base}_Asteroids.csv')
-            plot_asteroid_trails(ephemeris[in_fov],f'{cutFolder}/asteroids/{base}_AsteroidTrails.png',footprint_size=2*cutSize)
-
-            with open(f'{cutFolder}/asteroids.txt', 'w') as file:
-                file.write('Predicted!')
+            self._write_cut_asteroids(ephemeris, cutFolder, base, cut_corner, cutSize)
 
             if self.verbose > 0:
                 n_tracks = ephemeris['designation'].nunique() if len(ephemeris) else 0
                 print(f'Cam {cam} CCD {ccd} Cut {cut}{part_label} asteroid prediction complete '
                       f'({n_tracks} tracks found).')
+                print('\n')
+
+    def _write_cut_asteroids(self, ephemeris, cutFolder, base, cut_corner, cutSize):
+        """Write one cut's asteroid ephemeris, trail plot and asteroids.txt marker -- shared by the
+        per-cut and the CCD-level prediction so both produce identical files."""
+        from .asteroid_prediction import plot_asteroid_trails
+
+        # store x,y local to the cut (matching the cut TPF's own pixel indexing),
+        # not full-CCD, so results line up directly with the cut's reduced data
+        if len(ephemeris):
+            ephemeris['x'] -= cut_corner[0]
+            ephemeris['y'] -= cut_corner[1]
+            in_fov = ephemeris['x'].between(0,2*cutSize) & ephemeris['y'].between(0,2*cutSize)
+        else:
+            in_fov = ephemeris.index
+
+        # every asteroid output except the asteroids.txt marker (checked directly in the
+        # cut folder, matching cut.txt/reduced.txt's convention) lives in its own
+        # subdirectory rather than cluttering the cut folder alongside everything else
+        _Save_space(f'{cutFolder}/asteroids')
+        save_table(ephemeris,f'{cutFolder}/asteroids/{base}_Asteroids.csv')
+        plot_asteroid_trails(ephemeris[in_fov],f'{cutFolder}/asteroids/{base}_AsteroidTrails.png',footprint_size=2*cutSize)
+
+        with open(f'{cutFolder}/asteroids.txt', 'w') as file:
+            file.write('Predicted!')
+
+    def predict_asteroids_ccd(self,cam,ccd,n,cuts=None,part=False):
+        """
+        Asteroid prediction for a whole CCD at once, written out per cut in exactly the per-cut
+        format (predict_asteroids). One catalogue pass and one ASSIST integration per object over
+        every frame it spends on the CCD, instead of once per cut it crosses: on Sector 44 Cam1
+        Ccd2 6.0 min against ~93 min for its 64 cut jobs (15.6x), identical positions (<= 0.008
+        arcsec), and more complete -- it also catches fast near-Earth objects that cross a single
+        cut between the coarse samples (2021 UQ: 21.8 deg/day, V = 16.8).
+
+        The footprint is a circle enclosing every cut's own circle, over the union of the cuts'
+        frame times. Each cut then gets the rows inside its own circle at its own frame times,
+        with 'frame' re-indexed to the cut's own frame order and x,y local to the cut.
+
+        ------
+        Inputs
+        ------
+        cam, ccd : int
+        n : int
+            n**2 cuts have been made
+        cuts : list of int, optional
+            cuts to write (default all n**2); the prediction covers the whole CCD regardless
+        part : bool
+        """
+        import lightkurve as lk
+        import pandas as pd
+        from astropy.io import fits
+        from astropy.wcs import WCS
+        from .asteroid_prediction import predict_asteroids_for_footprint
+
+        cuts = list(range(1, n**2 + 1)) if cuts is None else list(cuts)
+        try:
+            cutCorners, _, cutCentreCoords, cutSize = self.find_cuts(cam=cam,ccd=ccd,n=n,plot=False,verbose=0)
+        except:
+            print('Something wrong with finding cuts!')
+            return
+
+        file_path = f'{self.path}/Cam{cam}/Ccd{ccd}'
+        wcs_path = f'{file_path}/wcs/ref/corrected.fits'
+        if not os.path.exists(wcs_path):
+            print('No corrected WCS found -- run fix_wcs first!')
+            return
+        with fits.open(wcs_path) as f:
+            wcsItem = WCS(f[1].header)
+
+        # each cut's own circle, as predict_asteroids: half the cut diagonal
+        radius_deg = cutSize * np.sqrt(2) * 21.0 / 3600.0
+        cen = np.radians(np.asarray(cutCentreCoords, dtype=float))
+        uv = np.column_stack([np.cos(cen[:, 1]) * np.cos(cen[:, 0]), np.cos(cen[:, 1]) * np.sin(cen[:, 0]), np.sin(cen[:, 1])])
+        mid = uv.mean(axis=0)
+        mid /= np.linalg.norm(mid)
+        ccd_ra = np.degrees(np.arctan2(mid[1], mid[0])) % 360
+        ccd_dec = np.degrees(np.arcsin(mid[2]))
+        ccd_radius = float(np.degrees(np.arccos(np.clip(uv @ mid, -1, 1))).max() + radius_deg)
+
+        def _sep_deg(ra, dec, ra0, dec0):
+            r, d, r0, d0 = np.radians(ra), np.radians(dec), np.radians(ra0), np.radians(dec0)
+            return np.degrees(np.arccos(np.clip(np.sin(d) * np.sin(d0) + np.cos(d) * np.cos(d0) * np.cos(r - r0), -1, 1)))
+
+        for i in range(2 if part else 1):
+            part_label = f' Part {i+1}' if part else ''
+            cut_mjds = {}
+            for cut in cuts:
+                cutFolder = f'{file_path}/Part{i+1}/Cut{cut}of{n**2}' if part else f'{file_path}/Cut{cut}of{n**2}'
+                base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
+                cutPath = f'{cutFolder}/{base}.fits'
+                times_path = f'{cutFolder}/{base}_Times.npy'
+                if os.path.exists(cutPath):
+                    cut_mjds[cut] = np.asarray(lk.read(cutPath).time.mjd, dtype=float)
+                elif os.path.exists(times_path):
+                    cut_mjds[cut] = np.load(times_path)
+                else:
+                    print(f'No cut or reduced times found to predict asteroids for '
+                          f'(Cam {cam} Ccd {ccd} Cut {cut}{part_label})!')
+            if not cut_mjds:
+                continue
+            mjd = np.unique(np.concatenate(list(cut_mjds.values())))
+
+            if self.verbose > 0:
+                print(f'Predicting Asteroids for Cam {cam} CCD {ccd}{part_label} ({len(cut_mjds)} cuts, '
+                      f'{len(mjd)} frames, footprint radius {ccd_radius:.2f} deg)')
+            try:
+                # allow_download=False: SLURM compute nodes have no internet access (see predict_asteroids)
+                ephemeris = predict_asteroids_for_footprint(
+                    ccd_ra, ccd_dec, ccd_radius, mjd.min(), mjd.max(), mjd, wcsItem,
+                    data_dir=f'{self.data_path}/mpc', allow_download=False)
+            except RuntimeError as e:
+                print(f'Cannot predict asteroids for Cam {cam} Ccd {ccd}{part_label}: {e}')
+                continue
+
+            # split into cuts here (vectorised), then write the cuts in parallel: writing 64 Parquet
+            # files and trail plots one after another took twice as long as the prediction itself
+            jobs = []
+            for cut, cmjd in cut_mjds.items():
+                cutFolder = f'{file_path}/Part{i+1}/Cut{cut}of{n**2}' if part else f'{file_path}/Cut{cut}of{n**2}'
+                base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
+                ra0, dec0 = cutCentreCoords[cut-1]
+                # exact matching, no rounding: each row's 'frame' indexes the union array `mjd` the
+                # prediction was given, and mjd's values are the cuts' own (np.unique keeps them
+                # bit-for-bit). Rounding to 8 dp dropped ~0.07% of rows at rounding boundaries.
+                frame_of = {float(t): k for k, t in enumerate(cmjd)}
+                if len(ephemeris):
+                    sel = _sep_deg(ephemeris['ra'].values, ephemeris['dec'].values, ra0, dec0) <= radius_deg
+                    eph = ephemeris[sel].copy()
+                    eph['frame'] = pd.Series(mjd[eph['frame'].values.astype(int)], index=eph.index).map(frame_of)
+                    eph = eph[eph['frame'].notna()].copy()
+                    eph['frame'] = eph['frame'].astype(int)
+                    eph = eph.sort_values(['designation', 'frame']).reset_index(drop=True)
+                else:
+                    eph = ephemeris.copy()
+                jobs.append((eph, cutFolder, base, cutCorners[cut-1], cutSize))
+            _write_cuts_parallel(self, jobs)
+            if self.verbose > 0:
+                n_tracks = ephemeris['designation'].nunique() if len(ephemeris) else 0
+                print(f'Cam {cam} CCD {ccd}{part_label} asteroid prediction complete '
+                      f'({n_tracks} tracks over the CCD, written to {len(cut_mjds)} cuts).')
                 print('\n')
 
     def _reduce_part_cuts(self,cam,ccd,n,cut,filepath):

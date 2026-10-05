@@ -605,8 +605,9 @@ class Tessellate():
             # FFIs/sector (30min vs 10min cadence, same ~27-day window) is the actual driver of
             # both stages' runtime (precise_ephemeris's per-frame loop; one PSF fit per frame
             # per track), a ~0.33x ratio -- not itself benchmarked on a primary-mission sector
-            predict_asteroids_time_sug = '5:00'
-            predict_asteroids_cpu_sug = '8'
+            # whole-CCD jobs (predict_asteroids_ccd); time is set per CCD (_predict_asteroids_time_for_ccd)
+            predict_asteroids_time_sug = '15:00'
+            predict_asteroids_cpu_sug = '16'
             predict_asteroids_mem_req = 24
 
             reduce_time_sug = '30:00'
@@ -653,9 +654,11 @@ class Tessellate():
             # 3 min / 3.6GB peak (Cam1 Ccd1 Cut57, 54 crossing tracks, 215 stage-2
             # survivors -- a genuinely dense, near-ecliptic cut) with cpu_sug=8 at ~70%
             # average utilisation, vs. the previous unbenchmarked 30:00/128G guess
-            predict_asteroids_time_sug = '10:00'
-            predict_asteroids_cpu_sug = '8'
-            predict_asteroids_mem_req = 24
+            # whole-CCD jobs (predict_asteroids_ccd): Sector 44 Cam1 Ccd2 took 6.0 min on 16 CPUs,
+            # 12.7 GB peak (36M ephemeris rows); time is set per CCD (_predict_asteroids_time_for_ccd)
+            predict_asteroids_time_sug = '30:00'
+            predict_asteroids_cpu_sug = '16'
+            predict_asteroids_mem_req = 48
 
             # reduce_time_sug = '1:15:00'
             # reduce_cpu_sug = '32'
@@ -710,9 +713,10 @@ class Tessellate():
             # (200sec vs 10min cadence, same ~27-day window), a ~3.3x ratio, the actual driver
             # of both stages' runtime (precise_ephemeris's per-frame loop; one PSF fit per
             # frame per track)
-            predict_asteroids_time_sug = '30:00'
+            # whole-CCD jobs (predict_asteroids_ccd): ~3.3x the 10-min-cadence frames
+            predict_asteroids_time_sug = '1:30:00'
             predict_asteroids_cpu_sug = '16'
-            predict_asteroids_mem_req = 72
+            predict_asteroids_mem_req = 160
 
             reduce_time_sug = '3:00:00'
             reduce_cpu_sug = '32'
@@ -2678,12 +2682,18 @@ export PYTHONUNBUFFERED=1\n\
             if (self.overwrite == 'all') | ('asteroids' in self.overwrite):
                 delete_files('asteroids',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts,part=self.part)
 
+        # One job per CCD (DataProcessor.predict_asteroids_ccd): it predicts the whole CCD once and
+        # writes every cut's ephemeris in the per-cut format -- 15.6x less CPU than a job per cut on
+        # Sector 44 Cam1 Ccd2, identical positions, and it catches fast near-Earth objects that a
+        # single cut's coarse sampling misses. Each cut key still gets a status entry, pointing at
+        # its CCD's job, so asteroid_lightcurves() waits per cut exactly as before.
         prediction_status = {}
         for cam in self.cam:
             for ccd in self.ccd:
                 print(_Print_buff(60,f'Predicting Asteroids for Sector{self.sector} Cam{cam} Ccd{ccd}'))
                 print('\n')
 
+                todo = []
                 for cut in self.cuts:
                     prediction_status[(cam, ccd, cut)] = {'status': None, 'job_id': None, 'job_time': None}
                     if self.part:
@@ -2693,40 +2703,41 @@ export PYTHONUNBUFFERED=1\n\
                     else:
                         asteroids_check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/asteroids.txt'
                         done = os.path.exists(asteroids_check)
-
                     if done:
-                        print(f'Cam {cam} CCD {ccd} cut {cut} asteroids already predicted!')
-                        print('\n')
                         prediction_status[(cam, ccd, cut)]['status'] = 'COMPLETED'
                     else:
-                        cut_time = self._predict_asteroids_time_for_cut(cam,ccd,cut)
-                        job_id = self._cut_predict_asteroids(cam=cam,ccd=ccd,cut=cut,time=cut_time)
-                        prediction_status[(cam, ccd, cut)]['status'] = 'INCOMPLETE'
-                        prediction_status[(cam, ccd, cut)]['job_id'] = job_id
-                        prediction_status[(cam, ccd, cut)]['job_time'] = cut_time
+                        todo.append(cut)
+
+                if not todo:
+                    print(f'Cam {cam} CCD {ccd} asteroids already predicted for every requested cut!')
+                    print('\n')
+                    continue
+                ccd_time = self._predict_asteroids_time_for_ccd(cam,ccd)
+                job_id = self._ccd_predict_asteroids(cam=cam,ccd=ccd,cuts=todo,time=ccd_time)
+                for cut in todo:
+                    prediction_status[(cam, ccd, cut)].update(status='INCOMPLETE', job_id=job_id, job_time=ccd_time)
 
         return prediction_status
 
-    def _cut_predict_asteroids(self,cam,ccd,cut,time=None):
+    def _ccd_predict_asteroids(self,cam,ccd,cuts,time=None):
 
-        # -- Create python file for predicting asteroids on a cut -- #
-        print(f'Creating Asteroid Prediction Python File for Sector{self.sector} Cam{cam} Ccd{ccd} Cut{cut}')
+        # -- Create python file for predicting asteroids on a whole CCD -- #
+        print(f'Creating Asteroid Prediction Python File for Sector{self.sector} Cam{cam} Ccd{ccd} ({len(cuts)} cuts)')
         python_text = f"\
 from tessellate import DataProcessor\n\
 \n\
 part = {self.part}\n\
 processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=2)\n\
-processor.predict_asteroids(cam={cam},ccd={ccd},n={self.n},cut={cut},part=part)"
+processor.predict_asteroids_ccd(cam={cam},ccd={ccd},n={self.n},cuts={list(cuts)},part=part)"
 
-        with open(f"{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py", "w") as python_file:
+        with open(f"{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}_script.py", "w") as python_file:
             python_file.write(python_text)
 
         # -- Create bash file to submit job -- #
-        #print('Creating Asteroid Prediction Batch File')
         batch_text = f'\
 #!/bin/bash\n\
 #\n\
-#SBATCH --job-name=TESS_S{self.sector}_Cam{cam}_Ccd{ccd}_Cut{cut}_PredictAsteroids\n\
+#SBATCH --job-name=TESS_S{self.sector}_Cam{cam}_Ccd{ccd}_PredictAsteroids\n\
 #SBATCH --output={self.job_output_path}/tessellate_asteroid_prediction_logs/%A_%x_job_output.txt\n\
 #SBATCH --error={self.job_output_path}/tessellate_asteroid_prediction_logs/%A_%x_errors.txt\n\
 #\n\
@@ -2737,12 +2748,12 @@ processor.predict_asteroids(cam={cam},ccd={ccd},n={self.n},cut={cut},part=part)"
 #SBATCH --account=oz335\n\
 \n\
 export PYTHONUNBUFFERED=1\n\
-{sys.executable} {self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
+{sys.executable} {self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}_script.py'
 
-        with open(f"{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
+        with open(f"{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}_script.sh", "w") as batch_file:
             batch_file.write(batch_text)
 
-        job_id = _Submit_sbatch(f'{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh')
+        job_id = _Submit_sbatch(f'{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}_script.sh')
         print(f'Submitted batch job {job_id}')
         print('\n')
 
@@ -2943,10 +2954,16 @@ export PYTHONUNBUFFERED=1\n\
                         s = total % 60
                         result = f"{h}:{m:02}:{s:02}"
 
-                        print(f'Restarting Asteroid Prediction for Cam {cam} CCD {ccd} Cut {cut} with new time limit of {result}')
-                        job_id = self._cut_predict_asteroids(cam=cam,ccd=ccd,cut=cut,time=result)
-                        prediction_status[key]['job_id'] = job_id
-                        prediction_status[key]['job_time'] = result
+                        # one prediction job serves every cut of its CCD: resubmit it once, and point
+                        # all of that CCD's still-waiting cuts at the new job
+                        old_id = prediction_status[key]['job_id']
+                        waiting = [k for k, v in prediction_status.items()
+                                   if k[:2] == (cam, ccd) and v['job_id'] == old_id and v['status'] != 'COMPLETED']
+                        print(f'Restarting Asteroid Prediction for Cam {cam} CCD {ccd} ({len(waiting)} cuts) with new time limit of {result}')
+                        job_id = self._ccd_predict_asteroids(cam=cam,ccd=ccd,cuts=[k[2] for k in waiting],time=result)
+                        for k in waiting:
+                            prediction_status[k]['job_id'] = job_id
+                            prediction_status[k]['job_time'] = result
 
                     elif job_status == 'COMPLETED':
                         prediction_status[key]['status'] = job_status
@@ -3059,29 +3076,31 @@ export PYTHONUNBUFFERED=1\n\
     # low-dec cut vs 215 on the cut the original flat 10:00 was benchmarked from). Tiers
     # include +15min margin on top of what the raw data implied, per direct instruction
     # after the first dec-based relaunch still needed some 60-min follow-up retries.
-    def _predict_asteroids_time_for_cut(self,cam,ccd,cut):
+    def _predict_asteroids_time_for_ccd(self,cam,ccd):
+        """Time limit for a whole-CCD prediction job. Asteroid density follows ecliptic latitude, and
+        run time the frame count: measured 6.0 min on 16 CPUs for Sector 44 Cam1 Ccd2 (an
+        ecliptic-pointing sector, ~3100 frames, 15,555 objects). Limits allow ~5x that at the
+        ecliptic, scaled by each mission tier's frames (~1200 / ~3600 / ~12000); a timeout is
+        resubmitted with 30 more minutes by asteroid_lightcurves()."""
         try:
             from astropy.io import fits
             from astropy.wcs import WCS
-            from .dataprocessor import DataProcessor
-            processor = DataProcessor(sector=self.sector,data_path=self.data_path,verbose=0)
-            cutCorners, _, _, _ = processor.find_cuts(cam=cam,ccd=ccd,n=self.n,plot=False,verbose=0)
-            x0, y0 = cutCorners[cut-1]
-            wcs_path = f'{processor.path}/Cam{cam}/Ccd{ccd}/wcs/ref/corrected.fits'
-            with fits.open(wcs_path) as f:
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            with fits.open(f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/wcs/ref/corrected.fits') as f:
                 wcsItem = WCS(f[1].header)
-            cut_side = 2078 / self.n
-            ra, dec = wcsItem.all_pix2world(x0 + cut_side/2, y0 + cut_side/2, 0)
-            abs_dec = abs(float(dec))
+            ra, dec = wcsItem.all_pix2world(44 + 1024, 1024, 0)
+            beta = abs(SkyCoord(ra=float(ra) * u.deg, dec=float(dec) * u.deg).barycentrictrueecliptic.lat.deg)
         except Exception:
             return self.predict_asteroids_time
 
-        if abs_dec < 20:
-            return "1:00:00"
-        elif abs_dec < 30:
-            return "45:00"
-        else:
-            return "12:00"
+        minutes = 30 if beta < 15 else 20 if beta < 30 else 10
+        if self.sector in range(1, 27):
+            minutes *= 0.5
+        elif self.sector >= 56:
+            minutes *= 3
+        minutes = int(np.ceil(minutes))
+        return f"{minutes // 60}:{minutes % 60:02}:00"
 
     def _cut_asteroid_lightcurves(self,cam,ccd,cut):
 

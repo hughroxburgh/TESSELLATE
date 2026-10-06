@@ -37,32 +37,70 @@ from .tools import _Save_space, _Remove_emptys, _Extract_fits, _Print_buff, save
 
 #     return wcsItem
 
-_CUT_WRITE_JOBS = None
+CUT_MARGIN_PX = 5      # rows kept beyond each cut's pixel square, for position offsets at its edge
+_CUT_WRITE = None      # (processor, CCD ephemeris, per-cut jobs), reaching forked workers without pickling
+
+
+def _ccd_ephemeris_for_cuts(ephemeris, mjd, cutSize):
+    """The CCD-level ephemeris prepared for splitting into cuts: sorted once by (designation, frame),
+    so every cut's rows come out already in that order, with designations categorical so forked
+    workers never touch (and copy-on-write) millions of Python string objects."""
+    import pandas as pd
+    df = ephemeris.reset_index(drop=True)
+    designation = pd.Categorical(df['designation'])      # categories sorted, as the old string sort
+    order = np.lexsort((df['frame'].to_numpy(), designation.codes))
+    df = df.iloc[order].reset_index(drop=True)
+    df['designation'] = designation[order]
+    return dict(df=df, x=df['x'].to_numpy(), y=df['y'].to_numpy(), frame=df['frame'].to_numpy().astype(np.int64),
+                mjd=mjd, size=cutSize)
+
+
+def _cut_ephemeris(ccd, corner, cmjd):
+    """One cut's rows of the CCD ephemeris: inside its pixel square plus CUT_MARGIN_PX, at the cut's
+    own frame times, with 'frame' re-indexed to the cut's frame order."""
+    x0, y0 = corner
+    lo_x, hi_x = x0 - CUT_MARGIN_PX, x0 + 2 * ccd['size'] + CUT_MARGIN_PX
+    lo_y, hi_y = y0 - CUT_MARGIN_PX, y0 + 2 * ccd['size'] + CUT_MARGIN_PX
+    # 'frame' indexes the union of the cuts' times; the cut's own times are members of it bit for bit
+    # (np.unique keeps them), so an exact lookup maps union frames to cut frames, -1 elsewhere
+    lut = np.full(len(ccd['mjd']), -1, dtype=np.int64)
+    lut[np.searchsorted(ccd['mjd'], cmjd)] = np.arange(len(cmjd))
+    cut_frame = lut[ccd['frame']]
+    x, y = ccd['x'], ccd['y']
+    keep = np.flatnonzero((x >= lo_x) & (x <= hi_x) & (y >= lo_y) & (y <= hi_y) & (cut_frame >= 0))
+    eph = ccd['df'].iloc[keep].reset_index(drop=True)
+    eph['frame'] = cut_frame[keep]
+    eph['designation'] = eph['designation'].astype(str)
+    return eph
 
 
 def _write_one_cut(k):
-    processor, (eph, cutFolder, base, corner, cutSize) = _CUT_WRITE_JOBS[k]
-    processor._write_cut_asteroids(eph, cutFolder, base, corner, cutSize)
+    processor, ccd, jobs = _CUT_WRITE
+    corner, cmjd, cutFolder, base, plot_trails = jobs[k]
+    processor._write_cut_asteroids(_cut_ephemeris(ccd, corner, cmjd), cutFolder, base, corner, ccd['size'],
+                                   plot_trails)
     return k
 
 
-def _write_cuts_parallel(processor, jobs):
-    """Write per-cut asteroid outputs in a forked pool sized to the job's CPUs (the subsets reach
-    the workers through fork, not pickling)."""
-    global _CUT_WRITE_JOBS
+def _write_cuts_parallel(processor, ccd, jobs):
+    """Split the CCD ephemeris into cuts and write them in a forked pool sized to the job's CPUs.
+    ProcessPoolExecutor, not multiprocessing.Pool: a worker killed (e.g. for memory) raises
+    BrokenProcessPool instead of leaving the job waiting forever on the rest."""
+    global _CUT_WRITE
     import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
     from .asteroid_prediction import _available_cpus
-    _CUT_WRITE_JOBS = [(processor, j) for j in jobs]
+    _CUT_WRITE = (processor, ccd, jobs)
     n_workers = max(1, min(len(jobs), _available_cpus()))
     try:
         if n_workers == 1:
             for k in range(len(jobs)):
                 _write_one_cut(k)
         else:
-            with multiprocessing.get_context("fork").Pool(n_workers) as pool:
-                pool.map(_write_one_cut, range(len(jobs)))
+            with ProcessPoolExecutor(max_workers=n_workers, mp_context=multiprocessing.get_context("fork")) as pool:
+                list(pool.map(_write_one_cut, range(len(jobs))))
     finally:
-        _CUT_WRITE_JOBS = None
+        _CUT_WRITE = None
 
 
 def _cut_properties(wcsItem,n,overlap): 
@@ -496,7 +534,7 @@ class DataProcessor():
                 print(f'Cam {cam} CCD {ccd} cut {cut} complete.')
                 print('\n')
 
-    def predict_asteroids(self,cam,ccd,n,cut,part=False):
+    def predict_asteroids(self,cam,ccd,n,cut,part=False,plot_trails=False):
         """
         Predicts every catalogued minor planet (from MPCORB) crossing this
         cut's footprint at any point during its observing window, using
@@ -578,7 +616,7 @@ class DataProcessor():
                 print(f'Cannot predict asteroids for Cam {cam} Ccd {ccd} Cut {cut}{part_label}: {e}')
                 continue
 
-            self._write_cut_asteroids(ephemeris, cutFolder, base, cut_corner, cutSize)
+            self._write_cut_asteroids(ephemeris, cutFolder, base, cut_corner, cutSize, plot_trails)
 
             if self.verbose > 0:
                 n_tracks = ephemeris['designation'].nunique() if len(ephemeris) else 0
@@ -586,9 +624,10 @@ class DataProcessor():
                       f'({n_tracks} tracks found).')
                 print('\n')
 
-    def _write_cut_asteroids(self, ephemeris, cutFolder, base, cut_corner, cutSize):
-        """Write one cut's asteroid ephemeris, trail plot and asteroids.txt marker -- shared by the
-        per-cut and the CCD-level prediction so both produce identical files."""
+    def _write_cut_asteroids(self, ephemeris, cutFolder, base, cut_corner, cutSize, plot_trails=False):
+        """Write one cut's asteroid ephemeris, asteroids.txt marker and, if plot_trails, the trail plot
+        (8 s per cut with ~1000 tracks, so off by default) -- shared by the per-cut and the
+        CCD-level prediction so both produce identical files."""
         from .asteroid_prediction import plot_asteroid_trails
 
         # store x,y local to the cut (matching the cut TPF's own pixel indexing),
@@ -605,12 +644,13 @@ class DataProcessor():
         # subdirectory rather than cluttering the cut folder alongside everything else
         _Save_space(f'{cutFolder}/asteroids')
         save_table(ephemeris,f'{cutFolder}/asteroids/{base}_Asteroids.csv')
-        plot_asteroid_trails(ephemeris[in_fov],f'{cutFolder}/asteroids/{base}_AsteroidTrails.png',footprint_size=2*cutSize)
+        if plot_trails:
+            plot_asteroid_trails(ephemeris[in_fov],f'{cutFolder}/asteroids/{base}_AsteroidTrails.png',footprint_size=2*cutSize)
 
         with open(f'{cutFolder}/asteroids.txt', 'w') as file:
             file.write('Predicted!')
 
-    def predict_asteroids_ccd(self,cam,ccd,n,cuts=None,part=False):
+    def predict_asteroids_ccd(self,cam,ccd,n,cuts=None,part=False,plot_trails=False):
         """
         Asteroid prediction for a whole CCD at once, written out per cut in exactly the per-cut
         format (predict_asteroids). One catalogue pass and one ASSIST integration per object over
@@ -620,8 +660,11 @@ class DataProcessor():
         cut between the coarse samples (2021 UQ: 21.8 deg/day, V = 16.8).
 
         The footprint is a circle enclosing every cut's own circle, over the union of the cuts'
-        frame times. Each cut then gets the rows inside its own circle at its own frame times,
-        with 'frame' re-indexed to the cut's own frame order and x,y local to the cut.
+        frame times. Each cut then gets the rows inside its pixel square plus CUT_MARGIN_PX (rows
+        beyond it can't be measured in the cut, and were 38% of what the cuts' circles kept) at
+        its own frame times, with 'frame' re-indexed to the cut's own frame order and x,y local
+        to the cut. The split runs in the write workers: done serially it took 315 s of a dense
+        CCD's run (Sector 44 Cam 4 Ccd 3, 66 M rows), 81% of it angular distances.
 
         ------
         Inputs
@@ -663,10 +706,6 @@ class DataProcessor():
         ccd_dec = np.degrees(np.arcsin(mid[2]))
         ccd_radius = float(np.degrees(np.arccos(np.clip(uv @ mid, -1, 1))).max() + radius_deg)
 
-        def _sep_deg(ra, dec, ra0, dec0):
-            r, d, r0, d0 = np.radians(ra), np.radians(dec), np.radians(ra0), np.radians(dec0)
-            return np.degrees(np.arccos(np.clip(np.sin(d) * np.sin(d0) + np.cos(d) * np.cos(d0) * np.cos(r - r0), -1, 1)))
-
         for i in range(2 if part else 1):
             part_label = f' Part {i+1}' if part else ''
             cut_mjds = {}
@@ -696,30 +735,18 @@ class DataProcessor():
                 print(f'Cannot predict asteroids for Cam {cam} Ccd {ccd}{part_label}: {e}')
                 continue
 
-            # split into cuts here (vectorised), then write the cuts in parallel: writing 64 Parquet
-            # files and trail plots one after another took twice as long as the prediction itself
+            # split into cuts and write them in parallel workers (_write_cuts_parallel)
+            n_tracks = ephemeris['designation'].nunique() if len(ephemeris) else 0
+            ccd_eph = _ccd_ephemeris_for_cuts(ephemeris, mjd, cutSize)
+            del ephemeris
             jobs = []
             for cut, cmjd in cut_mjds.items():
                 cutFolder = f'{file_path}/Part{i+1}/Cut{cut}of{n**2}' if part else f'{file_path}/Cut{cut}of{n**2}'
                 base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
-                ra0, dec0 = cutCentreCoords[cut-1]
-                # exact matching, no rounding: each row's 'frame' indexes the union array `mjd` the
-                # prediction was given, and mjd's values are the cuts' own (np.unique keeps them
-                # bit-for-bit). Rounding to 8 dp dropped ~0.07% of rows at rounding boundaries.
-                frame_of = {float(t): k for k, t in enumerate(cmjd)}
-                if len(ephemeris):
-                    sel = _sep_deg(ephemeris['ra'].values, ephemeris['dec'].values, ra0, dec0) <= radius_deg
-                    eph = ephemeris[sel].copy()
-                    eph['frame'] = pd.Series(mjd[eph['frame'].values.astype(int)], index=eph.index).map(frame_of)
-                    eph = eph[eph['frame'].notna()].copy()
-                    eph['frame'] = eph['frame'].astype(int)
-                    eph = eph.sort_values(['designation', 'frame']).reset_index(drop=True)
-                else:
-                    eph = ephemeris.copy()
-                jobs.append((eph, cutFolder, base, cutCorners[cut-1], cutSize))
-            _write_cuts_parallel(self, jobs)
+                jobs.append((cutCorners[cut-1], cmjd, cutFolder, base, plot_trails))
+            _write_cuts_parallel(self, ccd_eph, jobs)
+            del ccd_eph
             if self.verbose > 0:
-                n_tracks = ephemeris['designation'].nunique() if len(ephemeris) else 0
                 print(f'Cam {cam} CCD {ccd}{part_label} asteroid prediction complete '
                       f'({n_tracks} tracks over the CCD, written to {len(cut_mjds)} cuts).')
                 print('\n')

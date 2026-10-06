@@ -675,7 +675,7 @@ class Tessellate():
             # lower-ecliptic-latitude CCD). Widened with real margin rather than re-trimming.
             # Now also parallelised across tracks -- cpu scaled back up (see primary tier),
             # time halved as a conservative not-yet-benchmarked-in-parallel estimate, and
-            # _cut_asteroid_lightcurves additionally scales both per-cut by real track count
+            # _ccd_asteroid_lightcurves additionally scales both per-cut by real track count
             asteroid_lightcurves_time_sug = '15:00'
             asteroid_lightcurves_cpu_sug = '8'
             asteroid_lightcurves_mem_req = 28
@@ -2882,18 +2882,19 @@ export PYTHONUNBUFFERED=1\n\
         """
         Build Asteroid Lightcurves!
 
-        Forced aperture + PSF photometry, pixel-phase detrending, star-
-        contamination flagging, and shift-and-stack for every asteroid
-        predict_asteroids() found crossing each cut, using the REDUCED
-        flux cube -- runs after reduce(). Waits for predict_asteroids()'s
-        own jobs to actually finish (via prediction_status, its returned
-        status dict) before submitting a cut's lightcurves job, the same
-        way calibrate() waits on reduction_status. Pass prediction_status
-        =False to skip waiting entirely (predictions already exist / are
-        being managed separately).
+        Forced PSF photometry, pixel-phase detrending, star-contamination flagging and the
+        stacking summary for every asteroid predict_asteroids() found crossing each cut, using the
+        REDUCED flux cube -- runs after reduce(). One job per CCD (DataProcessor.
+        asteroid_lightcurves_ccd) stages each cut's tables, and one merge job per sector, run once
+        every CCD job has succeeded, folds them into the designation-sorted store
+        (asteroid_store.merge_sector). Waits for predict_asteroids()'s own jobs to finish (via
+        prediction_status, its returned status dict) before submitting a CCD's job. Pass
+        prediction_status=False to skip waiting entirely (predictions already exist / are being
+        managed separately).
         """
 
         from datetime import timedelta
+        from .asteroid_store import staged_cuts
 
         _Save_space(f'{self.working_path}/asteroid_lightcurves_scripts')
 
@@ -2901,12 +2902,13 @@ export PYTHONUNBUFFERED=1\n\
             if (self.overwrite == 'all') | ('lightcurves' in self.overwrite):
                 delete_files('asteroid_lightcurves',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts,part=self.part)
 
-        lightcurve_status = {}
+        lightcurve_status = {}   # (cam, ccd) -> cuts still to build
         for cam in self.cam:
             for ccd in self.ccd:
                 print(_Print_buff(60,f'Building Asteroid Lightcurves for Sector{self.sector} Cam{cam} Ccd{ccd}'))
                 print('\n')
 
+                todo = []
                 for cut in self.cuts:
                     if self.part:
                         check1 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part1/Cut{cut}of{self.n**2}/asteroid_lightcurves.txt'
@@ -2915,74 +2917,85 @@ export PYTHONUNBUFFERED=1\n\
                     else:
                         check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/asteroid_lightcurves.txt'
                         done = os.path.exists(check)
+                    if not done:
+                        todo.append(cut)
 
-                    if done:
-                        print(f'Cam {cam} CCD {ccd} cut {cut} asteroid lightcurves already built!')
-                        print('\n')
-                    else:
-                        lightcurve_status[(cam, ccd, cut)] = 'INCOMPLETE'
+                if todo:
+                    lightcurve_status[(cam, ccd)] = todo
+                else:
+                    print(f'Cam {cam} CCD {ccd} asteroid lightcurves already built for every requested cut!')
+                    print('\n')
 
+        job_ids = []
         i = 0
         while len(lightcurve_status.keys()) > 0:
 
             for key in list(lightcurve_status.keys()):
-                cam, ccd, cut = key
-                if prediction_status == False or prediction_status[key]['status'] == 'COMPLETED':
-                    self._cut_asteroid_lightcurves(cam=cam,ccd=ccd,cut=cut)
+                cam, ccd = key
+                cuts = lightcurve_status[key]
+                waiting = [] if prediction_status == False else [
+                    cut for cut in cuts if prediction_status[(cam, ccd, cut)]['status'] != 'COMPLETED']
+                if not waiting:
+                    job_ids.append(self._ccd_asteroid_lightcurves(cam=cam,ccd=ccd,cuts=cuts))
+                    del(lightcurve_status[key])
+                    continue
+
+                # one prediction job serves every cut of its CCD
+                job_id = prediction_status[(cam, ccd, waiting[0])]['job_id']
+                job_status = _Check_job_status(job_id)
+                if job_status == 'FAILED':
+                    print(f'Asteroid Prediction Failed for Cam {cam} CCD {ccd}')
+                    print('\n')
                     del(lightcurve_status[key])
 
-                else:
-                    job_id = prediction_status[key]['job_id']
-                    job_status = _Check_job_status(job_id)
-                    if job_status == 'FAILED':
-                        print(f'Asteroid Prediction Failed for Cam {cam} CCD {ccd} Cut {cut}')
-                        print('\n')
-                        del(lightcurve_status[key])
-                    elif job_status == 'TIMEOUT':
-                        parts = list(map(int, prediction_status[key]['job_time'].split(':')))
-                        if len(parts) == 3:
-                            h, m, s = parts
-                        else:
-                            h = 0
-                            m, s = parts
+                elif job_status == 'TIMEOUT':
+                    parts = list(map(int, prediction_status[(cam, ccd, waiting[0])]['job_time'].split(':')))
+                    if len(parts) == 3:
+                        h, m, s = parts
+                    else:
+                        h = 0
+                        m, s = parts
 
-                        td = timedelta(hours=h, minutes=m, seconds=s)
-                        td += timedelta(minutes=30) # add 30 minutes to the job time
-                        total = int(td.total_seconds())
-                        h = total // 3600
-                        m = (total % 3600) // 60
-                        s = total % 60
-                        result = f"{h}:{m:02}:{s:02}"
+                    td = timedelta(hours=h, minutes=m, seconds=s)
+                    td += timedelta(minutes=30) # add 30 minutes to the job time
+                    total = int(td.total_seconds())
+                    h = total // 3600
+                    m = (total % 3600) // 60
+                    s = total % 60
+                    result = f"{h}:{m:02}:{s:02}"
 
-                        # one prediction job serves every cut of its CCD: resubmit it once, and point
-                        # all of that CCD's still-waiting cuts at the new job
-                        old_id = prediction_status[key]['job_id']
-                        waiting = [k for k, v in prediction_status.items()
-                                   if k[:2] == (cam, ccd) and v['job_id'] == old_id and v['status'] != 'COMPLETED']
-                        print(f'Restarting Asteroid Prediction for Cam {cam} CCD {ccd} ({len(waiting)} cuts) with new time limit of {result}')
-                        job_id = self._ccd_predict_asteroids(cam=cam,ccd=ccd,cuts=[k[2] for k in waiting],time=result)
-                        for k in waiting:
-                            prediction_status[k]['job_id'] = job_id
-                            prediction_status[k]['job_time'] = result
+                    # resubmit it once, and point all of that CCD's still-waiting cuts at the new job
+                    stale = [k for k, v in prediction_status.items()
+                             if k[:2] == (cam, ccd) and v['job_id'] == job_id and v['status'] != 'COMPLETED']
+                    print(f'Restarting Asteroid Prediction for Cam {cam} CCD {ccd} ({len(stale)} cuts) with new time limit of {result}')
+                    new_id = self._ccd_predict_asteroids(cam=cam,ccd=ccd,cuts=[k[2] for k in stale],time=result)
+                    for k in stale:
+                        prediction_status[k]['job_id'] = new_id
+                        prediction_status[k]['job_time'] = result
 
-                    elif job_status == 'COMPLETED':
-                        prediction_status[key]['status'] = job_status
+                elif job_status == 'COMPLETED':
+                    for k, v in prediction_status.items():
+                        if v['job_id'] == job_id:
+                            v['status'] = job_status
 
-                    elif job_status == 'UNKNOWN':
-                        # _Check_job_status already retries internally -- a residual UNKNOWN
-                        # here is rare but not worth crashing the whole driver over (one bad
-                        # cut shouldn't take down every other cut's already-submitted jobs);
-                        # just keep polling, same as PENDING/RUNNING
-                        pass
+                elif job_status == 'UNKNOWN':
+                    # _Check_job_status already retries internally -- a residual UNKNOWN
+                    # here is rare but not worth crashing the whole driver over (one bad
+                    # CCD shouldn't take down every other CCD's already-submitted jobs);
+                    # just keep polling, same as PENDING/RUNNING
+                    pass
 
-                    elif job_status not in ['RUNNING','PENDING','COMPLETING','CONFIGURING','SUSPENDED']:
-                        e = f'Job {job_id} for asteroid prediction of Cam {cam} CCD {ccd} Cut {cut} has unexpected status: {job_status}\n'
-                        raise ValueError(e)
+                elif job_status not in ['RUNNING','PENDING','COMPLETING','CONFIGURING','SUSPENDED']:
+                    e = f'Job {job_id} for asteroid prediction of Cam {cam} CCD {ccd} has unexpected status: {job_status}\n'
+                    raise ValueError(e)
 
             if prediction_status != False and len(lightcurve_status.keys()) > 0:
                 print('Waiting for Asteroid Predictions' + i*'.', end='\r')
                 sleep(120)
                 i += 1
+
+        if job_ids or staged_cuts(self.data_path, self.sector):
+            self._merge_asteroid_store(dependency=job_ids)
 
     # Final calibration, refit against the full completed Sector 32 run under the current code
     # (parallel forced photometry + KDTree-based flag_star_contamination) -- 50 completed jobs
@@ -3102,28 +3115,40 @@ export PYTHONUNBUFFERED=1\n\
         minutes = int(np.ceil(minutes))
         return f"{minutes // 60}:{minutes % 60:02}:00"
 
-    def _cut_asteroid_lightcurves(self,cam,ccd,cut):
+    def _lightcurves_resources_for_ccd(self,cam,ccd,cuts):
+        """A CCD job builds its cuts one after another: time is the sum of the per-cut estimates and
+        memory the largest of them."""
+        times, mems = [], []
+        for cut in cuts:
+            time, cpu, mem = self._lightcurves_resources_for_cut(cam,ccd,cut)
+            parts = list(map(int, str(time).split(':')))
+            h, m, s = [0] * (3 - len(parts)) + parts
+            times.append(3600 * h + 60 * m + s)
+            mems.append(mem)
+        total = sum(times)
+        return f"{total // 3600}:{(total % 3600) // 60:02}:{total % 60:02}", cpu, max(mems)
 
-        time, cpu, mem = self._lightcurves_resources_for_cut(cam,ccd,cut)
+    def _ccd_asteroid_lightcurves(self,cam,ccd,cuts):
 
-        # -- Create python file for building asteroid lightcurves on a cut -- #
-        print(f'Creating Asteroid Lightcurves Python File for Sector{self.sector} Cam{cam} Ccd{ccd} Cut{cut}')
+        time, cpu, mem = self._lightcurves_resources_for_ccd(cam,ccd,cuts)
+
+        # -- Create python file for building asteroid lightcurves on a whole CCD -- #
+        print(f'Creating Asteroid Lightcurves Python File for Sector{self.sector} Cam{cam} Ccd{ccd} ({len(cuts)} cuts)')
         python_text = f"\
 from tessellate import DataProcessor\n\
 \n\
 part = {self.part}\n\
 processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=2)\n\
-processor.asteroid_lightcurves(cam={cam},ccd={ccd},n={self.n},cut={cut},part=part)"
+processor.asteroid_lightcurves_ccd(cam={cam},ccd={ccd},n={self.n},cuts={list(cuts)},part=part)"
 
-        with open(f"{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py", "w") as python_file:
+        with open(f"{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}_script.py", "w") as python_file:
             python_file.write(python_text)
 
         # -- Create bash file to submit job -- #
-        #print('Creating Asteroid Lightcurves Batch File')
         batch_text = f'\
 #!/bin/bash\n\
 #\n\
-#SBATCH --job-name=TESS_S{self.sector}_Cam{cam}_Ccd{ccd}_Cut{cut}_AsteroidLightcurves\n\
+#SBATCH --job-name=TESS_S{self.sector}_Cam{cam}_Ccd{ccd}_AsteroidLightcurves\n\
 #SBATCH --output={self.job_output_path}/tessellate_asteroid_lightcurves_logs/%A_%x_job_output.txt\n\
 #SBATCH --error={self.job_output_path}/tessellate_asteroid_lightcurves_logs/%A_%x_errors.txt\n\
 #\n\
@@ -3134,15 +3159,56 @@ processor.asteroid_lightcurves(cam={cam},ccd={ccd},n={self.n},cut={cut},part=par
 #SBATCH --account=oz335\n\
 \n\
 export PYTHONUNBUFFERED=1\n\
-{sys.executable} {self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
+{sys.executable} {self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}_script.py'
 
-        with open(f"{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
+        with open(f"{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}_script.sh", "w") as batch_file:
             batch_file.write(batch_text)
 
-        #print('Submitting Asteroid Lightcurves Batch File')
-        job_id = _Submit_sbatch(f'{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh')
+        job_id = _Submit_sbatch(f'{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}_script.sh')
         print(f'Submitted batch job {job_id}')
         print('\n')
+
+        return job_id
+
+    def _merge_asteroid_store(self,dependency=()):
+        """Submit the sector's merge of staged lightcurves into the asteroid store, held until every
+        CCD job in dependency has succeeded (a failed CCD job leaves the merge pending; rerunning
+        the lightcurves resumes the missing cuts and submits a new merge)."""
+
+        python_text = f"\
+from tessellate.asteroid_store import merge_sector\n\
+\n\
+merge_sector('{self.data_path}', {self.sector})"
+
+        with open(f"{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}_merge_script.py", "w") as python_file:
+            python_file.write(python_text)
+
+        depend = f'#SBATCH --dependency=afterok:{":".join(map(str, dependency))}\n' if dependency else ''
+        batch_text = f'\
+#!/bin/bash\n\
+#\n\
+#SBATCH --job-name=TESS_S{self.sector}_MergeAsteroidStore\n\
+#SBATCH --output={self.job_output_path}/tessellate_asteroid_lightcurves_logs/%A_%x_job_output.txt\n\
+#SBATCH --error={self.job_output_path}/tessellate_asteroid_lightcurves_logs/%A_%x_errors.txt\n\
+#\n\
+#SBATCH --ntasks=1\n\
+#SBATCH --time=1:00:00\n\
+#SBATCH --cpus-per-task=4\n\
+#SBATCH --mem-per-cpu=16G\n\
+#SBATCH --account=oz335\n\
+{depend}\
+\n\
+export PYTHONUNBUFFERED=1\n\
+{sys.executable} {self.working_path}/asteroid_lightcurves_scripts/S{self.sector}_merge_script.py'
+
+        with open(f"{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}_merge_script.sh", "w") as batch_file:
+            batch_file.write(batch_text)
+
+        job_id = _Submit_sbatch(f'{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}_merge_script.sh')
+        print(f'Submitted merge job {job_id} for Sector {self.sector}' + (f' (after {len(dependency)} CCD jobs)' if dependency else ''))
+        print('\n')
+
+        return job_id
 
     def _cut_calibrate(self, cam, ccd, cut):
 

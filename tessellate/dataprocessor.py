@@ -897,7 +897,7 @@ class DataProcessor():
 
             del (tessreduce)
 
-    def asteroid_lightcurves(self,cam,ccd,n,cut,part=False):
+    def asteroid_lightcurves(self,cam,ccd,n,cut,part=False,mark_done=True):
         """
         Forced aperture + PSF photometry, pixel-phase detrending, star-
         contamination flagging, and shift-and-stack for every asteroid
@@ -923,8 +923,10 @@ class DataProcessor():
         ------
         Creates
         ------
-        Per-cut forced aperture/PSF photometry, stacking summary, and
-        stacked-lightcurve tables in the cut's folder.
+        The cut's photometry and tracks tables, staged for the sector's asteroid store
+        (asteroid_store.merge_sector), and the cut's asteroid_lightcurves.txt marker.
+        mark_done=False writes nothing into the cut folder (no marker), for test runs that must
+        leave the existing products untouched.
 
         """
 
@@ -935,6 +937,7 @@ class DataProcessor():
                                             match_ephemeris_to_reduced_frames, detrend_pixel_phase,
                                             local_gaia_cat_to_stars, flag_star_contamination,
                                             stack_lightcurves, STACK_SIG_TARGET, pool_offset_from_stacks)
+        from . import asteroid_store
 
         try:
             cutCorners, _, _, _ = self.find_cuts(cam=cam,ccd=ccd,n=n,plot=False,verbose=0)
@@ -975,8 +978,11 @@ class DataProcessor():
             ephemeris = load_table(asteroids_path)
             if len(ephemeris) == 0:
                 print(f'No asteroids predicted for Cam {cam} Ccd {ccd} Cut {cut}{part_label}.')
-                with open(f'{cutFolder}/asteroid_lightcurves.txt', 'w') as file:
-                    file.write('No asteroids to process.')
+                # staged empty, so a rerun still replaces whatever this cut held in the store
+                asteroid_store.write_empty_staging(self.data_path, self.sector, cam, ccd, cut, i + 1 if part else 0)
+                if mark_done:
+                    with open(f'{cutFolder}/asteroid_lightcurves.txt', 'w') as file:
+                        file.write('No asteroids to process.')
                 continue
 
             cube = np.load(flux_path)
@@ -993,14 +999,10 @@ class DataProcessor():
             # this cut's own AB zeropoint, if calibrate() has already run for it -- lets
             # pool_offset_from_stacks convert each track's fitted flux to a real magnitude
             # for a direct sanity check against the ephemeris's own predicted mag_expected.
-            # None (uncalibrated) is a normal, handled case, not an error.
-            zp_path = f'{cutFolder}/calibration/psf_calibration_zp.csv'
-            zp_ab = None
-            if os.path.exists(zp_path):
-                try:
-                    zp_ab = float(pd.read_csv(zp_path)['zp_ab'].iloc[0])
-                except Exception:
-                    zp_ab = None
+            # None (uncalibrated) is a normal, handled case, not an error; the store fills it
+            # at merge if calibrate() finishes first.
+            zp, e_zp = asteroid_store.read_zeropoint(cutFolder)
+            zp_ab = zp if np.isfinite(zp) else None
 
             # Step 1: find the predicted-vs-measured position offset, straight off the raw
             # predicted ephemeris -- measure_stack_centroid_offset works from raw cube stamps
@@ -1033,19 +1035,23 @@ class DataProcessor():
 
             # Step 3: contamination flags, on the one photometry result actually being saved
             psf_df = flag_star_contamination(psf_df, stars, flux_col='flux_detrended')
-            stack_summary, stacked_df = stack_lightcurves(psf_df)
+            stack_summary, _ = stack_lightcurves(psf_df)
 
-            offset_df = pd.DataFrame([{'offset_x': offset_x, 'offset_y': offset_y,
-                                        'n_tracks_used': n_offset_tracks}])
+            # staged for the sector's designation-sorted store (asteroid_store.merge_sector), not
+            # saved in the cut folder; the stacked photometry is derived, so it is not stored
+            part_index = i + 1 if part else 0
+            asteroid_store.write_staging(
+                self.data_path,
+                asteroid_store.photometry_table(psf_df, ephemeris, self.sector, cam, ccd, cut, part_index,
+                                                shape=cube.shape[1:], zp_ab=zp, e_zp_ab=e_zp),
+                asteroid_store.tracks_table(ephemeris, psf_df, stack_summary, offset_diagnostics, offset_x, offset_y,
+                                            n_offset_tracks, self.sector, cam, ccd, cut, part_index,
+                                            zp_ab=zp, e_zp_ab=e_zp),
+                self.sector, cam, ccd, cut, part_index)
 
-            save_table(psf_df,f'{cutFolder}/asteroids/{base}_AsteroidPSFPhotometry.csv')
-            save_table(stack_summary.reset_index(),f'{cutFolder}/asteroids/{base}_AsteroidStackSummary.csv')
-            save_table(stacked_df,f'{cutFolder}/asteroids/{base}_AsteroidStackedPhotometry.csv')
-            save_table(offset_df,f'{cutFolder}/asteroids/{base}_AsteroidCutOffset.csv')
-            save_table(offset_diagnostics,f'{cutFolder}/asteroids/{base}_AsteroidOffsetDiagnostics.csv')
-
-            with open(f'{cutFolder}/asteroid_lightcurves.txt', 'w') as file:
-                file.write('Done!')
+            if mark_done:
+                with open(f'{cutFolder}/asteroid_lightcurves.txt', 'w') as file:
+                    file.write('Done!')
 
             if self.verbose > 0:
                 n_tracks = ephemeris['designation'].nunique()
@@ -1054,3 +1060,35 @@ class DataProcessor():
                 print(f'Cam {cam} CCD {ccd} Cut {cut}{part_label} asteroid lightcurves complete '
                       f'({n_tracks} tracks, {n_robust} robustly detected).')
                 print('\n')
+    def asteroid_lightcurves_ccd(self,cam,ccd,n,cuts=None,part=False,mark_done=True):
+        """
+        asteroid_lightcurves() for every requested cut of one CCD, in one job. Cuts already done
+        (asteroid_lightcurves.txt present, or with mark_done=False already staged in the store) are
+        skipped, so a resubmitted job resumes where its predecessor stopped. A cut that fails
+        doesn't stop the rest; the job raises at the end so the sector's merge (which waits on
+        afterok) never runs on an incomplete sector.
+        """
+        import traceback
+        from . import asteroid_store
+
+        cuts = list(range(1, n**2 + 1)) if cuts is None else list(cuts)
+        file_path = f'{self.path}/Cam{cam}/Ccd{ccd}'
+        failed = []
+        for cut in cuts:
+            folders = [f'{file_path}/Part{i}/Cut{cut}of{n**2}' for i in (1, 2)] if part else [f'{file_path}/Cut{cut}of{n**2}']
+            if mark_done and all(os.path.exists(f'{f}/asteroid_lightcurves.txt') for f in folders):
+                continue
+            if not mark_done and all(asteroid_store.is_staged(self.data_path, self.sector, cam, ccd, cut, p)
+                                     for p in ((1, 2) if part else (0,))):
+                continue
+            ts = t()
+            try:
+                self.asteroid_lightcurves(cam=cam, ccd=ccd, n=n, cut=cut, part=part, mark_done=mark_done)
+            except Exception:
+                traceback.print_exc()
+                failed.append(cut)
+            if self.verbose > 0:
+                print(f'Cam {cam} CCD {ccd} Cut {cut}: {t() - ts:.0f} s')
+
+        if failed:
+            raise RuntimeError(f'Asteroid lightcurves failed for Cam {cam} CCD {ccd} cuts {failed}')

@@ -3053,7 +3053,8 @@ export PYTHONUNBUFFERED=1\n\
         an order of magnitude or more within a single sector; density depends on ecliptic
         latitude). Falls back to the plain suggested time/cpu/mem if the ephemeris can't be
         read for any reason (e.g. genuinely zero tracks, or an unexpected layout)."""
-        from .tools import load_table, table_exists
+        import pandas as pd
+        from .tools import table_exists
 
         base_time, cpu, base_mem = self.asteroid_lightcurves_time, self.asteroid_lightcurves_cpu, self.asteroid_lightcurves_mem
         try:
@@ -3062,7 +3063,9 @@ export PYTHONUNBUFFERED=1\n\
             path = f'{cutFolder}/asteroids/{base}_Asteroids.csv'
             if not table_exists(path):
                 return base_time, cpu, base_mem
-            n_tracks = load_table(path)['designation'].nunique()
+            # the designation column only: the whole prediction table is tens of MB on dense cuts,
+            # read for every cut of the sector by the driver
+            n_tracks = pd.read_parquet(path[:-4] + '.parquet', columns=['designation'])['designation'].nunique()
         except Exception:
             return base_time, cpu, base_mem
 

@@ -27,6 +27,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 INFO = f'{HERE}/ml_data/v5/sort_sample_info.csv'                 # ml_sector_sample.py's sort_sample_info.csv
 SORT_DIR = f'{HERE}/ml_data/v5/S54_sort/sort_sort_sample'         # manual_sort folder (one subfolder per label)
 OUT_FILE = f'{HERE}/ml_eval_sector_sort_S54.txt'
+OOF = None                  # None = score the model that made INFO's predictions. Or an oof_predictions.csv from
+                            # ml_train_eval.py: score that model's held-out predictions instead (for a model trained
+                            # with this sector's labels; events without one are dropped)
 CLASS_MERGE = {'Systematic': 'Junk', 'Blend': 'Junk', 'Noise': 'Junk'}
 LEAVE_OUT = ['Unsure']
 BOOT = 2000
@@ -98,10 +101,15 @@ def main():
     rng = np.random.default_rng(SEED)
     info = pd.read_csv(INFO)
     lab = load_labels()
+    if OOF:
+        oof = pd.read_csv(OOF).drop_duplicates(KEY_COLS)
+        p_cols = [f'p_{c}' for c in CLASSES]
+        oof['pred_class'] = np.array(CLASSES)[oof[p_cols].to_numpy().argmax(axis=1)]
+        info = info.drop(columns=p_cols + ['pred_class']).merge(oof[KEY_COLS + p_cols + ['pred_class']], on=KEY_COLS)
     d = info.merge(lab[KEY_COLS + ['label']], on=KEY_COLS, how='inner')
     n_sorted = d.groupby('stratum').size()
     d['weight'] = d.n_stratum / d.stratum.map(n_sorted)      # re-weight over the events actually sorted
-    lines = [f'Sort {SORT_DIR} vs {INFO}',
+    lines = [f'Sort {SORT_DIR} vs {INFO}' + (f', held-out predictions from {OOF}' if OOF else ''),
              f'{len(info)} picked, {len(lab)} labelled (excl. {LEAVE_OUT}), {len(d)} matched; '
              f'sorted per stratum: {n_sorted.to_dict()}', '']
     lines += section(d[d.stratum != 'below_5'], 'lc_sig_max >= 5', rng)

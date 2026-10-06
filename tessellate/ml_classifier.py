@@ -90,6 +90,13 @@ KEY_COLS = ['sector', 'camera', 'ccd', 'cut', 'objid', 'eventid']
 META_COLS = KEY_COLS + ['frame_bin', 'flux_sign', 'classification', 'xcentroid', 'ycentroid', 'mjd_max',
                         'crossbin_ids']
 FEATURE_GROUPS = ('tab', 'lc', 'shape', 'ctx', 'pix', 'xm')
+
+# -- The classifier shipped with the package and used by the detector -- #
+ML_VERSION = '1.0.0'        # = development model v5_E (labels to 2026-10-06, incl. S54); see development/claude_context.md
+DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rfc_files',
+                                  f'event_classifier_v{ML_VERSION}.joblib')
+UNSURE_BELOW = 0.6          # most likely class below this -> 'Unsure' (S54: 3% of events at lc_sig_max >= 5,
+                            # right only half the time; the rest 95% right)
 FEATURE_VERSION = 5     # 5: event margin for the baseline capped at max_mask_pad_days (long events kept their
                         # light-curve features blank before), tab_chain_* (fast-asteroid detection chains)
                         # 4: image at before / peak / after and first / second half (pix_ep_*), gaps in the event
@@ -1453,6 +1460,21 @@ def _log_loss(proba, y_idx):
     return -np.mean(np.log(np.clip(proba[np.arange(len(y_idx)), y_idx], 1e-12, 1)))
 
 
+def _no_flare_dips(proba, classes, flux_sign):
+    """
+    A flare is a brightening, so a dip (flux_sign < 0) can't be one: its Flare probability is shared out over the
+    other classes in proportion. On S54 the model called 9 of 100 sampled Flare calls on dips; none were flares.
+    """
+    if flux_sign is None or 'Flare' not in classes:
+        return proba
+    proba = np.array(proba, dtype=float)
+    dip = np.asarray(flux_sign, dtype=float) < 0
+    if dip.any():
+        proba[dip, list(classes).index('Flare')] = 0
+        proba[dip] /= np.clip(proba[dip].sum(axis=1, keepdims=True), 1e-12, None)
+    return proba
+
+
 class EventClassifier():
     """
     Gradient-boosted classifier over the ml_classifier feature groups.
@@ -1569,6 +1591,8 @@ class EventClassifier():
             raw = self.cross_validate(features, labels, n_splits=n_splits, importance=importance, verbose=verbose)
             self.oof_raw_ = raw
             self.calibration_, self.oof_ = self._calibrate(raw)
+            cols = [f'p_{c}' for c in self.classes_]
+            self.oof_[cols] = _no_flare_dips(self.oof_[cols].to_numpy(), self.classes_, self.oof_.get('flux_sign'))
 
         m, X, y, w, source = self._training_data(features, labels)
         self.classes_ = [c for c in CLASSES if c in set(y)] + sorted(set(y) - set(CLASSES))
@@ -1622,6 +1646,7 @@ class EventClassifier():
         proba = _aligned_proba(self.model_, X, self.classes_)
         if self.calibration_ is not None:
             proba = _apply_temperature(proba, self.calibration_)
+        proba = _no_flare_dips(proba, self.classes_, features.get('flux_sign'))
         out = self._summarise(features, proba)
         lo, hi = self.domain_
         finite = np.isfinite(X)
@@ -1654,7 +1679,82 @@ class EventClassifier():
         if getattr(obj, 'version', None) != FEATURE_VERSION:
             warnings.warn(f'Model built with feature version {getattr(obj, "version", None)}, '
                           f'current is {FEATURE_VERSION}: re-extract features or retrain.')
+        # A model saved with scikit-learn 1.3 lacks the _preprocessor attribute that 1.4+ checks when predicting.
+        # It is only set for categorical features (none here), so None = no preprocessing, as in 1.3. Checked:
+        # identical probabilities (to 2e-16) on 9,975 S54 events, cluster sklearn vs local 1.3.2.
+        model = getattr(obj, 'model_', None)
+        if model is not None and not hasattr(model, '_preprocessor'):
+            model._preprocessor = None
         return obj
+
+
+# ----------------------------- Classifying a cut (the detector's stage 1) ----------------------------- #
+
+_LOADED = {}
+
+
+def load_default_classifier(path=None):
+    """The classifier shipped with the package (ML_VERSION), loaded once per process."""
+    path = path or DEFAULT_MODEL_PATH
+    if path not in _LOADED:
+        _LOADED[path] = EventClassifier.load(path)
+    return _LOADED[path]
+
+
+def classify_cut(data_path, sector, cam, ccd, cut, n=8, model=None, unsure_below=UNSURE_BELOW, config=None):
+    """
+    Stage-1 class probabilities for every event in a cut's detected_events.csv.
+
+    The model is trained on frame-bin-1 events, so those are scored directly (features from the cut's flux cube,
+    exactly as for training). An event in a coarser bin takes the probabilities of its frame-bin-1 crossbin sibling
+    -- the same physical event -- choosing the most significant if there are several; one with no frame-bin-1
+    sibling gets NaN probabilities.
+
+    ml_classification is the most likely class, or 'Unsure' when that class's probability is below unsure_below
+    (or there are no probabilities).
+
+    Returns objid, eventid, p_<class> per class and ml_classification, one row per event in the file's order.
+    """
+    model = model or load_default_classifier()
+    events = load_cut_events(data_path, sector, cam, ccd, cut, n)
+    classes = list(model.classes_)
+    p_cols = [f'p_{c}' for c in classes]
+    out = events[['objid', 'eventid']].copy()
+    for c in p_cols:
+        out[c] = np.nan
+
+    fb1 = (events['frame_bin'] == 1).to_numpy()
+    if fb1.any():
+        cfg = {'crossmatch': False, 'max_tagged': None, **(config or {})}
+        feats = extract_cut_features(data_path, sector, cam, ccd, cut, n, events=events[fb1], config=cfg)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            pred = model.predict(feats)
+        scored = out[['objid', 'eventid']].reset_index().merge(pred[['objid', 'eventid'] + p_cols],
+                                                               on=['objid', 'eventid']).set_index('index')
+        out.loc[scored.index, p_cols] = scored[p_cols].to_numpy()
+
+    # -- Coarser bins inherit from their frame-bin-1 sibling -- #
+    if 'crossbin_ids' in events and (~fb1).any():
+        ids = events['crossbin_ids'].apply(_parse_ids)
+        sig = pd.to_numeric(events.get('lc_sig_max', pd.Series(0.0, index=events.index)), errors='coerce').fillna(0)
+        best = {}                          # crossbin id -> the most significant scored frame-bin-1 event
+        for idx in events.index[fb1]:
+            if out.loc[idx, p_cols].notna().all():
+                for i in ids[idx]:
+                    if i not in best or sig[idx] > sig[best[i]]:
+                        best[i] = idx
+        for idx in events.index[~fb1]:
+            sources = [best[i] for i in ids[idx] if i in best]
+            if sources:
+                out.loc[idx, p_cols] = out.loc[max(sources, key=lambda j: sig[j]), p_cols].to_numpy()
+
+    P = out[p_cols].to_numpy(float)
+    ok = np.isfinite(P).all(axis=1)
+    P0 = np.where(ok[:, None], P, 0.0)
+    top, arg = P0.max(axis=1), np.array(classes)[P0.argmax(axis=1)]
+    out['ml_classification'] = np.where(ok & (top >= unsure_below), arg, 'Unsure')
+    return out
 
 
 # ----------------------------- Evaluation / review ----------------------------- #

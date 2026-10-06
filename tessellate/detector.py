@@ -11,6 +11,9 @@ from .tools import RoundToInt, load_table, table_exists
 
 from .localisation import CROSSMATCH_NSIGMA    # crossmatch radius, in units of the 1-sigma centroid_err
 
+# Detector.transient_search(redo=...): the first stage to repeat even though its output exists (later stages follow)
+REDO_STAGES = (None, 'sources', 'events', 'compile', 'classify')
+
 # ----------------------------------------------------------------------------------------------------------------------------- #
 # ----------------------------------------------------------------------------------------------------------------------------- # 
 # ------------------------------------------------- Source Detection functions ------------------------------------------------ #
@@ -978,6 +981,27 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_func, exposure_time, big_size
 
 
 
+def _add_psf_flags(events):
+    """
+    psf_pinned / psf_det_sep for an event table made before _Fit_psf set them, from the stored fit: a fit pinned at
+    its +-0.5 px bound sits within 0.001 px of a half-integer (brightest pixel + 0.5), exactly what _Fit_psf flags.
+    Leaves existing columns alone. (Outputs from before the radial branch stored ycentroid_psf - 0.0226, so their y
+    test can miss; those need the localisation update anyway.)
+    """
+    if {'xcentroid_psf', 'ycentroid_psf', 'xcentroid_det', 'ycentroid_det'} - set(events.columns):
+        return events
+    events = events.copy()
+    x, y = (pd.to_numeric(events[c], errors='coerce') for c in ('xcentroid_psf', 'ycentroid_psf'))
+    if 'psf_pinned' not in events:
+        def half(v):
+            return np.abs(np.abs(v - np.round(v)) - 0.5) <= 0.001
+        events['psf_pinned'] = (half(x) | half(y)).astype(int)
+    if 'psf_det_sep' not in events:
+        events['psf_det_sep'] = np.hypot(x - pd.to_numeric(events['xcentroid_det'], errors='coerce'),
+                                         y - pd.to_numeric(events['ycentroid_det'], errors='coerce'))
+    return events
+
+
 def _Isolate_events(objid,time,flux,sources,sector,cam,ccd,cut,prf,
                     exposure_time,snr_to_localisation_func,nan_frames,
                     frame_buffer,event_time_buffer,calc_time_window,psf_stacked=None,eventid=None):
@@ -1922,7 +1946,9 @@ class Detector():
         gaia_rpmag_all = gaia.RPmag.values
         gaia_gmag_all = gaia.Gmag.values
 
-        crossmatch = ~events.classification.isin(['Asteroid', 'CosmicRay', 'Junk']) & np.isfinite(events.centroid_err)
+        # every event with a calibrated position (PSF-like): the rule tags no longer decide what an event is
+        crossmatch = np.isfinite(events.centroid_err)
+        events['var_type'] = '-'
 
         for i, event in events.iterrows():
             if crossmatch[i]:
@@ -1990,7 +2016,7 @@ class Detector():
                 mahalanobis = np.sqrt((dra / (event.ra_err * 3600))**2 + (ddec / (event.dec_err * 3600))**2)
                 j = np.argmin(mahalanobis)
                 if mahalanobis[j] <= CROSSMATCH_NSIGMA:
-                    events.loc[i, 'classification'] = variables.iloc[j].Type
+                    events.loc[i, 'var_type'] = variables.iloc[j].Type      # catalogue type; classification = the ML class
 
         self.events = events
 
@@ -2318,6 +2344,7 @@ class Detector():
         ordered_cols = [
             # Primary Identification
             'objid', 'eventid', 'classification',
+            'p_Flare', 'p_CosmicRay', 'p_Junk', 'p_Asteroid', 'p_Variable', 'var_type', 'rule_tag', 'pipe_tag',
             'sector', 'camera', 'ccd', 'cut',
 
             # Centroid Positions
@@ -2390,12 +2417,35 @@ class Detector():
         self.events['TSS Catalogue'] = tss_names
 
 
-    def find_events(self):
+    def find_events(self, start='events'):
+        """
+        Build detected_events.csv. start='events': from the sources -- event isolation and PSF localisation (the
+        slow part); start='compile': from self.events already loaded from detected_events.csv, redoing everything
+        after localisation (units, asteroid checks, crossmatches, frame-bin linking, ML classification).
 
-        # -- Group these sources into unique objects based on the objid -- #
-        ts = clock()
-        self._get_all_independent_events()
-        print(f'   Separated into individual events -- done! ({(clock()-ts):.0f}s)',flush=True)
+        Every compile step recomputes its columns from the localisation output (positions, errors, frames,
+        fluxes), so it can rerun on its own output. Two exceptions are handled here: the asteroid checks start from
+        the localisation's CosmicRay / Junk tags, kept unchanged in pipe_tag; and the known-asteroid match is
+        merged in, so its columns are dropped first. Asteroid events keep their (stretched) windows.
+        """
+
+        if start == 'events':
+            # -- Group these sources into unique objects based on the objid -- #
+            ts = clock()
+            self._get_all_independent_events()
+            print(f'   Separated into individual events -- done! ({(clock()-ts):.0f}s)',flush=True)
+            self.events['pipe_tag'] = self.events['classification']     # localisation's tags, never changed after
+        elif start == 'compile':
+            events = self.events.reset_index(drop=True)
+            if 'pipe_tag' not in events:          # older file: only its CosmicRay / Junk tags come from localisation
+                tag = events['rule_tag'] if 'rule_tag' in events else events['classification']
+                events['pipe_tag'] = np.where(tag.isin(['CosmicRay', 'Junk']), tag, '-')
+            events['classification'] = events['pipe_tag']
+            redone = ['known_asteroid_designation', 'known_asteroid_dist_px', 'known_asteroid_frame', 'asteroid_id',
+                      'rule_tag', 'var_type', 'p_Flare', 'p_CosmicRay', 'p_Junk', 'p_Asteroid', 'p_Variable']
+            self.events = events.drop(columns=[c for c in redone if c in events])
+        else:
+            raise ValueError(f"find_events: start must be 'events' or 'compile', not {start!r}")
 
         # -- Get physical units for events -- #
         self._events_physical_units()
@@ -2429,11 +2479,55 @@ class Detector():
         print(f'   Getting TSS Catalogue Names -- done!',flush=True)
 
         # -- Order nicely -- #
-        self._order_events_columns()  
+        self.events = _add_psf_flags(self.events)
+        self.events['rule_tag'] = self.events['classification']        # the rules' final verdict
+        self._order_events_columns()
 
         # -- Save out results to csv file -- #
         self.events.to_csv(f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}/detected_events.csv',index=False)
-        
+
+        # -- Classify with the ML model (reads the file just written, exactly as for training) -- #
+        if not self.injection:
+            self._ml_classify()
+
+    def _ml_classify(self):
+        """
+        Replace the rule-based classification with the ML classifier's (tessellate.ml_classifier, ML_VERSION):
+        p_<class> columns, classification = the most likely class or 'Unsure'. The rule verdict (CosmicRay / Junk /
+        Asteroid / '-') is kept as rule_tag. Also upgrades an older detected_events.csv (variable-catalogue types
+        in classification -> var_type). Rewrites detected_events.csv.
+        """
+        from .ml_classifier import classify_cut, ML_VERSION
+
+        ts = clock()
+        events = _add_psf_flags(self.events.reset_index(drop=True))
+        if 'var_type' not in events:                         # older output: catalogue types sat in classification
+            cls = events['classification'].astype(str)
+            is_var = cls.str.match(r'^(V[A-Z]|RRLyrae)')
+            events['var_type'] = np.where(is_var, cls.replace({'RRLyrae': 'VRRLyr'}), '-')
+            events['classification'] = np.where(is_var, '-', cls)
+        if 'rule_tag' not in events:
+            events['rule_tag'] = events['classification']
+
+        res = classify_cut(self.data_path, self.sector, self.cam, self.ccd, self.cut, self.n)
+        res = res.drop_duplicates(['objid', 'eventid'])
+        p_cols = [c for c in res if c.startswith('p_')]
+        events = events.drop(columns=[c for c in p_cols if c in events])
+        events = events.merge(res, on=['objid', 'eventid'], how='left')
+        events['classification'] = events.pop('ml_classification').fillna('Unsure')
+
+        # new columns straight after classification; every other column kept as it was (an older file's columns
+        # aren't all in _order_events_columns' list, which drops anything unlisted)
+        new = [c for c in ['p_Flare', 'p_CosmicRay', 'p_Junk', 'p_Asteroid', 'p_Variable', 'var_type', 'rule_tag',
+                           'pipe_tag']
+               if c in events]
+        rest = [c for c in events.columns if c not in new]
+        at = rest.index('classification') + 1
+        self.events = events[rest[:at] + new + rest[at:]]
+        self.events.to_csv(f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}/detected_events.csv',index=False)
+        counts = self.events['classification'].value_counts().to_dict()
+        print(f'   ML classification v{ML_VERSION} -- done! ({(clock()-ts):.0f}s) {counts}',flush=True)
+
 
 
     # ------------------------------ Object finding function ------------------------------ #
@@ -2451,7 +2545,7 @@ class Detector():
             'lc_sig_max', 'flux_maxsig', 'frame_maxsig',
             'mjd_maxsig','psf_maxsig','flux_sign', 'n_events',
             'min_eventlength_frame', 'max_eventlength_frame',
-            'min_eventlength_mjd','max_eventlength_mjd','gaia_id','classification','TSS Catalogue',
+            'min_eventlength_mjd','max_eventlength_mjd','gaia_id','classification','var_type','TSS Catalogue',
             'known_asteroid_designation','known_asteroid_dist_px','known_asteroid_frame'
         ]
         objects = pd.DataFrame(columns=columns)
@@ -2471,9 +2565,14 @@ class Detector():
             if classification == 'RRLyrae':
                 classification = 'VRRLyr'
 
+            # catalogue variable type: the most common one among the object's matched events
+            var_types = obj['var_type'][obj['var_type'] != '-'] if 'var_type' in obj else pd.Series(dtype=object)
+            var_type = var_types.mode()[0] if len(var_types) else '-'
+
             row_data = {
                 'objid': objid,
-                'classification': classification,    
+                'classification': classification,
+                'var_type': var_type,
                 'sector': maxevent['sector'],
                 'cam': maxevent['camera'],
                 'ccd': maxevent['ccd'],
@@ -2518,9 +2617,23 @@ class Detector():
         
     # ------------------------------ Main search function ------------------------------ #
 
-    def transient_search(self,cut,mode='starfind',prf_path='/fred/oz335/_local_TESS_PRFs',time_bins=['10min'],min_snr=3.0):
+    def transient_search(self,cut,mode='starfind',prf_path='/fred/oz335/_local_TESS_PRFs',time_bins=['10min'],min_snr=3.0,
+                         redo=None):
+        """
+        Find sources, events and objects in a cut. Stages whose output already exists are skipped, unless redo
+        names the first stage to repeat (every later stage repeats too):
+          'sources'  - source detection in the images
+          'events'   - event isolation and PSF localisation (the slow part of event finding)
+          'compile'  - everything after localisation, from the existing detected_events.csv: units, asteroid
+                       checks, Gaia / variable crossmatch, frame-bin linking, then the ML classification
+          'classify' - the ML classification only
+        Objects are always rebuilt.
+        """
 
         import os
+
+        if redo not in REDO_STAGES:
+            raise ValueError(f'redo must be one of {REDO_STAGES}, not {redo!r}')
 
         # -- Check if using starfinder and/or sourcedetect for detection -- #
         self.mode = mode
@@ -2537,11 +2650,17 @@ class Detector():
 
         # -- Preload self.sources and self.events if they're already made, self.objects can't be made otherwise this function wouldn't be called -- #
         self.gather_results(cut=cut)
-        print('\n') 
+        print('\n')
+
+        if redo == 'sources':
+            self.sources = None
+        if redo in ('sources', 'events'):
+            self.events = None
 
         if self.sources is None:
             print('-------Source finding (see progress in errors log file)-------',flush=True)
             self.find_sources(time_bins,min_snr=min_snr)
+            self.events = None                  # events from older sources would be stale
             print('\n')
 
         if not os.path.exists(f'{self.prf_path}/cam{self.cam}_ccd{self.ccd}/snr_to_localisation/cut{cut}of{int(self.n**2)}_coeffs_y.npy'):
@@ -2552,9 +2671,18 @@ class Detector():
             print('\n')
 
         # -- self.events contains all individual events, grouped by time and space -- #  
+        if redo == 'compile' and self.events is not None:
+            print('-------Event compilation from detected_events.csv-------',flush=True)
+            self.find_events(start='compile')
+            print('\n')
+
         if self.events is None:
             print('-------Event finding (see progress in errors log file)-------',flush=True)
             self.find_events()
+            print('\n')
+        elif not self.injection and (redo == 'classify' or 'p_Flare' not in self.events):
+            print('-------ML classification of existing events-------',flush=True)
+            self._ml_classify()
             print('\n')
 
         # -- self.objects contains all individual spatial objects -- #  

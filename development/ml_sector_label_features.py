@@ -27,6 +27,11 @@ KEY_COLS = ['sector', 'camera', 'ccd', 'cut', 'objid', 'eventid']
 
 
 def main():
+    for d in SORT_DIRS:
+        n = len(glob.glob(f'{d}/*/events.csv'))
+        if n == 0:
+            raise SystemExit(f'No */events.csv in {d} -- check the path (and its upper/lower case).')
+        print(f'{d}: {n} label folders')
     keys = [pd.read_csv(f)[KEY_COLS] for d in SORT_DIRS for f in glob.glob(f'{d}/*/events.csv')]
     keys += [pd.read_csv(f)[KEY_COLS] for f in EVENTS_CSVS]
     keys = pd.concat(keys, ignore_index=True).drop_duplicates()

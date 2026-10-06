@@ -25,6 +25,50 @@ def _centroid_err(table):
     return np.sqrt((table['xcentroid_err']**2 + table['ycentroid_err']**2) / 2)
 
 
+OLD_VARIABLE_TYPES = ['VCR', 'VRRLyr', 'VEB', 'VLPV', 'VST', 'VAGN', 'VRM', 'VMSO', 'RRLyrae']
+
+
+def _class_mask(table, name, negate=False, min_probability=None, max_probability=None):
+    """
+    Rows of `table` that are (or, with negate, are not) class `name`.
+
+    With the ML columns (p_<Class>, from version 2.1.0 / classifier 1.0.0):
+      - no probability limits: by classification (the most likely class, or 'Unsure');
+      - with min/max_probability: by the probability of the condition as written -- p_<Class> for `name`, and
+        1 - p_<Class> for not-`name` (so '!var' with min_probability 0.75 keeps p_Variable <= 0.25). Events without
+        probabilities (no frame-bin-1 sibling) fail any probability limit.
+    Older outputs (rule tags, catalogue types in classification): by classification; 'var' means any catalogue
+    variable type; probability limits raise an error.
+    """
+    key = name.lower()
+    if key in ('var', 'variable'):
+        key = 'variable'
+    p_col = next((c for c in table.columns if c.lower() == f'p_{key}'), None)
+    limits = (min_probability is not None) or (max_probability is not None)
+
+    if p_col is None:
+        if limits:
+            raise ValueError('min_probability / max_probability need the ML probability columns (p_<class>): '
+                             're-run transient_search on this cut with tessellate >= 2.1.0.')
+        names = [v.lower() for v in OLD_VARIABLE_TYPES] + ['variable'] if key == 'variable' else [key]
+        hit = table['classification'].astype(str).str.lower().isin(names)
+        return ~hit if negate else hit
+
+    if not limits:
+        hit = table['classification'].astype(str).str.lower() == key
+        return ~hit if negate else hit
+
+    prob = pd.to_numeric(table[p_col], errors='coerce')
+    if negate:
+        prob = 1 - prob
+    mask = prob.notna()
+    if min_probability is not None:
+        mask &= prob >= min_probability
+    if max_probability is not None:
+        mask &= prob <= max_probability
+    return mask
+
+
 def _bazin_fit_worker(stamp_cube, sub_time, x_sub, y_sub, ccd_x, ccd_y,
                       event_window, n_ev_frames, sector, cam, ccd, units, zp,
                       stamp_size, n_durations, supersample, objid, eventid,
@@ -207,10 +251,18 @@ class Navigator():
                       min_frame_duration=None,max_frame_duration=None,min_events=None,max_events=None,
                       lc_sig_max=None,lc_sig_med=None,lc_flat=None,image_sig_max=None,psf_like=None,
                       galactic_latitude=None,centroid_err=None,crossbins=True,
-                      boundary_buffer=None,exclude_bad_frames=None):
-         
+                      boundary_buffer=None,exclude_bad_frames=None,
+                      min_probability=None,max_probability=None):
+
         """
         Returns a dataframe of the events in the cut, with options to filter by various parameters.
+
+        classification : 'Flare', 'Variable' (or 'var'), 'Asteroid', 'CosmicRay', 'Junk', 'Unsure'; prefix '!' or '~'
+            for "not". min_probability / max_probability turn it into a cut on the probability of that condition:
+            classification='Flare', min_probability=0.9 keeps p_Flare >= 0.9; classification='!var',
+            min_probability=0.75 keeps p_Variable <= 0.25 (confidently not a variable).
+        asteroidkiller / cosmicraykiller / junkkiller : remove that class; with min/max_probability, the same as
+            classification='!Asteroid' etc. (keep events confidently NOT that class).
         """
 
         # -- Gather data -- #
@@ -233,19 +285,12 @@ class Navigator():
         else:
             events = deepcopy(self.events)
 
-        # -- Remove asteroids from the results -- #
-        if asteroidkiller:
-            events = events.loc[~(events.classification == 'Asteroid')]
-            if 'Asteroid' in events.keys():
-                events = events.loc[events.Asteroid == 0]
-
-        # -- Remove Cosmic Rays -- #
-        if cosmicraykiller:
-            events = events.loc[~(events.classification == 'CosmicRay')]
-
-        # -- Remove junk -- #
-        if junkkiller:
-            events = events.loc[~(events.classification == 'Junk')]
+        # -- Remove asteroids, cosmic rays, junk (with probability limits: keep events confidently not that class) -- #
+        for kill, name in [(asteroidkiller, 'Asteroid'), (cosmicraykiller, 'CosmicRay'), (junkkiller, 'Junk')]:
+            if kill:
+                events = events.loc[_class_mask(events, name, True, min_probability, max_probability)]
+        if asteroidkiller and 'Asteroid' in events.keys():
+            events = events.loc[events.Asteroid == 0]
 
         # -- Remove events near strap structures -- #
         if strapkiller:
@@ -316,16 +361,7 @@ class Navigator():
         # -- Filter based on classification -- #
         if classification is not None:
             is_negation = classification.startswith(('!', '~'))
-            classification_stripped = classification.lstrip('!~').lower()
-            if classification_stripped in ['var', 'variable']:
-                classification = classification = ['VCR', 'VRRLyr', 'VEB','VLPV','VST','VAGN','VRM','VMSO','RRLyrae']  
-            else:
-                classification = [classification_stripped]
-
-            if is_negation:
-                events = events[~events.classification.str.lower().isin([classification[i].lower() for i in range(len(classification))])]
-            else:
-                events = events[events.classification.str.lower().isin([classification[i].lower() for i in range(len(classification))])]
+            events = events[_class_mask(events, classification.lstrip('!~'), is_negation, min_probability, max_probability)]
 
         # -- Filter by upper and lower limits on number of detections within each event -- #
         if max_frame_duration is not None or min_frame_duration is not None:
@@ -417,16 +453,7 @@ class Navigator():
         # -- Filter based on classification -- #
         if classification is not None:
             is_negation = classification.startswith(('!', '~'))
-            classification_stripped = classification.lstrip('!~').lower()
-            if classification_stripped in ['var', 'variable']:
-                classification = classification = ['VCR', 'VRRLyr', 'VEB','VLPV','VST','VAGN','VRM','VMSO']  # Replace with variable classes
-            else:
-                classification = [classification_stripped]
-
-            if is_negation:
-                objects = objects[~objects.classification.str.lower().isin([classification[i].lower() for i in range(len(classification))])]
-            else:
-                objects = objects[objects.classification.str.lower().isin([classification[i].lower() for i in range(len(classification))])]
+            objects = objects[_class_mask(objects, classification.lstrip('!~'), is_negation)]
 
         # -- Filter by various parameters -- #
         if frame_bin is not None:

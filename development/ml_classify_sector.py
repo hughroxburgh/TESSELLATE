@@ -59,6 +59,8 @@ OUT_DIR = '/fred/oz335/hroxburg/dev/ml_classifier/predictions'
 SAVE_FEATURES = True        # also keep each cut's features (~a few MB per cut, gzipped)
 REVIEW_MAX_P = 0.75         # review = True when the most likely class has p below this
 CROSSMATCH = False          # the model doesn't use the Gaia / variable-catalogue features
+REPREDICT = False           # True = redo the predictions of cuts that already have them (e.g. a new model), from the
+                            # saved features files: no re-extraction, ~seconds per cut
 COLLECT = False             # True = when every cut is done, also join them into one S{s}_ml_predictions.csv.gz
                             # (~1 GB per sector, slow to write). ml_sector_sample.py reads the per-cut files and
                             # writes a slimmer table with lc_sig_max, so this is rarely needed
@@ -169,8 +171,8 @@ def _worker(sector, cam, ccd, cut):
     process_cut(sector, cam, ccd, cut, _MODEL)
 
 
-def todo_cuts():
-    return [c for c in all_cuts() if not os.path.exists(pred_path(*c))
+def todo_cuts(repredict=False):
+    return [c for c in all_cuts() if (repredict or not os.path.exists(pred_path(*c)))
             and os.path.exists(f'{_cut_path(DATA_PATH, *c)}/detected_events.csv')]
 
 
@@ -181,7 +183,7 @@ def run_here(todo):
     print(f'{len(todo)} cuts to do with {N_JOBS} workers', flush=True)
     start = time.time()
     Parallel(n_jobs=N_JOBS)(delayed(_worker)(*c) for c in todo)
-    left = todo_cuts()
+    left = [c for c in todo if not os.path.exists(pred_path(*c))]
     print(f'\nDone in {(time.time() - start) / 60:.1f} min; {len(left)} cuts still without predictions', flush=True)
     if left:
         print('Run the script again to retry them (their FAILED lines above say why).')
@@ -293,7 +295,9 @@ def main():
     if not os.path.exists(MODEL):
         sys.exit(f'No model at {MODEL}')
     load_model()                              # fail on a version mismatch before submitting anything
-    todo = todo_cuts()
+    todo = todo_cuts(repredict=REPREDICT)
+    if REPREDICT and ARRAY:
+        sys.exit('REPREDICT is meant for one job / here (ARRAY = False): it is seconds per cut')
     if not todo:
         if COLLECT:
             collect()

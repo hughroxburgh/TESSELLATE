@@ -3128,22 +3128,41 @@ export PYTHONUNBUFFERED=1\n\
         except Exception:
             return None
 
+    # One cut on one core (DataProcessor.asteroid_lightcurves_ccd, offset fits serial), measured on
+    # 219 Sector 29 Cam 1 cuts (73-963 tracks, ~2800-3600 frames): 3.4 s + 19.4 ms/track with the
+    # offset fits in an 8-worker pool, ~46 ms/track with them serial. Time scales with frames per
+    # cut (Year 4 has ~3x Year 3's), memory with the reduced cube each worker holds.
+    _CUT_TIME_FLOOR_S = 30
+    _CUT_TIME_PER_TRACK_S = 0.06
+    _CUT_REFERENCE_FRAMES = 3000
+    _CUT_MEM_PER_CUBE = 2.0          # x the cut's ReducedFlux.npy size
+    _CUT_MEM_FLOOR_GB = 1.0
+
     def _lightcurves_resources_for_ccd(self,cam,ccd,cuts):
-        """A CCD job runs its cuts one per core (DataProcessor.asteroid_lightcurves_ccd): memory per
-        CPU is the largest single cut's estimate (each core holds a whole cut), and time is the
-        cuts' summed estimate spread over the cores plus the longest single cut. Per-cut estimates
-        are the track-count fits above; a cut without a readable prediction table is skipped by
-        the lightcurves, so it counts as a minute and no memory."""
+        """Time and memory for a CCD job that runs its cuts one per core: per cut (_CUT_TIME_FLOOR_S +
+        _CUT_TIME_PER_TRACK_S x tracks) x frames / _CUT_REFERENCE_FRAMES; the job gets twice the
+        summed cut time spread over its cores plus the longest cut (at least 15 min), and per CPU
+        twice the largest cut's cube plus a floor. Tracks come from the prediction table's
+        designation column, frames and cube size from the ReducedFlux.npy header and size, so
+        nothing large is read. A cut without a prediction table is skipped by the lightcurves and
+        counts as a minute."""
         cpu = int(self.asteroid_lightcurves_cpu)
-        times, mems = [], [self._LIGHTCURVES_MEM_FLOOR_GB]
+        times, mems = [], [self._CUT_MEM_FLOOR_GB]
         for cut in cuts:
             n_tracks = self._cut_n_tracks(cam,ccd,cut)
+            flux = (f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/'
+                    f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{self.n**2}_ReducedFlux.npy')
+            try:
+                frames = np.load(flux, mmap_mode='r').shape[0]
+                cube_gb = os.path.getsize(flux) / 1e9
+            except Exception:
+                frames, cube_gb = self._CUT_REFERENCE_FRAMES, 1.0
             if n_tracks is None:
                 times.append(60)
-            else:
-                times.append(self._LIGHTCURVES_TIME_PER_TRACK_S * n_tracks + self._LIGHTCURVES_TIME_FLOOR_S)
-                mems.append(self._LIGHTCURVES_MEM_PER_TRACK_GB * n_tracks + self._LIGHTCURVES_MEM_FLOOR_GB)
-        total = int(sum(times) / max(cpu, 1) + max(times))
+                continue
+            times.append((self._CUT_TIME_FLOOR_S + self._CUT_TIME_PER_TRACK_S * n_tracks) * frames / self._CUT_REFERENCE_FRAMES)
+            mems.append(self._CUT_MEM_PER_CUBE * cube_gb + self._CUT_MEM_FLOOR_GB)
+        total = int(max(900, 2 * (sum(times) / max(cpu, 1) + max(times))))
         return f"{total // 3600}:{(total % 3600) // 60:02}:{total % 60:02}", cpu, int(np.ceil(max(mems)))
 
     def _ccd_asteroid_lightcurves(self,cam,ccd,cuts):

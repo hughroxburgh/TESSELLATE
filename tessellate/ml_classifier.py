@@ -165,8 +165,9 @@ def load_cut_events(data_path, sector, cam, ccd, cut, n=8):
     without needing the WCS).
     """
     import ast
+    from .tools import load_table
 
-    events = pd.read_csv(f'{_cut_path(data_path, sector, cam, ccd, cut, n)}/detected_events.csv', low_memory=False)
+    events = load_table(f'{_cut_path(data_path, sector, cam, ccd, cut, n)}/detected_events.csv')
     if 'crossbin_ids' in events:
         events['crossbin_ids'] = events['crossbin_ids'].apply(
             lambda x: ast.literal_eval(x) if isinstance(x, str) else x
@@ -1205,7 +1206,8 @@ def _count_rows(path):
 
 
 def _cut_job(data_path, sector, cam, ccd, cut, n, events, config, cache, return_table=True):
-    if not os.path.exists(f'{_cut_path(data_path, sector, cam, ccd, cut, n)}/detected_events.csv'):
+    from .tools import table_exists
+    if not table_exists(f'{_cut_path(data_path, sector, cam, ccd, cut, n)}/detected_events.csv'):
         return None
     if events is not None:
         events = events[(events.camera == cam) & (events.ccd == ccd) & (events.cut == cut)]

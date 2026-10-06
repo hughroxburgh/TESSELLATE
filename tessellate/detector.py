@@ -7,7 +7,7 @@ import warnings
 warnings.filterwarnings("ignore")
 warnings.filterwarnings("ignore", category=RuntimeWarning) 
 
-from .tools import RoundToInt, load_table, table_exists
+from .tools import RoundToInt, load_table, save_table, table_exists
 
 from .localisation import CROSSMATCH_NSIGMA    # crossmatch radius, in units of the 1-sigma centroid_err
 
@@ -1661,7 +1661,7 @@ class Detector():
 
         self.sources = sources
 
-        self.sources.to_csv(f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}/detected_sources.csv',index=False)
+        save_table(self.sources,f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}/detected_sources.csv')
 
 
 
@@ -2502,7 +2502,7 @@ class Detector():
             self._get_all_independent_events()
             print(f'   Separated into individual events -- done! ({(clock()-ts):.0f}s)',flush=True)
             self.events['pipe_tag'] = self.events['classification']     # localisation's tags, never changed after
-            self.events.to_csv(save_path,index=False)                   # checkpoint: localisation done
+            save_table(self.events,save_path)                   # checkpoint: localisation done
             go = True
 
         if start == 'compile' or go:
@@ -2555,7 +2555,7 @@ class Detector():
             self.events['rule_tag'] = self.events['classification']    # the rules' final verdict (ONLY set here:
                                                                         # after classifying, classification is ML)
             self._order_events_columns()
-            self.events.to_csv(save_path,index=False)                   # checkpoint: compilation done
+            save_table(self.events,save_path)                   # checkpoint: compilation done
             go = True
 
         if (start == 'classify' or go) and not self.injection:
@@ -2565,7 +2565,7 @@ class Detector():
 
             # -- Order nicely (after the classification, so it also places the ML columns) and save -- #
             self._order_events_columns()
-            self.events.to_csv(save_path,index=False)                   # classification done
+            save_table(self.events,save_path)                   # classification done
 
     # ------------------------------ Object finding function ------------------------------ #
 
@@ -2649,7 +2649,7 @@ class Detector():
 
         self.objects = objects
 
-        self.objects.to_csv(f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}/detected_objects.csv',index=False)
+        save_table(self.objects,f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}/detected_objects.csv')
         
         
     # ------------------------------ Main search function ------------------------------ #

@@ -11,7 +11,7 @@ warnings.filterwarnings("ignore")
 warnings.filterwarnings("ignore", category=RuntimeWarning) 
 
 
-from .tools import RoundToInt, Generate_LC, Frame_Bin
+from .tools import RoundToInt, Generate_LC, Frame_Bin, load_table
 from .localisation import CROSSMATCH_NSIGMA
 
 
@@ -163,14 +163,14 @@ class Navigator():
 
         if sources:
             try:
-                self.sources = pd.read_csv(f'{path}/detected_sources.csv')    # raw detection results
+                self.sources = load_table(f'{path}/detected_sources.csv')    # raw detection results
             except:
                 print('No detected sources file found')
                 self.sources = None
 
         if events:
             try:
-                self.events = pd.read_csv(f'{path}/detected_events.csv')    # temporally located with same object id
+                self.events = load_table(f'{path}/detected_events.csv')    # temporally located with same object id
                 self.events['crossbin_ids'] = self.events['crossbin_ids'].apply(
                     lambda x: ast.literal_eval(x) if isinstance(x, str) else x
                 )
@@ -180,7 +180,7 @@ class Navigator():
 
         if objects: 
             try:
-                self.objects = pd.read_csv(f'{path}/detected_objects.csv')    # temporally and spatially located with same object id
+                self.objects = load_table(f'{path}/detected_objects.csv')    # temporally and spatially located with same object id
             except:
                 print('No detected objects file found')
                 self.objects = None

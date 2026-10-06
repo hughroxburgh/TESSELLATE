@@ -36,6 +36,7 @@ import pandas as pd  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
 from tessellate import Navigator  # noqa: E402
+from tessellate.tools import load_table  # noqa: E402
 
 KEY_COLS = ['sector', 'camera', 'ccd', 'cut', 'objid', 'eventid']
 
@@ -44,7 +45,7 @@ def full_rows(sample):
     rows = []
     for (sector, cam, ccd, cut), keys in sample.groupby(['sector', 'camera', 'ccd', 'cut']):
         path = f'{DATA_PATH}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of64/detected_events.csv'
-        ev = pd.read_csv(path)
+        ev = load_table(path)
         ev = ev.merge(keys[['objid', 'eventid', 'frame_bin']], on=['objid', 'eventid', 'frame_bin'])
         rows.append(ev)
     return pd.concat(rows, ignore_index=True)

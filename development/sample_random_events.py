@@ -26,6 +26,7 @@ import re
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from tessellate.tools import load_table, table_exists
 
 # ---- CONFIG ----
 DATA_PATH = '/fred/oz335/TESSdata'
@@ -66,8 +67,8 @@ def load_sector_events():
         for ccd in CCDS:
             for cut in range(1, N_CUTS + 1):
                 path = f'{DATA_PATH}/Sector{SECTOR}/Cam{cam}/Ccd{ccd}/Cut{cut}of{N_CUTS}/detected_events.csv'
-                if os.path.exists(path):
-                    tables.append(pd.read_csv(path, low_memory=False))   # known_asteroid_designation mixes numbers and names
+                if table_exists(path):
+                    tables.append(load_table(path))   # known_asteroid_designation mixes numbers and names
     if not tables:
         raise FileNotFoundError(f'No detected_events.csv found for Sector {SECTOR} under {DATA_PATH}')
     return pd.concat(tables, ignore_index=True)

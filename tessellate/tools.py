@@ -19,33 +19,94 @@ def save_compact_array(path,arr):
         arr = arr.astype(np.float32)
     np.save(path,arr)
 
+def _table_paths(path):
+    """('.parquet', '.csv') paths for a table. Callers pass the historical '.csv' path."""
+    stem = path[:-4] if path.endswith('.csv') else path[:-8] if path.endswith('.parquet') else path
+    return stem + '.parquet', stem + '.csv'
+
+def _remove_file(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:          # e.g. another job got there first
+        pass
+
+def _list_cells_to_lists(df):
+    """Parquet gives list columns (e.g. crossbin_ids) back as numpy arrays; make them plain lists again."""
+    for c in df.columns[df.dtypes == object]:
+        first = df[c].dropna()
+        if len(first) and isinstance(first.iloc[0], np.ndarray):
+            df[c] = [list(v) if isinstance(v, np.ndarray) else v for v in df[c]]
+    return df
+
+def _write_parquet(df, parquet_path):
+    """
+    Write df as Parquet, safely: to a temporary file first, then renamed into place, so a job that is killed
+    mid-write (or another job reading at the same time) never sees a half-written table. A text column that also
+    holds numbers (Parquet needs one type per column) is saved as text -- what a CSV round trip gives anyway.
+    """
+    tmp = f'{parquet_path}.tmp{os.getpid()}'
+    try:
+        try:
+            df.to_parquet(tmp, index=False)
+        except Exception:
+            df = df.copy()
+            for c in df.columns[df.dtypes == object]:
+                kinds = {type(v) for v in df[c] if v is not None and not (isinstance(v, float) and np.isnan(v))}
+                if len(kinds) > 1 and not kinds <= {list, np.ndarray}:
+                    df[c] = [v if v is None or (isinstance(v, float) and np.isnan(v)) else str(v) for v in df[c]]
+            df.to_parquet(tmp, index=False)
+        os.replace(tmp, parquet_path)
+    finally:
+        _remove_file(tmp)
+
 def save_table(df,path):
     """
-    Save a DataFrame as Parquet instead of CSV to reduce on-disk size.
+    Save a DataFrame as Parquet (smaller and faster to load than CSV).
     `path` should be the '.csv' path used historically by callers; the file
-    is actually written alongside it with a '.parquet' extension.
+    is actually written alongside it with a '.parquet' extension, and any old
+    CSV of the same table is deleted so the two can never disagree.
     """
-    parquet_path = path[:-4]+'.parquet' if path.endswith('.csv') else path+'.parquet'
-    df.to_parquet(parquet_path,index=False)
+    parquet_path, csv_path = _table_paths(path)
+    _write_parquet(df, parquet_path)
+    _remove_file(csv_path)
 
-def load_table(path):
+def load_table(path, convert=True, columns=None):
     """
     Load a DataFrame saved with save_table. Looks for the Parquet file first,
     falling back to the legacy '.csv' path so pre-existing outputs on disk
     remain readable without needing to be regenerated.
+
+    convert : a legacy CSV is immediately re-saved as Parquet and the CSV deleted
+        (the CSV is only deleted once the Parquet has been written and read back
+        identically; if anything goes wrong the CSV is kept and a warning printed).
+    columns : only these columns (a Parquet file reads just them from disk, which is much faster).
     """
-    parquet_path = path[:-4]+'.parquet' if path.endswith('.csv') else path
+    parquet_path, csv_path = _table_paths(path)
     if os.path.exists(parquet_path):
-        return pd.read_parquet(parquet_path)
-    return pd.read_csv(path)
+        return _list_cells_to_lists(pd.read_parquet(parquet_path, columns=columns))
+
+    df = pd.read_csv(csv_path, low_memory=False)       # low_memory=False: one type per column, as Parquet needs
+    if convert:
+        try:
+            _write_parquet(df, parquet_path)
+            if pd.read_parquet(parquet_path).equals(df):
+                _remove_file(csv_path)
+            else:
+                _remove_file(parquet_path)
+                print(f'load_table: {csv_path} did not convert to Parquet identically; kept the CSV', flush=True)
+        except Exception as e:
+            _remove_file(parquet_path)
+            print(f'load_table: could not convert {csv_path} to Parquet ({type(e).__name__}: {e}); '
+                  'kept the CSV', flush=True)
+    return df if columns is None else df[list(columns)]
 
 def table_exists(path):
     """
     True if a table saved with save_table exists, checking both the
     '.parquet' path and the legacy '.csv' path.
     """
-    parquet_path = path[:-4]+'.parquet' if path.endswith('.csv') else path
-    return os.path.exists(parquet_path) or os.path.exists(path)
+    parquet_path, csv_path = _table_paths(path)
+    return os.path.exists(parquet_path) or os.path.exists(csv_path)
 
 def _Save_space(Save,delete=False):
     """
@@ -248,9 +309,9 @@ def _remove_reductions(data_path,sector,n,cams,ccds,cuts,part):
                             os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Part{i}/Cut{cut}of{n**2}')
                             os.system(f'rm -f *.npy')
                             os.system(f'rm -f reduced.txt')
-                            os.system(f'rm -f detected_events.csv')
-                            os.system(f'rm -f detected_sources.csv')
-                            os.system(f'rm -f detected_objects.csv')
+                            os.system(f'rm -f detected_events.csv detected_events.parquet')
+                            os.system(f'rm -f detected_sources.csv detected_sources.parquet')
+                            os.system(f'rm -f detected_objects.csv detected_objects.parquet')
                             os.system('rm -f figs.zip')
                             os.system('rm -f lcs.zip')  
                         except:
@@ -260,9 +321,9 @@ def _remove_reductions(data_path,sector,n,cams,ccds,cuts,part):
                         os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
                         os.system(f'rm -f *.npy')
                         os.system(f'rm -f reduced.txt')
-                        os.system(f'rm -f detected_events.csv')
-                        os.system(f'rm -f detected_sources.csv')
-                        os.system(f'rm -f detected_objects.csv')
+                        os.system(f'rm -f detected_events.csv detected_events.parquet')
+                        os.system(f'rm -f detected_sources.csv detected_sources.parquet')
+                        os.system(f'rm -f detected_objects.csv detected_objects.parquet')
                         os.system('rm -f figs.zip')
                         os.system('rm -f lcs.zip')  
                     except:
@@ -331,9 +392,9 @@ def _remove_search(data_path,sector,n,cams,ccds,cuts,part):
                     for i in range(1,3):
                         try:
                             os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Part{i}/Cut{cut}of{n**2}')
-                            os.system(f'rm -f detected_events.csv')
-                            os.system(f'rm -f detected_sources.csv')
-                            os.system(f'rm -f detected_objects.csv')
+                            os.system(f'rm -f detected_events.csv detected_events.parquet')
+                            os.system(f'rm -f detected_sources.csv detected_sources.parquet')
+                            os.system(f'rm -f detected_objects.csv detected_objects.parquet')
                             os.system('rm -f figs.zip')
                             os.system('rm -f lcs.zip') 
                         except:
@@ -341,9 +402,9 @@ def _remove_search(data_path,sector,n,cams,ccds,cuts,part):
                 else:
                     try:
                         os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
-                        os.system(f'rm -f detected_events.csv')
-                        os.system(f'rm -f detected_sources.csv')
-                        os.system(f'rm -f detected_objects.csv')
+                        os.system(f'rm -f detected_events.csv detected_events.parquet')
+                        os.system(f'rm -f detected_sources.csv detected_sources.parquet')
+                        os.system(f'rm -f detected_objects.csv detected_objects.parquet')
                         os.system('rm -f figs.zip')
                         os.system('rm -f lcs.zip')  
                     except:

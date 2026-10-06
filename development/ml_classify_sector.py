@@ -44,6 +44,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))   # use this checkout's tessellate
 import tessellate.ml_classifier
+from tessellate.tools import table_exists
 from tessellate.ml_classifier import FEATURE_VERSION, EventClassifier, _cut_path, extract_cut_features, load_cut_events
 
 # ---- CONFIG ----
@@ -94,7 +95,7 @@ def feat_path(sector, cam, ccd, cut):
 
 def classify_cut(sector, cam, ccd, cut, model):
     """Features + predictions for the frame-bin events of one cut; returns the number of events (None = no cut)."""
-    if not os.path.exists(f'{_cut_path(DATA_PATH, sector, cam, ccd, cut)}/detected_events.csv'):
+    if not table_exists(f'{_cut_path(DATA_PATH, sector, cam, ccd, cut)}/detected_events.csv'):
         return None
     events = load_cut_events(DATA_PATH, sector, cam, ccd, cut)
     events = events[events.frame_bin.isin(FRAME_BINS)]
@@ -173,7 +174,7 @@ def _worker(sector, cam, ccd, cut):
 
 def todo_cuts(repredict=False):
     return [c for c in all_cuts() if (repredict or not os.path.exists(pred_path(*c)))
-            and os.path.exists(f'{_cut_path(DATA_PATH, *c)}/detected_events.csv')]
+            and table_exists(f'{_cut_path(DATA_PATH, *c)}/detected_events.csv')]
 
 
 def run_here(todo):

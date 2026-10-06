@@ -7,6 +7,7 @@ Edit the CONFIG block, then:  python ml_tagcheck_rules.py
 """
 
 import pandas as pd
+from tessellate.tools import load_table
 
 # ---- CONFIG ----
 DATA_PATH = '/fred/oz335/TESSdata'
@@ -23,7 +24,7 @@ def main():
     keys = pd.read_csv(EVENTS_CSV)
     rows = []
     for (sector, cam, ccd, cut), k in keys.groupby(['sector', 'camera', 'ccd', 'cut']):
-        ev = pd.read_csv(f'{DATA_PATH}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of64/detected_events.csv')
+        ev = load_table(f'{DATA_PATH}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of64/detected_events.csv')
         ev = ev[[c for c in COLS if c in ev]].merge(k[['objid', 'eventid', 'frame_bin']])
         rows.append(ev.assign(sector=sector, camera=cam, ccd=ccd, cut=cut))
     out = pd.concat(rows, ignore_index=True)

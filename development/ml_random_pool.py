@@ -19,6 +19,7 @@ import os
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
+from tessellate.tools import load_table, table_exists
 
 # ---- CONFIG ----
 DATA_PATH = '/fred/oz335/TESSdata'
@@ -43,7 +44,7 @@ def cut_path(sector, cam, ccd, cut):
 
 
 def read_cut(sector, cam, ccd, cut):
-    ev = pd.read_csv(cut_path(sector, cam, ccd, cut), usecols=['objid', 'eventid', 'frame_bin', 'classification'])
+    ev = load_table(cut_path(sector, cam, ccd, cut), columns=['objid', 'eventid', 'frame_bin', 'classification'])
     ev = ev[ev.frame_bin.isin(FRAME_BINS)]
     return ev.assign(sector=sector, camera=cam, ccd=ccd, cut=cut)
 
@@ -53,7 +54,7 @@ def main():
     picked, frac = [], {}
     for sector in SECTORS:
         cuts = [(sector, cam, ccd, cut) for cam in CAMS for ccd in CCDS for cut in range(1, N_CUTS + 1)
-                if os.path.exists(cut_path(sector, cam, ccd, cut))]
+                if table_exists(cut_path(sector, cam, ccd, cut))]
         if not cuts:
             print(f'Sector {sector}: no detected_events.csv found; skipped')
             continue

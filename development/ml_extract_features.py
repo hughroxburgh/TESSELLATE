@@ -40,6 +40,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))   # use this checkout's tessellate
 import tessellate.ml_classifier
+from tessellate.tools import load_table, table_exists
 from tessellate.ml_classifier import FEATURE_VERSION, PIPELINE_CLASSES, _cut_path, build_feature_table
 
 # ---- CONFIG ----
@@ -79,9 +80,9 @@ ACCOUNT = 'oz335'
 def pick_cut_events(sector, cam, ccd, cut, labelled):
     """The events of one labelled cut to extract, with the reason each was picked."""
     path = f'{_cut_path(DATA_PATH, sector, cam, ccd, cut)}/detected_events.csv'
-    if not os.path.exists(path):
+    if not table_exists(path):
         return None
-    ev = pd.read_csv(path, usecols=['objid', 'eventid', 'classification'])
+    ev = load_table(path, columns=['objid', 'eventid', 'classification'])
     rng = np.random.default_rng([SEED, sector, cam, ccd, cut])
     cls = ev['classification'].astype(str)
 

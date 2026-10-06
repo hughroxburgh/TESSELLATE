@@ -1135,7 +1135,19 @@ def _select_events(all_events, events, cfg, sector, cam, ccd, cut):
     return selected
 
 
-def extract_cut_features(data_path, sector, cam, ccd, cut, n=8, events=None, config=None, all_events=None):
+def _event_features_safe(ev, cd, cfg):
+    """_event_features for one event, or None if it fails. Kept at module level so joblib workers can run it;
+    warnings are silenced in here because a worker process doesn't inherit the caller's warning filters."""
+    with warnings.catch_warnings(), np.errstate(all='ignore'):
+        warnings.simplefilter('ignore')
+        try:
+            return _event_features(ev, cd, cfg)
+        except Exception:
+            return None
+
+
+def extract_cut_features(data_path, sector, cam, ccd, cut, n=8, events=None, config=None, all_events=None,
+                         progress=False, n_jobs=1):
     """
     Feature table for the events of one cut.
 
@@ -1144,6 +1156,9 @@ def extract_cut_features(data_path, sector, cam, ccd, cut, n=8, events=None, con
         per-object recurrence) still use every event in detected_events.csv.
     all_events : the cut's whole event table, if already in memory (e.g. the detector's, before it is
         saved); None = read detected_events.csv.
+    progress : show a tqdm progress bar over the events (off by default: parallel callers would print one each).
+    n_jobs : joblib workers over the events (1 = a plain loop; -1 = every core). Leave at 1 when the caller is
+        already running cuts in parallel (extract_sector_features), or the workers multiply.
     """
     cfg = {**DEFAULT_CONFIG, **(config or {})}
     if all_events is None:
@@ -1154,15 +1169,18 @@ def extract_cut_features(data_path, sector, cam, ccd, cut, n=8, events=None, con
     selected = _select_events(all_events, events, cfg, sector, cam, ccd, cut)
 
     cd = _CutData(data_path, sector, cam, ccd, cut, n, frame_stats=cfg['frame_stats'])
-    rows, failed = [], 0
-    with warnings.catch_warnings(), np.errstate(all='ignore'):
-        warnings.simplefilter('ignore')
-        for _, ev in selected.iterrows():
-            try:
-                rows.append(_event_features(ev, cd, cfg))
-            except Exception:
-                rows.append({})
-                failed += 1
+    evs = [ev for _, ev in selected.iterrows()]
+    if progress:
+        from tqdm import tqdm
+        evs = tqdm(evs, desc='ML features')
+    if n_jobs == 1:
+        rows = [_event_features_safe(ev, cd, cfg) for ev in evs]
+    else:
+        # -- One job per event; the flux cube is memory-mapped, so workers re-open the file, not copy it -- #
+        from joblib import Parallel, delayed
+        rows = Parallel(n_jobs=n_jobs)(delayed(_event_features_safe)(ev, cd, cfg) for ev in evs)
+    failed = sum(r is None for r in rows)
+    rows = [{} if r is None else r for r in rows]
     if failed:
         print(f'  S{sector} C{cam} C{ccd} cut {cut}: feature extraction failed for {failed}/{len(selected)} events')
 
@@ -1719,7 +1737,7 @@ def load_default_classifier(path=None):
 
 
 def classify_cut(data_path, sector, cam, ccd, cut, n=8, model=None, unsure_below=UNSURE_BELOW, config=None,
-                 events=None):
+                 events=None, progress=False, n_jobs=1):
     """
     Stage-1 class probabilities for every event in a cut's detected_events.csv.
 
@@ -1733,6 +1751,7 @@ def classify_cut(data_path, sector, cam, ccd, cut, n=8, model=None, unsure_below
 
     events : the cut's event table if already in memory (the detector's, before saving); None = read
         detected_events.csv.
+    n_jobs : joblib workers for the feature extraction (see extract_cut_features).
 
     Returns objid, eventid, p_<class> per class and ml_classification, one row per event in the table's order.
     """
@@ -1751,7 +1770,7 @@ def classify_cut(data_path, sector, cam, ccd, cut, n=8, model=None, unsure_below
     if fb1.any():
         cfg = {'crossmatch': False, 'max_tagged': None, **(config or {})}
         feats = extract_cut_features(data_path, sector, cam, ccd, cut, n, events=events[fb1], config=cfg,
-                                     all_events=events)
+                                     all_events=events, progress=progress, n_jobs=n_jobs)
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
             pred = model.predict(feats)

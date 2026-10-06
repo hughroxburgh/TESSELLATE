@@ -2440,7 +2440,8 @@ class Detector():
         if 'pipe_tag' not in events:            # older file: only its CosmicRay / Junk tags come from localisation
             events['pipe_tag'] = np.where(events['rule_tag'].isin(['CosmicRay', 'Junk']), events['rule_tag'], '-')
 
-        res = classify_cut(self.data_path, self.sector, self.cam, self.ccd, self.cut, self.n, events=events)
+        res = classify_cut(self.data_path, self.sector, self.cam, self.ccd, self.cut, self.n, events=events,
+                           progress=True, n_jobs=self.cpu)
         res = res.drop_duplicates(['objid', 'eventid'])
         p_cols = [c for c in res if c.startswith('p_')]
         events = events.drop(columns=[c for c in p_cols if c in events])

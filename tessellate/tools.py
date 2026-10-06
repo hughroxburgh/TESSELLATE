@@ -312,6 +312,7 @@ def _remove_reductions(data_path,sector,n,cams,ccds,cuts,part):
                             os.system(f'rm -f detected_events.csv detected_events.parquet')
                             os.system(f'rm -f detected_sources.csv detected_sources.parquet')
                             os.system(f'rm -f detected_objects.csv detected_objects.parquet')
+                            os.system(f'rm -f single_isolated_detections.csv single_isolated_detections.parquet')
                             os.system('rm -f figs.zip')
                             os.system('rm -f lcs.zip')  
                         except:
@@ -324,6 +325,7 @@ def _remove_reductions(data_path,sector,n,cams,ccds,cuts,part):
                         os.system(f'rm -f detected_events.csv detected_events.parquet')
                         os.system(f'rm -f detected_sources.csv detected_sources.parquet')
                         os.system(f'rm -f detected_objects.csv detected_objects.parquet')
+                        os.system(f'rm -f single_isolated_detections.csv single_isolated_detections.parquet')
                         os.system('rm -f figs.zip')
                         os.system('rm -f lcs.zip')  
                     except:
@@ -395,6 +397,7 @@ def _remove_search(data_path,sector,n,cams,ccds,cuts,part):
                             os.system(f'rm -f detected_events.csv detected_events.parquet')
                             os.system(f'rm -f detected_sources.csv detected_sources.parquet')
                             os.system(f'rm -f detected_objects.csv detected_objects.parquet')
+                            os.system(f'rm -f single_isolated_detections.csv single_isolated_detections.parquet')
                             os.system('rm -f figs.zip')
                             os.system('rm -f lcs.zip') 
                         except:
@@ -405,6 +408,7 @@ def _remove_search(data_path,sector,n,cams,ccds,cuts,part):
                         os.system(f'rm -f detected_events.csv detected_events.parquet')
                         os.system(f'rm -f detected_sources.csv detected_sources.parquet')
                         os.system(f'rm -f detected_objects.csv detected_objects.parquet')
+                        os.system(f'rm -f single_isolated_detections.csv single_isolated_detections.parquet')
                         os.system('rm -f figs.zip')
                         os.system('rm -f lcs.zip')  
                     except:

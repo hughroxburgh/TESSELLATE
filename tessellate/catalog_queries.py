@@ -355,7 +355,8 @@ def get_variable_cats(coords,radius,verbose):
 
 def create_external_var_cat(center,size,save_path,verbose=False):
     varcat = get_variable_cats(center,size,verbose=verbose)
-    varcat.to_csv(save_path+'/variable_catalog.csv',index=False)
+    from .tools import save_table
+    save_table(varcat,save_path+'/variable_catalog.csv')
 
 
 def join_cats(obs_cat, viz_cat,rad = 2):

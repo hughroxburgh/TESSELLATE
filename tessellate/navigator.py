@@ -189,10 +189,10 @@ class Navigator():
 
         if isolated: 
             try:
-                self.isolated = pd.read_csv(f'{path}/single_isolated_detections.csv')    # raw detection results
+                self.isolated = load_table(f'{path}/single_isolated_detections.csv')    # raw detection results
             except:
                 print('No detected isolated sources file found')
-                self.isoalted = None
+                self.isolated = None
 
     def gather_data(self,cut,flux=True,time=True,ref=False,mask=False,bkg=False,verbose=True):
         """

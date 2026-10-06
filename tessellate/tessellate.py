@@ -2541,7 +2541,7 @@ export PYTHONUNBUFFERED=1\n\
                 for cut in self.cuts:
                     if cut not in completed:
                         save_path = f'{base_path}/Cut{cut}of{self.n**2}'
-                        if os.path.exists(f'{save_path}/variable_catalog.csv') & os.path.exists(f'{save_path}/local_gaia_cat.csv'):
+                        if table_exists(f'{save_path}/variable_catalog.csv') & os.path.exists(f'{save_path}/local_gaia_cat.csv'):
                             completed.append(cut)
                         elif os.path.exists(f'{save_path}/cut.txt'):
 
@@ -2579,7 +2579,7 @@ export PYTHONUNBUFFERED=1\n\
                                     #     attempt += 1
 
                             
-                            if os.path.exists(f'{save_path}/variable_catalog.csv'):
+                            if table_exists(f'{save_path}/variable_catalog.csv'):
                                 print('--Variable catalog already made, skipping.')
                             else:
                                 rad2 = rad*21/60**2

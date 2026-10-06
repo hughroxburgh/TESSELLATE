@@ -1558,7 +1558,7 @@ class Detector():
         
         # -- Save out single detections which are isolated in space in time, probably noise, maybe cool -- #
         if isolate_single_detections:
-            single_isolated_detections.to_csv(f'{save_folder}/single_isolated_detections.csv',index=False)
+            save_table(single_isolated_detections,f'{save_folder}/single_isolated_detections.csv')
         
         results['frame_bin'] = frame_bin
 
@@ -2007,7 +2007,7 @@ class Detector():
                     events.loc[i, 'nearest_gaia_dy'] = float(dy_pix[best_idx])
 
         # -- Cross matches location to variable catalog -- #
-        variables = pd.read_csv(f'{self.path}/Cut{self.cut}of{self.n**2}/variable_catalog.csv')
+        variables = load_table(f'{self.path}/Cut{self.cut}of{self.n**2}/variable_catalog.csv')
         for i, event in events.iterrows():
             if crossmatch[i] and len(variables):
                 # same rule as Gaia: on-sky offsets (RA wrapped, x cos dec) within CROSSMATCH_NSIGMA sigma

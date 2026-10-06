@@ -1101,7 +1101,8 @@ def _crossmatch_features(events, data_path, sector, cam, ccd, cut, n=8):
     out.loc[idx, 'xm_gaia_brightest_1px'] = [np.nanmin(mag[v]) if len(v) else np.nan for v in close]
 
     try:
-        variables = pd.read_csv(f'{path}/variable_catalog.csv')
+        from .tools import load_table
+        variables = load_table(f'{path}/variable_catalog.csv')
         if len(variables):
             vx, vy = wcs.all_world2pix(variables['ra'].to_numpy(), variables['dec'].to_numpy(), 0)
             out.loc[idx, 'xm_var_sep'] = cKDTree(np.c_[vx, vy]).query(pts, k=1)[0]

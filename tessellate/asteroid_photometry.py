@@ -1208,6 +1208,8 @@ def pool_offset_from_stacks(ephemeris, cube, sector, cam, ccd, ccd_x0, ccd_y0, p
         # explicit columns: a cut where no track has a usable stamp still gets a 'used' column
         diagnostics = pd.DataFrame([r for r in rows if r], columns=_OFFSET_COLUMNS)
     diagnostics = diagnostics.sort_values("designation").reset_index(drop=True)
+    # explicit types: an empty table (no track with a usable stamp) is otherwise all object columns
+    diagnostics = diagnostics.astype({c: float for c in ["offset_x", "offset_y", "sig", "flux", "mag", "mag_err"]})
     diagnostics["used"] = diagnostics["used"].astype(bool)
 
     used_offsets = diagnostics[diagnostics["used"]]
@@ -1231,8 +1233,9 @@ def track_offsets(designations, diagnostics, cut_offset_x, cut_offset_y, sig_thr
     out['offset_x'] = cut_offset_x if cut_ok else 0.0
     out['offset_y'] = cut_offset_y if cut_ok else 0.0
     out['offset_source'] = 'cut' if cut_ok else 'none'
-    own = diagnostics[np.isfinite(diagnostics['offset_x']) & np.isfinite(diagnostics['offset_y'])
-                      & np.isfinite(diagnostics['sig']) & (diagnostics['sig'] >= sig_threshold)]
+    num = {c: pd.to_numeric(diagnostics[c], errors='coerce') for c in ['offset_x', 'offset_y', 'sig']}
+    own = diagnostics[np.isfinite(num['offset_x']) & np.isfinite(num['offset_y'])
+                      & np.isfinite(num['sig']) & (num['sig'] >= sig_threshold)]
     own = own.set_index('designation').reindex(out.index).dropna(subset=['offset_x'])
     out.loc[own.index, 'offset_x'] = own['offset_x'].astype(float)
     out.loc[own.index, 'offset_y'] = own['offset_y'].astype(float)

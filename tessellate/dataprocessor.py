@@ -524,7 +524,6 @@ class DataProcessor():
 
         """
 
-        import lightkurve as lk
         from astropy.io import fits
         from astropy.wcs import WCS
         from .asteroid_prediction import predict_asteroids_for_footprint, plot_asteroid_trails
@@ -553,19 +552,14 @@ class DataProcessor():
         for i in range(2 if part else 1):
             part_label = f' Part {i+1}' if part else ''
             cutFolder = f'{file_path}/Part{i+1}/Cut{cut}of{n**2}' if part else f'{file_path}/Cut{cut}of{n**2}'
-            cutName = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}.fits'
-            cutPath = f'{cutFolder}/{cutName}'
             base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
             times_path = f'{cutFolder}/{base}_Times.npy'
 
-            if os.path.exists(cutPath):
-                mjd = lk.read(cutPath).time.mjd
-            elif os.path.exists(times_path):
-                # raw cut TPF already cleaned up post-reduce() -- reduce()'s own saved frame
-                # times cover the same thing (a strict subset if bad-quality frames were dropped)
+            # the frame times saved by the reduction -- no cut data is loaded
+            if os.path.exists(times_path):
                 mjd = np.load(times_path)
             else:
-                print(f'No cut or reduced times found to predict asteroids for '
+                print(f'No saved frame times found to predict asteroids for '
                       f'(Cam {cam} Ccd {ccd} Cut {cut}{part_label})!')
                 continue
 
@@ -639,7 +633,6 @@ class DataProcessor():
             cuts to write (default all n**2); the prediction covers the whole CCD regardless
         part : bool
         """
-        import lightkurve as lk
         import pandas as pd
         from astropy.io import fits
         from astropy.wcs import WCS
@@ -680,14 +673,12 @@ class DataProcessor():
             for cut in cuts:
                 cutFolder = f'{file_path}/Part{i+1}/Cut{cut}of{n**2}' if part else f'{file_path}/Cut{cut}of{n**2}'
                 base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
-                cutPath = f'{cutFolder}/{base}.fits'
                 times_path = f'{cutFolder}/{base}_Times.npy'
-                if os.path.exists(cutPath):
-                    cut_mjds[cut] = np.asarray(lk.read(cutPath).time.mjd, dtype=float)
-                elif os.path.exists(times_path):
+                # the frame times saved by the reduction -- no cut data is loaded
+                if os.path.exists(times_path):
                     cut_mjds[cut] = np.load(times_path)
                 else:
-                    print(f'No cut or reduced times found to predict asteroids for '
+                    print(f'No saved frame times found to predict asteroids for '
                           f'(Cam {cam} Ccd {ccd} Cut {cut}{part_label})!')
             if not cut_mjds:
                 continue

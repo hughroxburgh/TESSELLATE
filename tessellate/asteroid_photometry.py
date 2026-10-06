@@ -285,7 +285,7 @@ _PSF_COLUMNS = ["designation", "frame", "mjd", "x", "y", "flux", "e_flux", "back
 
 
 def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
-                            prf_path=None, stamp_size=STAMP_SIZE, n_workers=None):
+                            prf_path=None, stamp_size=STAMP_SIZE, n_workers=None, vectorised=True):
     """Forced PSF photometry (joint fit of [target PRF shape, flat local
     background]) at every predicted (frame, x, y), reusing the same
     per-frame linear solve psf_flux_calibration.py's zeropoint calibration
@@ -296,10 +296,15 @@ def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
     only to look up the right PRF model for this part of the CCD -- x, y
     in ephemeris_df stay in the cube's local frame throughout.
 
-    Parallelised across tracks (see _run_parallel_by_track) when there's
-    more than one and n_workers != 1; pass n_workers=1 to force sequential."""
+    By default every frame of every track is fitted at once (_forced_psf_photometry_vectorised:
+    the same fit, with the PRF at each frame's exact detector position from prf_grid). With
+    vectorised=False, the per-frame path: parallelised across tracks (see _run_parallel_by_track)
+    when there's more than one and n_workers != 1; pass n_workers=1 to force sequential."""
     from .psf_flux_calibration import PRF_PATH_DEFAULT
     prf_path = prf_path or PRF_PATH_DEFAULT
+    if vectorised:
+        return _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
+                                                 prf_path, stamp_size)
 
     result = _run_parallel_by_track(cube, ephemeris_df, _psf_track_worker,
                                       (sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size),
@@ -307,6 +312,56 @@ def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
     if result is not None:
         return result
     return _forced_psf_photometry_core(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size)
+
+
+def _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size,
+                                      chunk=50000):
+    """_psf_lc_core's fit -- PRF template (normalised to 1 within the stamp) plus a flat background,
+    least squares on the finite pixels, error from 1.4826 x the median absolute residual -- for
+    every row at once, in closed form, with each row's PRF at its exact detector position
+    (prf_grid) rather than the per-100 px cached one. Rows whose stamp leaves the cube, or with
+    fewer than 3 finite pixels or a singular fit, are dropped, as the per-frame path drops them."""
+    from .prf_grid import get_grid
+    if len(ephemeris_df) == 0:
+        return pd.DataFrame(columns=_PSF_COLUMNS)
+    grid = get_grid(cam, ccd, sector, prf_path)
+    half = stamp_size // 2
+    off = np.arange(-half, half + 1)
+    eph = ephemeris_df[['designation', 'frame', 'mjd', 'x', 'y']].reset_index(drop=True)
+    x, y, f = eph['x'].to_numpy(float), eph['y'].to_numpy(float), eph['frame'].to_numpy(int)
+    xi, yi = np.round(x).astype(int), np.round(y).astype(int)          # as int(round()) in the per-frame path
+    inside = np.flatnonzero((xi - half >= 0) & (yi - half >= 0) & (xi + half + 1 <= cube.shape[2])
+                            & (yi + half + 1 <= cube.shape[1]))
+    parts = []
+    for start in range(0, len(inside), chunk):
+        k = inside[start:start + chunk]
+        D = np.asarray(cube[f[k][:, None, None], (yi[k][:, None] + off)[:, :, None],
+                            (xi[k][:, None] + off)[:, None, :]], dtype=float).reshape(len(k), -1)
+        T = grid.images(ccd_x0 + x[k], ccd_y0 + y[k], x[k] - xi[k], y[k] - yi[k], half).reshape(len(k), -1)
+        s = np.nansum(T, axis=1)
+        T = np.where((np.isfinite(s) & (s > 0))[:, None], T / np.where(s > 0, s, 1)[:, None], 0.0)
+        good = np.isfinite(D) & np.isfinite(T)
+        n = good.sum(axis=1).astype(float)
+        Dz, Tz = np.where(good, D, 0.0), np.where(good, T, 0.0)
+        stt, st, sd, std = (Tz * Tz).sum(1), Tz.sum(1), Dz.sum(1), (Tz * Dz).sum(1)
+        det = n * stt - st ** 2
+        ok = (n >= 3) & (np.abs(det) > 1e-12 * np.maximum(n * stt, 1e-300))
+        det = np.where(ok, det, np.nan)
+        flux = (n * std - st * sd) / det
+        bg = (stt * sd - st * std) / det
+        resid = np.where(good, D - flux[:, None] * T - bg[:, None], np.nan)
+        med = np.nanmedian(resid, axis=1)
+        sigma = 1.4826 * np.nanmedian(np.abs(resid - med[:, None]), axis=1)
+        e_flux = sigma * np.sqrt(n / det)
+        out = eph.iloc[k[ok]].copy()
+        out['flux'], out['e_flux'], out['background'] = flux[ok], e_flux[ok], bg[ok]
+        parts.append(out)
+    if not parts:
+        return pd.DataFrame(columns=_PSF_COLUMNS)
+    out = pd.concat(parts).sort_index().reset_index(drop=True)
+    e = out['e_flux'].to_numpy()
+    out['sig'] = np.where(np.isfinite(e) & (e > 0), out['flux'].to_numpy() / np.where(e > 0, e, 1), np.nan)
+    return out[_PSF_COLUMNS]
 
 
 def _forced_psf_photometry_core(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size):
@@ -417,16 +472,19 @@ def detrend_pixel_phase(df, flux_col="flux", e_flux_col="e_flux"):
     out = df.copy()
     out["xfrac"] = out["x"] - np.round(out["x"])
     out["yfrac"] = out["y"] - np.round(out["y"])
-    out["flux_detrended"] = out[flux_col]
+    flux_all = out[flux_col].to_numpy(dtype=float)
+    xfrac, yfrac = out["xfrac"].to_numpy(), out["yfrac"].to_numpy()
+    detrended = flux_all.copy()
 
-    for designation, idx in out.groupby("designation").groups.items():
-        idx = np.asarray(idx)
+    # positional indices into numpy arrays: per-track .loc reads and writes were most of this
+    # function's time on a dense cut, not the fits
+    for idx in out.groupby("designation").indices.values():
         if len(idx) < MIN_POINTS_FOR_DETREND:
             continue
-        flux = out.loc[idx, flux_col].values
-        model = _detrend_robust_fit(flux, out.loc[idx, "xfrac"].values, out.loc[idx, "yfrac"].values)
-        correction = model - np.nanmean(model)
-        out.loc[idx, "flux_detrended"] = flux - correction
+        flux = flux_all[idx]
+        model = _detrend_robust_fit(flux, xfrac[idx], yfrac[idx])
+        detrended[idx] = flux - (model - np.nanmean(model))
+    out["flux_detrended"] = detrended
 
     if e_flux_col in out.columns:
         out["sig_detrended"] = np.where(out[e_flux_col] > 0, out["flux_detrended"] / out[e_flux_col], np.nan)
@@ -670,20 +728,49 @@ def flag_star_contamination(df, stars, flux_col="flux"):
         out["contaminating_star_dist_px"] = contaminating_star_dist_px
         out["contaminating_star_mag"] = contaminating_star_mag
 
-    out["local_flux_excess"] = False
-    out["near_bright_star"] = False
-    contaminating_star_idx = pd.Series(contaminating_star_idx, index=out.index)
-    for designation, idx in out.groupby("designation").groups.items():
-        idx = np.asarray(idx)
-        mjd_g = out.loc[idx, "mjd"].values
-        excess_g = _local_excess_mask(mjd_g, out.loc[idx, flux_col].values)
-        prox_g = out.loc[idx, "near_star_proximity"].values
-        star_idx_g = contaminating_star_idx.loc[idx].values
-        out.loc[idx, "local_flux_excess"] = excess_g
-        out.loc[idx, "near_bright_star"] = (_expand_flag_over_excess_runs(mjd_g, excess_g, prox_g)
-                                             | _long_proximity_runs_mask(mjd_g, prox_g, star_idx_g))
-
+    excess, near = _contamination_flags(out["designation"].to_numpy(), out["mjd"].to_numpy(dtype=float),
+                                        out[flux_col].to_numpy(dtype=float),
+                                        out["near_star_proximity"].to_numpy(dtype=bool), contaminating_star_idx)
+    out["local_flux_excess"] = excess
+    out["near_bright_star"] = near
     return out
+
+
+def _contamination_flags(designation, mjd, flux, proximity, star_idx):
+    """_local_excess_mask, _expand_flag_over_excess_runs and _long_proximity_runs_mask for every
+    track at once: one sort by (track, mjd), the rolling medians per track in one grouped pass, and
+    the runs found with array operations instead of a Python loop per track and per row.
+    Returns (local_flux_excess, near_bright_star) in the input order."""
+    n = len(mjd)
+    if n == 0:
+        return np.zeros(0, dtype=bool), np.zeros(0, dtype=bool)
+    track = pd.factorize(designation)[0]
+    order = np.lexsort((mjd, track))
+    t, f = track[order], flux[order]
+    p, sid = proximity[order], star_idx[order]
+    s = pd.Series(f)
+    roll = dict(window=LOCAL_EXCESS_WINDOW, center=True, min_periods=5)
+    baseline = s.groupby(t).rolling(**roll).median().droplevel(0).sort_index()
+    resid = s - baseline
+    resid_med = resid.groupby(t).rolling(**roll).median().droplevel(0).sort_index()
+    mad = (resid - resid_med).abs().groupby(t).rolling(**roll).median().droplevel(0).sort_index() * 1.4826
+    e = (resid.abs() > LOCAL_EXCESS_NSIGMA * mad).to_numpy()
+
+    same_track = np.r_[False, t[1:] == t[:-1]]
+    # excess runs containing any proximity point are flagged whole
+    start = e & ~(np.r_[False, e[:-1]] & same_track)
+    run = np.cumsum(start) - 1
+    has_prox = np.bincount(run[e], weights=p[e].astype(float), minlength=max(run.max() + 1, 1)) > 0
+    flag = e & has_prox[np.maximum(run, 0)]
+    # sustained proximity to one and the same star
+    start = p & ~(np.r_[False, p[:-1]] & same_track & np.r_[False, sid[1:] == sid[:-1]])
+    run = np.cumsum(start) - 1
+    length = np.bincount(run[p], minlength=max(run.max() + 1, 1))
+    flag |= p & (length[np.maximum(run, 0)] >= MIN_PROXIMITY_RUN_LENGTH)
+
+    excess, near = np.empty(n, dtype=bool), np.empty(n, dtype=bool)
+    excess[order], near[order] = e, flag
+    return excess, near
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +799,38 @@ def _stack_track(track, n_stack):
                           flux=flux, e_flux=e_flux, sig=flux / e_flux, n_frames=len(chunk),
                           bin_index=bin_index))
     return pd.DataFrame(rows)
+
+
+def stack_summary(psf_df, sig_target=STACK_SIG_TARGET):
+    """stack_lightcurves' summary alone, for every track at once: the binned fluxes only enter
+    through each bin's significance, sum(f w) / sqrt(sum w), so per-bin sums give achieved_sig
+    without building the stacked lightcurves (most of a dense cut's stacking time)."""
+    cols = ["designation", "avg_sig", "stacking_needed", "n_stack", "n_frames", "achieved_sig"]
+    clean = psf_df[~psf_df["near_bright_star"].to_numpy(dtype=bool)]
+    if len(clean) == 0:
+        return pd.DataFrame(columns=cols).set_index("designation")
+    g = clean.groupby("designation", sort=True)
+    summary = pd.DataFrame({"avg_sig": g["sig_detrended"].mean(), "n_frames": g.size()})
+    avg = summary["avg_sig"].to_numpy()
+    summary["stacking_needed"] = ~(avg > sig_target)
+    ok = np.isfinite(avg) & (avg > 0)
+    n_needed = np.where(ok, np.maximum(np.ceil((sig_target / np.where(ok, avg, 1)) ** 2), 1), np.nan)
+    feasible = summary["stacking_needed"].to_numpy() & ok & (n_needed <= summary["n_frames"].to_numpy())
+    summary["n_stack"] = np.where(~summary["stacking_needed"], 1.0, np.where(feasible, n_needed, np.nan))
+    summary["achieved_sig"] = np.where(~summary["stacking_needed"], avg, np.nan)
+    if feasible.any():
+        need = pd.Series(n_needed, index=summary.index)[feasible]
+        rows = clean[clean["designation"].isin(need.index)].sort_values(["designation", "mjd"], kind="stable")
+        rank = rows.groupby("designation", sort=False).cumcount().to_numpy()
+        per_row_n = rows["designation"].map(need).to_numpy()
+        bins = pd.DataFrame({"designation": rows["designation"].to_numpy(), "bin": rank // per_row_n})
+        w = 1.0 / rows["e_flux"].to_numpy(dtype=float) ** 2
+        bins["w"], bins["fw"] = w, rows["flux_detrended"].to_numpy(dtype=float) * w
+        sums = bins.groupby(["designation", "bin"], sort=False)[["w", "fw"]].sum(min_count=1)
+        sig = (sums["fw"] / np.sqrt(sums["w"])).groupby(level=0).max()
+        summary.loc[sig.index, "achieved_sig"] = sig
+    summary.index.name = "designation"
+    return summary[cols[1:]]
 
 
 def stack_lightcurves(psf_df, sig_target=STACK_SIG_TARGET):
@@ -771,6 +890,9 @@ STACK_CENTROID_MIN_STAMPS = 5
 # model (measure_stack_offset): injection-recovery on Sector 29 Cam 2 Ccd 2 Cut 23 gave 0.021 vs
 # 0.037 px RMS at stack S/N ~95, but no gain at ~40 and below
 MATCHED_FIT_SIG = 50.0
+# offset fits go to the worker pool only for cuts with at least this many tracks: starting the pool
+# and copying the cube into shared memory costs ~1-2 s, more than fitting a few dozen tracks serially
+OFFSET_PARALLEL_MIN_TRACKS = 100
 
 
 def measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=None,
@@ -1006,8 +1128,37 @@ def measure_stack_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path
     return float(ox), float(oy), float(sig), float(flux), len(stamps)
 
 
+_OFFSET_COLUMNS = ["designation", "offset_x", "offset_y", "sig", "flux", "mag", "mag_err", "n_stamps", "used", "fit"]
+
+
+def _track_offset_row(track, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, zp_ab, sig_threshold, stamp_kwargs):
+    """One track's stack-fit offset as a diagnostics row (None if it has no usable stamp)."""
+    ox, oy, sig, flux, n_stamps = measure_stack_centroid_offset(
+        track, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=prf_path, **stamp_kwargs)
+    fit = "single"
+    if np.isfinite(sig) and sig >= MATCHED_FIT_SIG:
+        m = measure_stack_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=prf_path)
+        if np.isfinite(m[0]) and np.isfinite(m[1]) and np.isfinite(m[2]):
+            ox, oy, sig, flux, n_stamps = m
+            fit = "matched"
+    if n_stamps == 0:
+        return None
+    used = bool(np.isfinite(ox) and np.isfinite(sig) and sig >= sig_threshold)
+    mag = -2.5 * np.log10(flux) + zp_ab if zp_ab is not None and flux is not None and np.isfinite(flux) and flux > 0 else np.nan
+    mag_err = 1.0857 / sig if np.isfinite(sig) and sig > 0 else np.nan
+    return dict(designation=track["designation"].iloc[0], offset_x=ox, offset_y=oy, sig=sig, flux=flux, mag=mag,
+                mag_err=mag_err, n_stamps=n_stamps, used=used, fit=fit)
+
+
+def _offset_track_worker(track_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, zp_ab, sig_threshold, stamp_kwargs):
+    row = _track_offset_row(track_df, _worker_cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, zp_ab,
+                            sig_threshold, stamp_kwargs)
+    return pd.DataFrame([row] if row else [], columns=_OFFSET_COLUMNS)
+
+
 def pool_offset_from_stacks(ephemeris, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=None, zp_ab=None,
-                              sig_threshold=STACK_CENTROID_SIG_THRESHOLD, min_tracks=2, **stamp_kwargs):
+                              sig_threshold=STACK_CENTROID_SIG_THRESHOLD, min_tracks=2, n_workers=None,
+                              **stamp_kwargs):
     """Robust per-cut (dx, dy) offset, pooled (median) from the individual
     shift-and-stack centroid offsets (measure_stack_centroid_offset) of
     every track that reaches at least sig_threshold in ITS OWN joint
@@ -1042,33 +1193,22 @@ def pool_offset_from_stacks(ephemeris, cube, sector, cam, ccd, ccd_x0, ccd_y0, p
     by construction, no separate uncertainty needed) and a `used` flag
     marking which tracks fed the pooled offset -- so the trust decision is
     inspectable after the fact instead of only the final pooled number."""
-    rows = []
-    for designation, track in ephemeris.groupby("designation"):
-        ox, oy, sig, flux, n_stamps = measure_stack_centroid_offset(
-            track, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=prf_path, **stamp_kwargs)
-        fit = "single"
-        if np.isfinite(sig) and sig >= MATCHED_FIT_SIG:
-            m = measure_stack_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=prf_path)
-            if np.isfinite(m[0]) and np.isfinite(m[1]) and np.isfinite(m[2]):
-                ox, oy, sig, flux, n_stamps = m
-                fit = "matched"
-        used = bool(np.isfinite(ox) and np.isfinite(sig) and sig >= sig_threshold)
-        if zp_ab is not None and flux is not None and np.isfinite(flux) and flux > 0:
-            mag = -2.5 * np.log10(flux) + zp_ab
-        else:
-            mag = np.nan
-        mag_err = 1.0857 / sig if np.isfinite(sig) and sig > 0 else np.nan
-        if n_stamps == 0:
-            continue
-        rows.append(dict(designation=designation, offset_x=ox, offset_y=oy, sig=sig,
-                          flux=flux, mag=mag, mag_err=mag_err, n_stamps=n_stamps, used=used, fit=fit))
-    # pd.DataFrame([]) has no columns at all (not even 'used') -- a cut where every single
-    # predicted track has zero usable stamps (confirmed: a real cut, no tracks ever land
-    # in-bounds) would otherwise raise KeyError on the diagnostics["used"] access below
-    # instead of just producing zero used tracks, same pitfall already guarded against in
-    # forced_aperture_photometry/forced_psf_photometry's own empty-result cases
-    diagnostics = pd.DataFrame(rows, columns=["designation", "offset_x", "offset_y", "sig",
-                                                "flux", "mag", "mag_err", "n_stamps", "used", "fit"])
+    # one fit per track, in the shared-cube worker pool (_run_parallel_by_track); it ran on the
+    # main process alone, ~45% of a dense cut's time with the other cores idle
+    from .psf_flux_calibration import PRF_PATH_DEFAULT
+    prf_path = prf_path or PRF_PATH_DEFAULT     # resolved here: spawned workers don't see a patched default
+    if n_workers is None and ephemeris["designation"].nunique() < OFFSET_PARALLEL_MIN_TRACKS:
+        n_workers = 1
+    diagnostics = _run_parallel_by_track(cube, ephemeris, _offset_track_worker,
+                                         (sector, cam, ccd, ccd_x0, ccd_y0, prf_path, zp_ab, sig_threshold, stamp_kwargs),
+                                         _OFFSET_COLUMNS, n_workers)
+    if diagnostics is None:
+        rows = [_track_offset_row(track, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, zp_ab, sig_threshold,
+                                  stamp_kwargs) for _, track in ephemeris.groupby("designation")]
+        # explicit columns: a cut where no track has a usable stamp still gets a 'used' column
+        diagnostics = pd.DataFrame([r for r in rows if r], columns=_OFFSET_COLUMNS)
+    diagnostics = diagnostics.sort_values("designation").reset_index(drop=True)
+    diagnostics["used"] = diagnostics["used"].astype(bool)
 
     used_offsets = diagnostics[diagnostics["used"]]
     if len(used_offsets) < min_tracks:

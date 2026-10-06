@@ -936,7 +936,7 @@ class DataProcessor():
         from .asteroid_photometry import (forced_psf_photometry,
                                             match_ephemeris_to_reduced_frames, detrend_pixel_phase,
                                             local_gaia_cat_to_stars, flag_star_contamination,
-                                            stack_lightcurves, STACK_SIG_TARGET, pool_offset_from_stacks,
+                                            stack_summary, STACK_SIG_TARGET, pool_offset_from_stacks,
                                             track_offsets)
         from . import asteroid_store
 
@@ -1032,7 +1032,7 @@ class DataProcessor():
 
             # Step 3: contamination flags, on the one photometry result actually being saved
             psf_df = flag_star_contamination(psf_df, stars, flux_col='flux_detrended')
-            stack_summary, _ = stack_lightcurves(psf_df)
+            stack_summary_df = stack_summary(psf_df)
 
             # staged for the sector's designation-sorted store (asteroid_store.merge_sector), not
             # saved in the cut folder; the stacked photometry is derived, so it is not stored
@@ -1041,7 +1041,7 @@ class DataProcessor():
                 self.data_path,
                 asteroid_store.photometry_table(psf_df, ephemeris, self.sector, cam, ccd, cut, part_index,
                                                 shape=cube.shape[1:], zp_ab=zp, e_zp_ab=e_zp),
-                asteroid_store.tracks_table(ephemeris, psf_df, stack_summary, offset_diagnostics, offset_x, offset_y,
+                asteroid_store.tracks_table(ephemeris, psf_df, stack_summary_df, offset_diagnostics, offset_x, offset_y,
                                             n_offset_tracks, self.sector, cam, ccd, cut, part_index, per_track=per_track,
                                             zp_ab=zp, e_zp_ab=e_zp),
                 self.sector, cam, ccd, cut, part_index)
@@ -1052,8 +1052,8 @@ class DataProcessor():
 
             if self.verbose > 0:
                 n_tracks = ephemeris['designation'].nunique()
-                n_robust = int(((~stack_summary['stacking_needed']) |
-                                 (stack_summary['achieved_sig'] >= STACK_SIG_TARGET)).sum())
+                n_robust = int(((~stack_summary_df['stacking_needed']) |
+                                 (stack_summary_df['achieved_sig'] >= STACK_SIG_TARGET)).sum())
                 print(f'Cam {cam} CCD {ccd} Cut {cut}{part_label} asteroid lightcurves complete '
                       f'({n_tracks} tracks, {n_robust} robustly detected).')
                 print('\n')

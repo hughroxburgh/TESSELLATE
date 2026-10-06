@@ -78,6 +78,52 @@ class PRFGrid:
         return ((1 - ty) * (1 - tx) * self.cube[r, c] + (1 - ty) * tx * self.cube[r, c + 1]
                 + ty * (1 - tx) * self.cube[r + 1, c] + ty * tx * self.cube[r + 1, c + 1])
 
+    def images(self, ccd_x, ccd_y, x, y, half, group_px=None):
+        """(N, 2 half + 1, 2 half + 1) PRF images, one per source, each as TESS_PRF.locate would give
+        it in that stamp for a source at stamp position (half + x, half + y). Each 13x13 image sums
+        to 1 before it is placed (pixels falling outside the stamp are lost, as in locate).
+
+        By default the PRF is blended at every source's exact detector position. group_px blends it
+        once per group_px x group_px block (at its centre) and shares it, four sub-pixel lookups per
+        source instead of sixteen: twice as fast on a cut's rows, but 16 px blocks differ from the
+        exact PRF by up to 0.56% of its peak, so it is not the default."""
+        ccd_x, ccd_y = np.asarray(ccd_x, dtype=float), np.asarray(ccd_y, dtype=float)
+        x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+        n, size, pad = len(x), 2 * half + 1, PRF_SIZE // 2
+        sx = np.floor(x + 0.5).astype(int)                 # whole-pixel part, as locate's colint
+        sy = np.floor(y + 0.5).astype(int)
+        cb, _, cw = _sample_weights(x + 0.5 - sx)
+        rb, _, rw = _sample_weights(y + 0.5 - sy)
+        img = np.zeros((n, PRF_SIZE, PRF_SIZE))
+        if group_px:
+            keys, group = np.unique(np.column_stack([np.floor(ccd_x / group_px), np.floor(ccd_y / group_px)]).astype(int),
+                                    axis=0, return_inverse=True)
+            group = group.ravel()
+            blended = np.stack([self.at((kx + 0.5) * group_px, (ky + 0.5) * group_px) for kx, ky in keys])
+            for dsr, wsr in ((0, 1 - rw), (1, rw)):
+                for dsc, wsc in ((0, 1 - cw), (1, cw)):
+                    img += (wsr * wsc)[:, None, None] * blended[group, rb + dsr, cb + dsc]
+        else:
+            r = np.clip(np.searchsorted(self.rows, ccd_y) - 1, 0, len(self.rows) - 2)
+            c = np.clip(np.searchsorted(self.cols, ccd_x) - 1, 0, len(self.cols) - 2)
+            ty = np.clip((ccd_y - self.rows[r]) / (self.rows[r + 1] - self.rows[r]), 0, 1)
+            tx = np.clip((ccd_x - self.cols[c]) / (self.cols[c + 1] - self.cols[c]), 0, 1)
+            for dgr, wgr in ((0, 1 - ty), (1, ty)):
+                for dgc, wgc in ((0, 1 - tx), (1, tx)):
+                    for dsr, wsr in ((0, 1 - rw), (1, rw)):
+                        for dsc, wsc in ((0, 1 - cw), (1, cw)):
+                            img += (wgr * wgc * wsr * wsc)[:, None, None] * self.cube[r + dgr, c + dgc, rb + dsr, cb + dsc]
+        img /= np.maximum(img.sum(axis=(1, 2)), 1e-30)[:, None, None]
+        out = np.zeros((n, size, size))
+        for ox, oy in np.unique(np.column_stack([sx, sy]), axis=0):
+            k = (sx == ox) & (sy == oy)
+            r0, c0 = half + oy - pad, half + ox - pad
+            rs, cs = max(0, r0), max(0, c0)
+            re, ce = min(size, r0 + PRF_SIZE), min(size, c0 + PRF_SIZE)
+            if rs < re and cs < ce:
+                out[k, rs:re, cs:ce] = img[k, rs - r0:re - r0, cs - c0:ce - c0]
+        return out
+
     def stack_model(self, ccd_x, ccd_y, x, y, half, group_px=16):
         """Mean over sources of the PRF image each would give in a (2 half + 1)^2 stamp centred on
         pixel (half, half), for sources at stamp positions (half + x, half + y): x, y are offsets

@@ -897,7 +897,7 @@ class DataProcessor():
 
             del (tessreduce)
 
-    def asteroid_lightcurves(self,cam,ccd,n,cut,part=False,mark_done=True):
+    def asteroid_lightcurves(self,cam,ccd,n,cut,part=False,mark_done=True,n_workers=None):
         """
         Forced aperture + PSF photometry, pixel-phase detrending, star-
         contamination flagging, and shift-and-stack for every asteroid
@@ -926,7 +926,8 @@ class DataProcessor():
         The cut's photometry and tracks tables, staged for the sector's asteroid store
         (asteroid_store.merge_sector), and the cut's asteroid_lightcurves.txt marker.
         mark_done=False writes nothing into the cut folder (no marker), for test runs that must
-        leave the existing products untouched.
+        leave the existing products untouched. n_workers is passed to the track-offset fits
+        (pool_offset_from_stacks); asteroid_lightcurves_ccd sets 1, as each cut has its own core.
 
         """
 
@@ -1010,7 +1011,8 @@ class DataProcessor():
             # and its own joint position+flux fit's significance (not a forced-photometry
             # SNR), so no photometry needs to run before the offset is known.
             offset_x, offset_y, n_offset_tracks, offset_diagnostics = pool_offset_from_stacks(
-                ephemeris, cube, self.sector, cam, ccd, cut_corner[0], cut_corner[1], zp_ab=zp_ab)
+                ephemeris, cube, self.sector, cam, ccd, cut_corner[0], cut_corner[1], zp_ab=zp_ab,
+                n_workers=n_workers)
 
             # both the aperture and the (non-centroiding, fixed-position) PSF fit assume the
             # given x,y IS the source, so a real predicted-vs-actual offset left uncorrected
@@ -1057,20 +1059,29 @@ class DataProcessor():
                 print(f'Cam {cam} CCD {ccd} Cut {cut}{part_label} asteroid lightcurves complete '
                       f'({n_tracks} tracks, {n_robust} robustly detected).')
                 print('\n')
-    def asteroid_lightcurves_ccd(self,cam,ccd,n,cuts=None,part=False,mark_done=True):
+    def asteroid_lightcurves_ccd(self,cam,ccd,n,cuts=None,part=False,mark_done=True,n_workers=None):
         """
-        asteroid_lightcurves() for every requested cut of one CCD, in one job. Cuts already done
-        (asteroid_lightcurves.txt present, or with mark_done=False already staged in the store) are
-        skipped, so a resubmitted job resumes where its predecessor stopped. A cut that fails
-        doesn't stop the rest; the job raises at the end so the sector's merge (which waits on
-        afterok) never runs on an incomplete sector.
+        asteroid_lightcurves() for every requested cut of one CCD, in one job, several cuts at a
+        time: one cut per core (n_workers, default the job's CPUs), each single-threaded with its
+        offset fits serial. Run one after another, a CCD job used ~2 of its 8 cores, as each cut's
+        work is now mostly single-process array operations. Densest cuts (largest prediction
+        files) start first. Workers are spawned, not forked, with single-threaded BLAS set
+        beforehand, so no worker inherits a BLAS thread pool pinned to one core.
+
+        Cuts already done (asteroid_lightcurves.txt present, or with mark_done=False already staged
+        in the store) are skipped, so a resubmitted job resumes where its predecessor stopped. A
+        cut that fails doesn't stop the rest; the job raises at the end so the sector's merge
+        (which waits on afterok) never runs on an incomplete sector. A worker killed outright
+        (e.g. for memory) raises BrokenProcessPool at once.
         """
-        import traceback
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor, as_completed
         from . import asteroid_store
+        from .asteroid_photometry import _available_cpu_count
 
         cuts = list(range(1, n**2 + 1)) if cuts is None else list(cuts)
         file_path = f'{self.path}/Cam{cam}/Ccd{ccd}'
-        failed = []
+        todo = []
         for cut in cuts:
             folders = [f'{file_path}/Part{i}/Cut{cut}of{n**2}' for i in (1, 2)] if part else [f'{file_path}/Cut{cut}of{n**2}']
             if mark_done and all(os.path.exists(f'{f}/asteroid_lightcurves.txt') for f in folders):
@@ -1078,14 +1089,49 @@ class DataProcessor():
             if not mark_done and all(asteroid_store.is_staged(self.data_path, self.sector, cam, ccd, cut, p)
                                      for p in ((1, 2) if part else (0,))):
                 continue
-            ts = t()
-            try:
-                self.asteroid_lightcurves(cam=cam, ccd=ccd, n=n, cut=cut, part=part, mark_done=mark_done)
-            except Exception:
-                traceback.print_exc()
-                failed.append(cut)
-            if self.verbose > 0:
-                print(f'Cam {cam} CCD {ccd} Cut {cut}: {t() - ts:.0f} s')
+            size = sum(os.path.getsize(p) for f in folders
+                       for p in [f'{f}/asteroids/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_Asteroids.parquet']
+                       if os.path.exists(p))
+            todo.append((size, cut))
+        todo = [cut for _, cut in sorted(todo, reverse=True)]
+        n_workers = max(1, min(len(todo), n_workers or _available_cpu_count()))
+
+        failed = []
+        if n_workers == 1:
+            results = (_lightcurves_cut_worker(self.sector, self.data_path, self.verbose, cam, ccd, n, cut, part, mark_done)
+                       for cut in todo)
+        else:
+            for env in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+                        "VECLIB_MAXIMUM_THREADS"):
+                os.environ[env] = "1"
+            os.environ["MKL_THREADING_LAYER"] = "SEQUENTIAL"
+            pool = ProcessPoolExecutor(max_workers=n_workers, mp_context=multiprocessing.get_context("spawn"))
+            futures = [pool.submit(_lightcurves_cut_worker, self.sector, self.data_path, self.verbose, cam, ccd, n, cut,
+                                   part, mark_done) for cut in todo]
+            results = (f.result() for f in as_completed(futures))
+        try:
+            for cut, seconds, error in results:
+                if error:
+                    print(error)
+                    failed.append(cut)
+                if self.verbose > 0:
+                    print(f'Cam {cam} CCD {ccd} Cut {cut}: {seconds:.0f} s', flush=True)
+        finally:
+            if n_workers > 1:
+                pool.shutdown(cancel_futures=True)
 
         if failed:
-            raise RuntimeError(f'Asteroid lightcurves failed for Cam {cam} CCD {ccd} cuts {failed}')
+            raise RuntimeError(f'Asteroid lightcurves failed for Cam {cam} CCD {ccd} cuts {sorted(failed)}')
+
+
+def _lightcurves_cut_worker(sector, data_path, verbose, cam, ccd, n, cut, part, mark_done):
+    """One cut's asteroid_lightcurves in a worker process (offset fits serial: the cut has one core).
+    Returns (cut, seconds, error traceback or None)."""
+    import traceback
+    ts = t()
+    try:
+        DataProcessor(sector=sector, data_path=data_path, verbose=verbose).asteroid_lightcurves(
+            cam=cam, ccd=ccd, n=n, cut=cut, part=part, mark_done=mark_done, n_workers=1)
+        return cut, t() - ts, None
+    except Exception:
+        return cut, t() - ts, traceback.format_exc()

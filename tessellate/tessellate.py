@@ -3118,18 +3118,33 @@ export PYTHONUNBUFFERED=1\n\
         minutes = int(np.ceil(minutes))
         return f"{minutes // 60}:{minutes % 60:02}:00"
 
+    def _cut_n_tracks(self,cam,ccd,cut):
+        """Predicted tracks in a cut (designation column of its prediction table), or None."""
+        import pandas as pd
+        path = (f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/asteroids/'
+                f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{self.n**2}_Asteroids.parquet')
+        try:
+            return pd.read_parquet(path, columns=['designation'])['designation'].nunique()
+        except Exception:
+            return None
+
     def _lightcurves_resources_for_ccd(self,cam,ccd,cuts):
-        """A CCD job builds its cuts one after another: time is the sum of the per-cut estimates and
-        memory the largest of them."""
-        times, mems = [], []
+        """A CCD job runs its cuts one per core (DataProcessor.asteroid_lightcurves_ccd): memory per
+        CPU is the largest single cut's estimate (each core holds a whole cut), and time is the
+        cuts' summed estimate spread over the cores plus the longest single cut. Per-cut estimates
+        are the track-count fits above; a cut without a readable prediction table is skipped by
+        the lightcurves, so it counts as a minute and no memory."""
+        cpu = int(self.asteroid_lightcurves_cpu)
+        times, mems = [], [self._LIGHTCURVES_MEM_FLOOR_GB]
         for cut in cuts:
-            time, cpu, mem = self._lightcurves_resources_for_cut(cam,ccd,cut)
-            parts = list(map(int, str(time).split(':')))
-            h, m, s = [0] * (3 - len(parts)) + parts
-            times.append(3600 * h + 60 * m + s)
-            mems.append(mem)
-        total = sum(times)
-        return f"{total // 3600}:{(total % 3600) // 60:02}:{total % 60:02}", cpu, max(mems)
+            n_tracks = self._cut_n_tracks(cam,ccd,cut)
+            if n_tracks is None:
+                times.append(60)
+            else:
+                times.append(self._LIGHTCURVES_TIME_PER_TRACK_S * n_tracks + self._LIGHTCURVES_TIME_FLOOR_S)
+                mems.append(self._LIGHTCURVES_MEM_PER_TRACK_GB * n_tracks + self._LIGHTCURVES_MEM_FLOOR_GB)
+        total = int(sum(times) / max(cpu, 1) + max(times))
+        return f"{total // 3600}:{(total % 3600) // 60:02}:{total % 60:02}", cpu, int(np.ceil(max(mems)))
 
     def _ccd_asteroid_lightcurves(self,cam,ccd,cuts):
 

@@ -66,7 +66,8 @@ def _scale_to_zp(f):
 
 TESS_PIX_SCALE = 21.0  # arcsec/pixel
 GAIA_PATH_DEFAULT = '/fred/oz335/GAIAdata/full_gaia_cat.csv'
-PRF_PATH_DEFAULT = '/fred/oz335/_local_TESS_PRFs'
+# TESSELLATE_PRF_PATH overrides it (e.g. a local copy; seen by spawned worker processes too)
+PRF_PATH_DEFAULT = os.environ.get('TESSELLATE_PRF_PATH', '/fred/oz335/_local_TESS_PRFs')
 
 
 # ---------------------------------------------------------------------------

@@ -523,7 +523,14 @@ def local_gaia_cat_to_stars(gaia_cat, wcs, ccd_x0, ccd_y0):
     comparison, so argmin can get stuck returning that star's index
     instead of the true closest/worst one -- confirmed: this silently
     hid a real, obvious 0.55px/Gmag=9.76 contaminating star)."""
-    gaia_cat = gaia_cat.dropna(subset=["Gmag"])
+    # numeric coercion: a catalog file cut off mid-row (Sector 38 Cam 3 Ccd 4 Cut 34 ends on a
+    # lone "-") turns its column into strings, which all_world2pix rejects; such rows are dropped
+    gaia_cat = gaia_cat.assign(**{c: pd.to_numeric(gaia_cat[c], errors="coerce") for c in ("ra", "dec", "Gmag")})
+    n = len(gaia_cat)
+    gaia_cat = gaia_cat.dropna(subset=["ra", "dec", "Gmag"])
+    if n - len(gaia_cat) > 0.05 * max(n, 1):
+        import warnings
+        warnings.warn(f"local_gaia_cat_to_stars: {n - len(gaia_cat)} of {n} catalog rows unreadable", RuntimeWarning)
     x, y = wcs.all_world2pix(gaia_cat["ra"].values, gaia_cat["dec"].values, 0)
     return pd.DataFrame({"x": x - ccd_x0, "y": y - ccd_y0, "mag": gaia_cat["Gmag"].values})
 

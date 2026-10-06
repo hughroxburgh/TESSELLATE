@@ -940,14 +940,21 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_func, exposure_time, big_size
         psf_like = 0
         psf_diff = np.nan
         stacked_psf_fit = 0
+        psf_pinned = 0
     else:
 
         # --- PSF fit --- #
+        lim = 0.5
         fitter = PSF_Fitter(small_size, prf)
-        fitter.fit_psf(centred_flux, limx=0.5, limy=0.5)
+        fitter.fit_psf(centred_flux, limx=lim, limy=lim)
 
         xcentroid = fitter.source_x + brightest_x      # raw fit; the radial shift is removed from xcentroid/ycentroid later
         ycentroid = fitter.source_y + brightest_y
+
+        # The fit stopped at the edge of its +-0.5 px box around the brightest pixel: usually the image isn't a clean
+        # point source there and the position isn't trustworthy (refitting further out doesn't land closer to Gaia
+        # stars). A clean source sitting right on a pixel edge also flags (~3%), with a good position.
+        psf_pinned = int(max(abs(fitter.source_x), abs(fitter.source_y)) > lim - 0.001)
         centroid_err_psf = float(uncertainty_func(snr))   # 1 sigma per axis, pixels
 
         psf_like = np.corrcoef(centred_flux.flatten(), fitter.psf.flatten())[0, 1]
@@ -962,6 +969,10 @@ def _Fit_psf(flux, event, prf, frames, uncertainty_func, exposure_time, big_size
     event['psf_like'] = psf_like
     event['psf_diff'] = psf_diff
     event['psf_stacked'] = stacked_psf_fit
+    event['psf_pinned'] = psf_pinned
+    # Distance (px) of the PSF fit from the detection centroid. Large when something else in the stack (e.g. a poor
+    # subtraction residual) took the brightest-pixel choice -- the fit can then settle off the source without pinning
+    event['psf_det_sep'] = np.hypot(xcentroid - event['xcentroid_det'], ycentroid - event['ycentroid_det'])
 
     return event
 
@@ -2330,7 +2341,7 @@ class Detector():
             'snr_psf',
 
             # Morphology
-            'psf_like', 'psf_diff','psf_stacked','com_motion','gaussian_score',
+            'psf_like', 'psf_diff','psf_stacked','psf_pinned','psf_det_sep','com_motion','gaussian_score',
             'ellipticity','fwhm','neg_extent','bad_frame_flag',
 
             # # Frequency Domain

@@ -965,7 +965,7 @@ class Navigator():
         while len(frames) < 5:
             frames = np.append(frames,frames[-1]+frame_interval)
         frames[frames<0] = 0
-        frames[frames>len(time)]=len(time)-1
+        frames[frames>=len(time)]=len(time)-1
         frames = np.unique(frames)
 
         # -- Define cutout -- #
@@ -1268,9 +1268,12 @@ class Navigator():
         
         # axes[0].scatter(errorRA,errorDEC, transform=axes[0].get_transform('fk5'),
         #             edgecolors='red',marker='.',s=15,lw=1)
-        ellipse_patch = Polygon(np.column_stack([errorRA, errorDEC]),closed=True,transform=axes[0].get_transform('fk5'),
-                                fill=False, edgecolor='red',linewidth=1.5)
-        axes[0].add_patch(ellipse_patch)
+        # Non-PSF-like events have no calibrated error (centroid_err NaN) and so no match region to draw; an all-NaN
+        # polygon makes astropy's WCSAxes transform fail ("'list' object has no attribute 'T'")
+        if np.all(np.isfinite(errorRA)) and np.all(np.isfinite(errorDEC)):
+            ellipse_patch = Polygon(np.column_stack([errorRA, errorDEC]),closed=True,transform=axes[0].get_transform('fk5'),
+                                    fill=False, edgecolor='red',linewidth=1.5)
+            axes[0].add_patch(ellipse_patch)
 
         legend = axes[0].legend(loc=2,facecolor="black",fontsize=10)
         for text in legend.get_texts():

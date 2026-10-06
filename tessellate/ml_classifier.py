@@ -147,6 +147,18 @@ def _cut_base(data_path, sector, cam, ccd, cut, n=8):
     return f'{_cut_path(data_path, sector, cam, ccd, cut, n)}/sector{sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
 
 
+def _as_loaded(events):
+    """An in-memory event table as load_cut_events would return it: fresh 0..n-1 index, crossbin_ids as lists."""
+    import ast
+
+    events = events.reset_index(drop=True).copy()
+    if 'crossbin_ids' in events:
+        events['crossbin_ids'] = events['crossbin_ids'].apply(
+            lambda x: ast.literal_eval(x) if isinstance(x, str) else x
+        )
+    return events
+
+
 def load_cut_events(data_path, sector, cam, ccd, cut, n=8):
     """
     Read a cut's detected_events.csv (same file Navigator.gather_results reads,
@@ -1123,16 +1135,21 @@ def _select_events(all_events, events, cfg, sector, cam, ccd, cut):
     return selected
 
 
-def extract_cut_features(data_path, sector, cam, ccd, cut, n=8, events=None, config=None):
+def extract_cut_features(data_path, sector, cam, ccd, cut, n=8, events=None, config=None, all_events=None):
     """
     Feature table for the events of one cut.
 
     events : optional table (any columns incl. objid/eventid) restricting which
         events to compute; statistics that need the whole cut (simultaneity,
         per-object recurrence) still use every event in detected_events.csv.
+    all_events : the cut's whole event table, if already in memory (e.g. the detector's, before it is
+        saved); None = read detected_events.csv.
     """
     cfg = {**DEFAULT_CONFIG, **(config or {})}
-    all_events = load_cut_events(data_path, sector, cam, ccd, cut, n)
+    if all_events is None:
+        all_events = load_cut_events(data_path, sector, cam, ccd, cut, n)
+    else:
+        all_events = _as_loaded(all_events)
     tab = table_features(all_events)
     selected = _select_events(all_events, events, cfg, sector, cam, ccd, cut)
 
@@ -1701,7 +1718,8 @@ def load_default_classifier(path=None):
     return _LOADED[path]
 
 
-def classify_cut(data_path, sector, cam, ccd, cut, n=8, model=None, unsure_below=UNSURE_BELOW, config=None):
+def classify_cut(data_path, sector, cam, ccd, cut, n=8, model=None, unsure_below=UNSURE_BELOW, config=None,
+                 events=None):
     """
     Stage-1 class probabilities for every event in a cut's detected_events.csv.
 
@@ -1713,10 +1731,16 @@ def classify_cut(data_path, sector, cam, ccd, cut, n=8, model=None, unsure_below
     ml_classification is the most likely class, or 'Unsure' when that class's probability is below unsure_below
     (or there are no probabilities).
 
-    Returns objid, eventid, p_<class> per class and ml_classification, one row per event in the file's order.
+    events : the cut's event table if already in memory (the detector's, before saving); None = read
+        detected_events.csv.
+
+    Returns objid, eventid, p_<class> per class and ml_classification, one row per event in the table's order.
     """
     model = model or load_default_classifier()
-    events = load_cut_events(data_path, sector, cam, ccd, cut, n)
+    if events is None:
+        events = load_cut_events(data_path, sector, cam, ccd, cut, n)
+    else:
+        events = _as_loaded(events)
     classes = list(model.classes_)
     p_cols = [f'p_{c}' for c in classes]
     out = events[['objid', 'eventid']].copy()
@@ -1726,7 +1750,8 @@ def classify_cut(data_path, sector, cam, ccd, cut, n=8, model=None, unsure_below
     fb1 = (events['frame_bin'] == 1).to_numpy()
     if fb1.any():
         cfg = {'crossmatch': False, 'max_tagged': None, **(config or {})}
-        feats = extract_cut_features(data_path, sector, cam, ccd, cut, n, events=events[fb1], config=cfg)
+        feats = extract_cut_features(data_path, sector, cam, ccd, cut, n, events=events[fb1], config=cfg,
+                                     all_events=events)
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
             pred = model.predict(feats)

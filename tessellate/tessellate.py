@@ -187,7 +187,7 @@ class Tessellate():
         self.detect_mode = detect_mode
         self.search_time_bins = search_time_bins
         self.search_snr = search_snr
-        self.search_redo = search_redo      # 'ask', or Detector.transient_search's redo: None / 'sources' / 'events' / 'compile' / 'classify'.
+        self.search_redo = search_redo      # 'ask', or Detector.transient_search's redo: None / 'events' / 'compile' / 'classify'.
                                             # A one-off choice: never saved in the config file
 
         self.plot_time = plot_time
@@ -1842,11 +1842,11 @@ class Tessellate():
     def _search_redo_properties(self):
         """
         Default detection skips every stage whose output exists. Otherwise ask which stage to repeat first (the
-        later stages follow): source detection, event localisation, event compilation, ML classification.
+        later stages follow): event localisation, event compilation, ML classification. (Redoing source detection
+        too = overwriting the search, asked separately.)
         """
 
-        stages = [('sources', 'Redo source detection?'),
-                  ('events', 'Redo event localisation (event isolation + PSF fits)?'),
+        stages = [('events', 'Redo event localisation (event isolation + PSF fits)?'),
                   ('compile', 'Redo event compilation (asteroid checks, crossmatches, frame-bin links)?'),
                   ('classify', 'Redo ML classification?')]
 
@@ -3400,18 +3400,19 @@ import os\n\
 \n\
 part = {self.part}\n\
 \n\
+redo = {self.search_redo!r}\n\
 if part:\n\
     path1 = '{self.data_path}/{self.sector}/Cam{cam}/Ccd{ccd}/Part1/Cut{cut}of{self.n**2}/{self._inj_dir}/detected_events.csv'\n\
     path2 = '{self.data_path}/{self.sector}/Cam{cam}/Ccd{ccd}/Part2/Cut{cut}of{self.n**2}/{self._inj_dir}/detected_events.csv'\n\
-    if {self.search_redo!r} is not None or not os.path.exists(path1):\n\
+    if redo is not None or not os.path.exists(path1):\n\
         detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n},injection={self.injection},part=1)\n\
-        detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.search_time_bins},min_snr={self.search_snr},redo={self.search_redo!r})\n\
-    if {self.search_redo!r} is not None or not os.path.exists(path2):\n\
+        detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.search_time_bins},min_snr={self.search_snr},redo=redo)\n\
+    if redo is not None or not os.path.exists(path2):\n\
         detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n},injection={self.injection},part=2)\n\
-        detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.search_time_bins},min_snr={self.search_snr},redo={self.search_redo!r})\n\
+        detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.search_time_bins},min_snr={self.search_snr},redo=redo)\n\
 else:\n\
     detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n},injection={self.injection},injection_dir='{self._inj_dir}')\n\
-    detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.search_time_bins},min_snr={self.search_snr},redo={self.search_redo!r})"   
+    detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.search_time_bins},min_snr={self.search_snr},redo=redo)"   
                     
         with open(f"{self.working_path}/detection_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py", "w") as python_file:
             python_file.write(python_text)

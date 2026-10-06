@@ -3171,12 +3171,15 @@ export PYTHONUNBUFFERED=1\n\
 
         # -- Create python file for building asteroid lightcurves on a whole CCD -- #
         print(f'Creating Asteroid Lightcurves Python File for Sector{self.sector} Cam{cam} Ccd{ccd} ({len(cuts)} cuts)')
+        # main guard: asteroid_lightcurves_ccd's workers are spawned, and a spawned worker re-imports
+        # this script -- unguarded, every worker would rerun the job and Python aborts the pool
         python_text = f"\
 from tessellate import DataProcessor\n\
 \n\
-part = {self.part}\n\
-processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=2)\n\
-processor.asteroid_lightcurves_ccd(cam={cam},ccd={ccd},n={self.n},cuts={list(cuts)},part=part)"
+if __name__ == '__main__':\n\
+    part = {self.part}\n\
+    processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=2)\n\
+    processor.asteroid_lightcurves_ccd(cam={cam},ccd={ccd},n={self.n},cuts={list(cuts)},part=part)"
 
         with open(f"{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}_script.py", "w") as python_file:
             python_file.write(python_text)

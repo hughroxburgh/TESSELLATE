@@ -936,7 +936,8 @@ class DataProcessor():
         from .asteroid_photometry import (forced_psf_photometry,
                                             match_ephemeris_to_reduced_frames, detrend_pixel_phase,
                                             local_gaia_cat_to_stars, flag_star_contamination,
-                                            stack_lightcurves, STACK_SIG_TARGET, pool_offset_from_stacks)
+                                            stack_lightcurves, STACK_SIG_TARGET, pool_offset_from_stacks,
+                                            track_offsets)
         from . import asteroid_store
 
         try:
@@ -1011,19 +1012,15 @@ class DataProcessor():
             offset_x, offset_y, n_offset_tracks, offset_diagnostics = pool_offset_from_stacks(
                 ephemeris, cube, self.sector, cam, ccd, cut_corner[0], cut_corner[1], zp_ab=zp_ab)
 
-            if np.isfinite(offset_x) and np.isfinite(offset_y):
-                # both the aperture and the (non-centroiding, fixed-position) PSF fit assume
-                # the given x,y IS the source, so a real, measured predicted-vs-actual offset
-                # left uncorrected here silently loses flux (an off-centre aperture misses
-                # part of the source; an offset PSF template correlates less well with the
-                # data and its best-fit amplitude comes out low) on every single measurement
-                photometry_ephemeris = ephemeris.copy()
-                photometry_ephemeris['x'] += offset_x
-                photometry_ephemeris['y'] += offset_y
-            else:
-                # too few high-SNR tracks to trust a measured offset (pool_offset_from_stacks'
-                # own min_tracks fallback) -- save at the uncorrected position instead
-                photometry_ephemeris = ephemeris
+            # both the aperture and the (non-centroiding, fixed-position) PSF fit assume the
+            # given x,y IS the source, so a real predicted-vs-actual offset left uncorrected
+            # silently loses flux on every measurement. The offset is per object (its own
+            # ephemeris error): each track's own stack fit where it is significant, else the
+            # cut's pooled offset, else none (track_offsets)
+            per_track = track_offsets(ephemeris['designation'], offset_diagnostics, offset_x, offset_y)
+            photometry_ephemeris = ephemeris.copy()
+            photometry_ephemeris['x'] += photometry_ephemeris['designation'].map(per_track['offset_x']).to_numpy()
+            photometry_ephemeris['y'] += photometry_ephemeris['designation'].map(per_track['offset_y']).to_numpy()
 
             # Step 2: forced photometry, exactly once, at the position from step 1.
             # Aperture photometry is currently disabled -- not part of the pipeline for now
@@ -1045,7 +1042,7 @@ class DataProcessor():
                 asteroid_store.photometry_table(psf_df, ephemeris, self.sector, cam, ccd, cut, part_index,
                                                 shape=cube.shape[1:], zp_ab=zp, e_zp_ab=e_zp),
                 asteroid_store.tracks_table(ephemeris, psf_df, stack_summary, offset_diagnostics, offset_x, offset_y,
-                                            n_offset_tracks, self.sector, cam, ccd, cut, part_index,
+                                            n_offset_tracks, self.sector, cam, ccd, cut, part_index, per_track=per_track,
                                             zp_ab=zp, e_zp_ab=e_zp),
                 self.sector, cam, ccd, cut, part_index)
 

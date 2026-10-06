@@ -9,7 +9,9 @@ file sorted by designation:
         objects.parquet                     one row per designation: number, H, G, sectors, points
         photometry/sector{SS}.parquet       every measurement of the sector, sorted by (designation, mjd)
         tracks/sector{SS}.parquet           one row per (designation, cam, ccd, cut, part): stacking
-                                            summary, centroid offset, and the cut's applied offset
+                                            summary, the track's own centroid fit, the position
+                                            offset applied to it and its source (own, cut, none),
+                                            and the cut's pooled offset
         _staging/sector{S}/...              per-cut output waiting to be merged (deleted on merge)
 
 Row groups of ROW_GROUP_SIZE rows carry min/max statistics on the designation, so one object's
@@ -86,7 +88,7 @@ PRECISION = {
         'avg_sig': ('mantissa', ERROR_BITS), 'achieved_sig': ('mantissa', ERROR_BITS),
         'centroid_sig': ('mantissa', ERROR_BITS),
         'centroid_offset_x': _PIXELS, 'centroid_offset_y': _PIXELS,
-        'cut_offset_x': _PIXELS, 'cut_offset_y': _PIXELS,
+        'offset_x': _PIXELS, 'offset_y': _PIXELS, 'cut_offset_x': _PIXELS, 'cut_offset_y': _PIXELS,
         'centroid_mag': ('step', 2.0 ** -10),
     },
 }
@@ -147,6 +149,10 @@ TRACKS_SCHEMA = pa.schema([
     ('centroid_mag', pa.float32()),
     ('centroid_n_stamps', pa.float32()),
     ('centroid_used', pa.bool_()),
+    ('centroid_fit', pa.string()),
+    ('offset_x', pa.float32()),
+    ('offset_y', pa.float32()),
+    ('offset_source', pa.string()),
     ('cut_offset_x', pa.float32()),
     ('cut_offset_y', pa.float32()),
     ('cut_offset_n_tracks', pa.uint16()),
@@ -261,9 +267,10 @@ def photometry_table(psf_df, ephemeris, sector, cam, ccd, cut, part=0, shape=Non
 
 
 def tracks_table(ephemeris, psf_df, stack_summary, offset_diagnostics, offset_x, offset_y, n_offset_tracks,
-                 sector, cam, ccd, cut, part=0, zp_ab=np.nan, e_zp_ab=np.nan):
+                 sector, cam, ccd, cut, part=0, zp_ab=np.nan, e_zp_ab=np.nan, per_track=None):
     """One row per predicted track of the cut: prediction counts, the stacking summary, this track's
-    centroid-offset measurement, and the offset applied to the whole cut."""
+    centroid-offset measurement, the offset applied to it (per_track: asteroid_photometry.track_offsets)
+    and the cut's pooled offset."""
     pred = ephemeris.groupby('designation').agg(magnitude_H=('magnitude_H', 'first'),
                                                 magnitude_G=('magnitude_G', 'first'),
                                                 n_predicted=('frame', 'size'))
@@ -272,8 +279,11 @@ def tracks_table(ephemeris, psf_df, stack_summary, offset_diagnostics, offset_x,
     stack = stack_summary.rename(columns={'n_frames': 'n_clean'})
     centroid = offset_diagnostics.set_index('designation').rename(
         columns={'offset_x': 'centroid_offset_x', 'offset_y': 'centroid_offset_y', 'sig': 'centroid_sig',
-                 'mag': 'centroid_mag', 'n_stamps': 'centroid_n_stamps', 'used': 'centroid_used'})
+                 'mag': 'centroid_mag', 'n_stamps': 'centroid_n_stamps', 'used': 'centroid_used',
+                 'fit': 'centroid_fit'})
     df = pred.join(meas).join(stack).join(centroid[[c for c in centroid.columns if c.startswith('centroid_')]])
+    if per_track is not None:
+        df = df.join(per_track[['offset_x', 'offset_y', 'offset_source']])
     df = df.reset_index().rename(columns={'index': 'designation'})
     df = df.reindex(columns=list(dict.fromkeys(list(df.columns) + TRACKS_SCHEMA.names)))
     df['n_points'] = df['n_points'].fillna(0)

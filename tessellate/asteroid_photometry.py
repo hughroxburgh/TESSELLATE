@@ -767,6 +767,10 @@ STACK_CENTROID_SIG_THRESHOLD = 8.0
 STACK_CENTROID_STAMP_HALF = 6
 STACK_CENTROID_WINDOW = 2
 STACK_CENTROID_MIN_STAMPS = 5
+# tracks whose single-PRF stack fit reaches this significance are refitted with the matched stack
+# model (measure_stack_offset): injection-recovery on Sector 29 Cam 2 Ccd 2 Cut 23 gave 0.021 vs
+# 0.037 px RMS at stack S/N ~95, but no gain at ~40 and below
+MATCHED_FIT_SIG = 50.0
 
 
 def measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=None,
@@ -918,6 +922,90 @@ def measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0,
     return float(ox), float(oy), sig, float(flux), len(stamps)
 
 
+def _clipped_mean_stack(stamps, nsig=3.0):
+    """Per-pixel mean over frames after rejecting values more than nsig robust sigma from the
+    median (cosmic rays, passing stars)."""
+    med = np.median(stamps, axis=0)
+    mad = 1.4826 * np.median(np.abs(stamps - med), axis=0)
+    good = np.abs(stamps - med) <= nsig * np.where(mad > 0, mad, np.inf)
+    return np.where(good, stamps, 0).sum(0) / np.maximum(good.sum(0), 1)
+
+
+def measure_stack_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=None,
+                         half=STACK_CENTROID_STAMP_HALF, min_stamps=STACK_CENTROID_MIN_STAMPS,
+                         search_radius_px=2.0):
+    """Predicted-vs-measured offset for one track from its stacked image, with a model built the same
+    way as the stack (replaces measure_stack_centroid_offset's single PRF).
+
+    Every frame's stamp is cut on whole pixels around the predicted position and never shifted (no
+    interpolation blur); the stamps are combined with a clipped mean. The model for a trial offset
+    is the mean, over the same frames, of the TESS PRF at each frame's own detector position and
+    sub-pixel position plus the offset (prf_grid.PRFGrid.stack_model), so the spread of sub-pixel
+    positions and the PRF's change along the track are in the model rather than smeared into the
+    data. The offset minimises the residual of a joint [model amplitude, flat background] fit
+    (amplitude and background solved exactly at each trial offset, the offset by least squares);
+    sig is that amplitude over its error, as before.
+
+    Returns (offset_x, offset_y, sig, flux, n_stamps), NaN where fewer than min_stamps frames are
+    usable or there is no signal."""
+    from scipy.optimize import least_squares
+    from .psf_flux_calibration import PRF_PATH_DEFAULT
+    from .prf_grid import get_grid, StackModel
+    prf_path = prf_path or PRF_PATH_DEFAULT
+
+    x, y, f = track['x'].to_numpy(float), track['y'].to_numpy(float), track['frame'].to_numpy(int)
+    xi, yi = np.round(x).astype(int), np.round(y).astype(int)
+    ok = (xi - half >= 0) & (yi - half >= 0) & (xi + half + 1 <= cube.shape[2]) & (yi + half + 1 <= cube.shape[1])
+    if ok.sum() < min_stamps:
+        return np.nan, np.nan, np.nan, np.nan, int(ok.sum())
+    x, y, f, xi, yi = x[ok], y[ok], f[ok], xi[ok], yi[ok]
+    stamps = np.stack([cube[k, b - half:b + half + 1, a - half:a + half + 1] for k, a, b in zip(f, xi, yi)]).astype(float)
+    finite = np.isfinite(stamps).all(axis=(1, 2))
+    if finite.sum() < min_stamps:
+        return np.nan, np.nan, np.nan, np.nan, int(finite.sum())
+    stamps, x, y, xi, yi = stamps[finite], x[finite], y[finite], xi[finite], yi[finite]
+    data = _clipped_mean_stack(stamps).ravel()
+    fx, fy = x - xi, y - yi
+    ccd_x, ccd_y = ccd_x0 + x, ccd_y0 + y
+    try:
+        grid = get_grid(cam, ccd, sector, prf_path)
+    except Exception as ex:
+        import warnings
+        warnings.warn(f"measure_stack_offset: PRF unavailable ({ex!r})", RuntimeWarning)
+        return np.nan, np.nan, np.nan, np.nan, len(stamps)
+
+    model = StackModel(grid, ccd_x, ccd_y, fx, fy, half)
+    A = np.column_stack([np.zeros(data.size), np.ones(data.size)])
+
+    def solve(dx, dy):
+        # amplitude and background are linear: solve them exactly at each trial offset
+        A[:, 0] = model(dx, dy).ravel()
+        coeffs, *_ = np.linalg.lstsq(A, data, rcond=None)
+        return data - A @ coeffs, coeffs
+
+    # start from the data's centroid shift relative to the model's (the PRF itself is asymmetric)
+    img = data.reshape(2 * half + 1, -1)
+    yy, xx = np.mgrid[-half:half + 1, -half:half + 1]
+    w = np.clip(img - np.median(img), 0, None)
+    m0 = model(0.0, 0.0)
+    start = np.zeros(2)
+    if w.sum() > 0 and m0.sum() > 0:
+        start = np.clip([(xx * w).sum() / w.sum() - (xx * m0).sum() / m0.sum(),
+                         (yy * w).sum() / w.sum() - (yy * m0).sum() / m0.sum()],
+                        -0.95 * search_radius_px, 0.95 * search_radius_px)
+    res = least_squares(lambda o: solve(*o)[0], start, bounds=([-search_radius_px] * 2, [search_radius_px] * 2),
+                        diff_step=1e-3, xtol=1e-4)
+    ox, oy = res.x
+    resid, (flux, _) = solve(ox, oy)
+    sigma = 1.4826 * np.median(np.abs(resid - np.median(resid)))
+    try:
+        e_flux = sigma * np.sqrt(np.linalg.inv(A.T @ A)[0, 0])
+    except np.linalg.LinAlgError:
+        e_flux = np.nan
+    sig = max(0.0, flux / e_flux) if np.isfinite(e_flux) and e_flux > 0 else np.nan
+    return float(ox), float(oy), float(sig), float(flux), len(stamps)
+
+
 def pool_offset_from_stacks(ephemeris, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=None, zp_ab=None,
                               sig_threshold=STACK_CENTROID_SIG_THRESHOLD, min_tracks=2, **stamp_kwargs):
     """Robust per-cut (dx, dy) offset, pooled (median) from the individual
@@ -941,6 +1029,10 @@ def pool_offset_from_stacks(ephemeris, cube, sector, cam, ccd, ccd_x0, ccd_y0, p
     asteroid_photometry.identify_known_asteroids's own detected-source
     pooling) rather than trust too few points.
 
+    Tracks whose stack reaches MATCHED_FIT_SIG are refitted with the matched
+    stack model (measure_stack_offset), which is more precise for bright
+    tracks; the diagnostics' 'fit' column says which fit gave the offset.
+
     Also returns a per-track diagnostics DataFrame (every track with at
     least one usable stamp, not just the ones that qualified) with
     designation, offset_x, offset_y,
@@ -954,6 +1046,12 @@ def pool_offset_from_stacks(ephemeris, cube, sector, cam, ccd, ccd_x0, ccd_y0, p
     for designation, track in ephemeris.groupby("designation"):
         ox, oy, sig, flux, n_stamps = measure_stack_centroid_offset(
             track, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=prf_path, **stamp_kwargs)
+        fit = "single"
+        if np.isfinite(sig) and sig >= MATCHED_FIT_SIG:
+            m = measure_stack_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=prf_path)
+            if np.isfinite(m[0]) and np.isfinite(m[1]) and np.isfinite(m[2]):
+                ox, oy, sig, flux, n_stamps = m
+                fit = "matched"
         used = bool(np.isfinite(ox) and np.isfinite(sig) and sig >= sig_threshold)
         if zp_ab is not None and flux is not None and np.isfinite(flux) and flux > 0:
             mag = -2.5 * np.log10(flux) + zp_ab
@@ -963,20 +1061,43 @@ def pool_offset_from_stacks(ephemeris, cube, sector, cam, ccd, ccd_x0, ccd_y0, p
         if n_stamps == 0:
             continue
         rows.append(dict(designation=designation, offset_x=ox, offset_y=oy, sig=sig,
-                          flux=flux, mag=mag, mag_err=mag_err, n_stamps=n_stamps, used=used))
+                          flux=flux, mag=mag, mag_err=mag_err, n_stamps=n_stamps, used=used, fit=fit))
     # pd.DataFrame([]) has no columns at all (not even 'used') -- a cut where every single
     # predicted track has zero usable stamps (confirmed: a real cut, no tracks ever land
     # in-bounds) would otherwise raise KeyError on the diagnostics["used"] access below
     # instead of just producing zero used tracks, same pitfall already guarded against in
     # forced_aperture_photometry/forced_psf_photometry's own empty-result cases
     diagnostics = pd.DataFrame(rows, columns=["designation", "offset_x", "offset_y", "sig",
-                                                "flux", "mag", "mag_err", "n_stamps", "used"])
+                                                "flux", "mag", "mag_err", "n_stamps", "used", "fit"])
 
     used_offsets = diagnostics[diagnostics["used"]]
     if len(used_offsets) < min_tracks:
         return np.nan, np.nan, len(used_offsets), diagnostics
     return (float(used_offsets["offset_x"].median()), float(used_offsets["offset_y"].median()),
             len(used_offsets), diagnostics)
+
+
+def track_offsets(designations, diagnostics, cut_offset_x, cut_offset_y, sig_threshold=STACK_CENTROID_SIG_THRESHOLD):
+    """The position offset applied to each track. The predicted position error is mostly the
+    object's own ephemeris error -- stacks of single faint tracks in Sector 29 Cam 2 Ccd 2 Cut 23
+    scatter by 0.3 px and up to 1 px around the cut's pooled offset -- so a track whose own
+    shift-and-stack fit (pool_offset_from_stacks' diagnostics) reaches sig_threshold gets its own
+    offset ('own'). A track too faint to measure falls back to the cut's pooled offset ('cut'),
+    or to no shift if the cut has none ('none').
+
+    Returns a DataFrame indexed by designation with offset_x, offset_y and offset_source."""
+    cut_ok = np.isfinite(cut_offset_x) and np.isfinite(cut_offset_y)
+    out = pd.DataFrame(index=pd.Index(pd.unique(np.asarray(designations)), name='designation'))
+    out['offset_x'] = cut_offset_x if cut_ok else 0.0
+    out['offset_y'] = cut_offset_y if cut_ok else 0.0
+    out['offset_source'] = 'cut' if cut_ok else 'none'
+    own = diagnostics[np.isfinite(diagnostics['offset_x']) & np.isfinite(diagnostics['offset_y'])
+                      & np.isfinite(diagnostics['sig']) & (diagnostics['sig'] >= sig_threshold)]
+    own = own.set_index('designation').reindex(out.index).dropna(subset=['offset_x'])
+    out.loc[own.index, 'offset_x'] = own['offset_x'].astype(float)
+    out.loc[own.index, 'offset_y'] = own['offset_y'].astype(float)
+    out.loc[own.index, 'offset_source'] = 'own'
+    return out
 
 
 # ---------------------------------------------------------------------------

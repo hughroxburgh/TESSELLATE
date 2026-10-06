@@ -271,6 +271,7 @@ def _remove_reductions(data_path,sector,n,cams,ccds,cuts,part):
     os.chdir(home_path)
 
 def _remove_asteroid_lightcurves(data_path,sector,n,cams,ccds,cuts,part):
+    from .asteroid_store import remove_staging
 
     home_path = os.getcwd()
     for cam in cams:
@@ -285,7 +286,9 @@ def _remove_asteroid_lightcurves(data_path,sector,n,cams,ccds,cuts,part):
                             os.system(f'rm -f asteroids/*_AsteroidStackSummary.parquet')
                             os.system(f'rm -f asteroids/*_AsteroidStackedPhotometry.parquet')
                             os.system(f'rm -f asteroids/*_AsteroidCutOffset.parquet')
+                            os.system(f'rm -f asteroids/*_AsteroidOffsetDiagnostics.parquet')
                             os.system(f'rm -f asteroid_lightcurves.txt')
+                            remove_staging(data_path,sector,cam,ccd,cut,i)
                         except:
                             pass
                 else:
@@ -296,7 +299,9 @@ def _remove_asteroid_lightcurves(data_path,sector,n,cams,ccds,cuts,part):
                         os.system(f'rm -f asteroids/*_AsteroidStackSummary.parquet')
                         os.system(f'rm -f asteroids/*_AsteroidStackedPhotometry.parquet')
                         os.system(f'rm -f asteroids/*_AsteroidCutOffset.parquet')
+                        os.system(f'rm -f asteroids/*_AsteroidOffsetDiagnostics.parquet')
                         os.system(f'rm -f asteroid_lightcurves.txt')
+                        remove_staging(data_path,sector,cam,ccd,cut,0)
                     except:
                         pass
 

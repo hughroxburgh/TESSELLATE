@@ -12,7 +12,7 @@ from .tools import RoundToInt, load_table, save_table, table_exists
 from .localisation import CROSSMATCH_NSIGMA    # crossmatch radius, in units of the 1-sigma centroid_err
 
 # Detector.transient_search(redo=...): the first stage to repeat even though its output exists (later stages follow)
-REDO_STAGES = (None, 'events', 'compile', 'classify')
+REDO_STAGES = (None, 'events', 'compile', 'classify', 'crossmatch')
 NO_CROSSMATCH_CLASSES = ('Asteroid', 'CosmicRay', 'Junk')   # not crossmatched with Gaia / variables
 NOT_CHECKED = '.'        # gaia_id / nearest_gaia_id / var_type of those events (vs '-' = checked, no match)
 
@@ -2471,7 +2471,8 @@ class Detector():
         saves the file when it finishes:
           no events                                    -> 'events'
           localisation only (no TSS names / rule_tag)  -> 'compile'
-          compiled, no ML probabilities / crossmatch   -> 'classify' (also cuts searched before the classifier)
+          compiled, no ML probabilities                -> 'classify' (also cuts searched before the classifier)
+          classified, not crossmatched                 -> 'crossmatch'
           classified and crossmatched                  -> None, nothing to do
         """
         if self.events is None:
@@ -2479,8 +2480,10 @@ class Detector():
         cols = set(self.events.columns)
         if not cols & {'TSS Catalogue', 'rule_tag'}:
             return 'compile'
-        if (not self.injection and 'p_Flare' not in cols) or 'gaia_id' not in cols:
+        if not self.injection and 'p_Flare' not in cols:
             return 'classify'
+        if 'gaia_id' not in cols:
+            return 'crossmatch'
         return None
 
     def find_events(self, start=None):
@@ -2488,8 +2491,9 @@ class Detector():
         Build detected_events.csv, saving it after each stage so an interrupted run resumes where it stopped.
         start='events': from the sources -- event isolation and PSF localisation (the slow part); start='compile':
         from self.events loaded from detected_events.csv, redoing everything after localisation (units, asteroid
-        checks, frame-bin linking); start='classify': the ML classification, then the Gaia / variable crossmatch of
-        the events it keeps (Flare / Variable / Unsure; injections: the rules' untagged events). Each stage runs
+        checks, frame-bin linking); start='classify': the ML classification; start='crossmatch': the Gaia / variable
+        crossmatch of the events worth it (Flare / Variable / Unsure; injections: the rules' untagged events), which
+        needs the classification so comes last. Each stage runs
         the ones after it. start=None: resume from whatever the file holds (_next_event_stage).
 
         Every compile step recomputes its columns from the localisation output (positions, errors, frames,
@@ -2504,8 +2508,9 @@ class Detector():
                 print('   Events already found and classified',flush=True)
                 return
             print(f'   Resuming event finding from: {start}',flush=True)
-        if start not in ('events', 'compile', 'classify'):
-            raise ValueError(f"find_events: start must be None, 'events', 'compile' or 'classify', not {start!r}")
+        if start not in ('events', 'compile', 'classify', 'crossmatch'):
+            raise ValueError(f"find_events: start must be None, 'events', 'compile', 'classify' or 'crossmatch', "
+                             f"not {start!r}")
         save_path = f'{self.path}/Cut{self.cut}of{self.n**2}/{self._inj_path}/detected_events.csv'
 
         go = False
@@ -2567,20 +2572,24 @@ class Detector():
             save_table(self.events,save_path)                   # checkpoint: compilation done
             go = True
 
-        if start == 'classify' or go:
+        if (start == 'classify' or go) and not self.injection:     # injections keep the rules' tags
 
-            # -- Classify with the ML model (on the table in memory); injections keep the rules' tags -- #
-            if not self.injection:
-                self._ml_classify()
+            # -- Classify with the ML model (on the table in memory) -- #
+            self._ml_classify()
+
+            # -- Order nicely (after the classification, so it also places the ML columns) and save -- #
+            self._order_events_columns()
+            save_table(self.events,save_path)                   # checkpoint: classification done
+            go = True
+
+        if start == 'crossmatch' or go or self.injection:
 
             # -- Crossmatch with catalogues (only the classes worth it, so after the classification) -- #
             ts = clock()
             self._catalogue_crossmatch()
             print(f'   Crossmatching with Gaia and Variables -- done! ({(clock()-ts):.0f}s)',flush=True)
-
-            # -- Order nicely (after the classification, so it also places the ML columns) and save -- #
             self._order_events_columns()
-            save_table(self.events,save_path)                   # classification done
+            save_table(self.events,save_path)                   # crossmatch done
 
     # ------------------------------ Object finding function ------------------------------ #
 
@@ -2677,8 +2686,9 @@ class Detector():
         tessellate's overwrite of the search, which deletes the search outputs.
           'events'   - event isolation and PSF localisation (the slow part of event finding)
           'compile'  - everything after localisation, from the existing detected_events.csv: units, asteroid
-                       checks, frame-bin linking, then the classification stage
-          'classify' - the ML classification, then the Gaia / variable crossmatch of Flare / Variable / Unsure
+                       checks, frame-bin linking
+          'classify'   - the ML classification
+          'crossmatch' - the Gaia / variable crossmatch (of Flare / Variable / Unsure events) only
         Objects are always rebuilt.
         """
 
@@ -2719,7 +2729,7 @@ class Detector():
 
         if self.events is None or redo == 'events':
             events_start = 'events'                    # nothing to build on, or asked to redo localisation
-        elif redo in ('compile', 'classify'):
+        elif redo in ('compile', 'classify', 'crossmatch'):
             events_start = redo
         else:
             events_start = self._next_event_stage()    # resume from what detected_events.csv holds (None = all done)

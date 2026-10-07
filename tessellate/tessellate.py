@@ -187,7 +187,7 @@ class Tessellate():
         self.detect_mode = detect_mode
         self.search_time_bins = search_time_bins
         self.search_snr = search_snr
-        self.search_redo = search_redo      # 'ask', or Detector.transient_search's redo: None / 'events' / 'compile' / 'classify'.
+        self.search_redo = search_redo      # 'ask', or Detector.transient_search's redo: None / 'events' / 'compile' / 'classify' / 'crossmatch'.
                                             # A one-off choice: never saved in the config file
 
         self.plot_time = plot_time
@@ -1842,13 +1842,15 @@ class Tessellate():
     def _search_redo_properties(self):
         """
         Default detection skips every stage whose output exists. Otherwise ask which stage to repeat first (the
-        later stages follow): event localisation, event compilation, ML classification. (Redoing source detection
+        later stages follow): event localisation, event compilation, ML classification, catalogue crossmatch.
+        (Redoing source detection
         too = overwriting the search, asked separately.)
         """
 
         stages = [('events', 'Redo event localisation (event isolation + PSF fits)?'),
-                  ('compile', 'Redo event compilation (asteroid checks, crossmatches, frame-bin links)?'),
-                  ('classify', 'Redo ML classification?')]
+                  ('compile', 'Redo event compilation (asteroid checks, frame-bin links)?'),
+                  ('classify', 'Redo ML classification?'),
+                  ('crossmatch', 'Redo Gaia / variable crossmatch?')]
 
         def yes_no(question):
             a = input(f'{question} [y/n] = ')

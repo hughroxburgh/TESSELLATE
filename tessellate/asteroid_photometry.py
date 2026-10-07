@@ -315,12 +315,16 @@ def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
 
 
 def _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size,
-                                      chunk=50000):
+                                      chunk=5000):
     """_psf_lc_core's fit -- PRF template (normalised to 1 within the stamp) plus a flat background,
     least squares on the finite pixels, error from 1.4826 x the median absolute residual -- for
     every row at once, in closed form, with each row's PRF at its exact detector position
     (prf_grid) rather than the per-100 px cached one. Rows whose stamp leaves the cube, or with
-    fewer than 3 finite pixels or a singular fit, are dropped, as the per-frame path drops them."""
+    fewer than 3 finite pixels or a singular fit, are dropped, as the per-frame path drops them.
+
+    chunk rows at a time keeps every temporary array to a few MB, which the allocator reuses: at
+    50,000 rows each chunk took ~1.5 GB of short-lived arrays from the kernel and gave it back,
+    so every chunk page-faulted its memory afresh."""
     from .prf_grid import get_grid
     if len(ephemeris_df) == 0:
         return pd.DataFrame(columns=_PSF_COLUMNS)

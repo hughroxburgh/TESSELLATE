@@ -3135,14 +3135,17 @@ export PYTHONUNBUFFERED=1\n\
     _CUT_TIME_FLOOR_S = 30
     _CUT_TIME_PER_TRACK_S = 0.06
     _CUT_REFERENCE_FRAMES = 3000
-    _CUT_MEM_PER_CUBE = 2.0          # x the cut's ReducedFlux.npy size
-    _CUT_MEM_FLOOR_GB = 1.0
+    # x the cut's ReducedFlux.npy size, + floor: the worker's copy of the cube, its file cache (also
+    # charged to the job) and the photometry's working arrays. 2 x cube + 1 GB put Sector 45 Cam 3
+    # Ccd 4 (3,000 tracks a cut) at its 24 GB limit, where direct reclaim took 82% of the CPU time.
+    _CUT_MEM_PER_CUBE = 2.5
+    _CUT_MEM_FLOOR_GB = 2.0
 
     def _lightcurves_resources_for_ccd(self,cam,ccd,cuts):
         """Time and memory for a CCD job that runs its cuts one per core: per cut (_CUT_TIME_FLOOR_S +
         _CUT_TIME_PER_TRACK_S x tracks) x frames / _CUT_REFERENCE_FRAMES; the job gets twice the
         summed cut time spread over its cores plus the longest cut (at least 15 min), and per CPU
-        twice the largest cut's cube plus a floor. Tracks come from the prediction table's
+        _CUT_MEM_PER_CUBE x the largest cut's cube plus _CUT_MEM_FLOOR_GB. Tracks come from the prediction table's
         designation column, frames and cube size from the ReducedFlux.npy header and size, so
         nothing large is read. A cut without a prediction table is skipped by the lightcurves and
         counts as a minute."""

@@ -281,7 +281,7 @@ class Navigator():
             no_gaia_objids = self.objects.loc[self.objects['gaia_id'] == '-', 'objid']
             events = events[events['objid'].isin(no_gaia_objids)]
         elif starkiller == False:
-            events = deepcopy(self.events.loc[self.events.gaia_id != '-'])
+            events = deepcopy(self.events.loc[~self.events.gaia_id.isin(['-', '.'])])   # matched to a star
         else:
             events = deepcopy(self.events)
 

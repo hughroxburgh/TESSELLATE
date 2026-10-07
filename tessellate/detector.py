@@ -13,6 +13,8 @@ from .localisation import CROSSMATCH_NSIGMA    # crossmatch radius, in units of 
 
 # Detector.transient_search(redo=...): the first stage to repeat even though its output exists (later stages follow)
 REDO_STAGES = (None, 'events', 'compile', 'classify')
+NO_CROSSMATCH_CLASSES = ('Asteroid', 'CosmicRay', 'Junk')   # not crossmatched with Gaia / variables
+NOT_CHECKED = '.'        # gaia_id / nearest_gaia_id / var_type of those events (vs '-' = checked, no match)
 
 # ----------------------------------------------------------------------------------------------------------------------------- #
 # ----------------------------------------------------------------------------------------------------------------------------- # 
@@ -1926,10 +1928,18 @@ class Detector():
         star (effective distance) among the stars inside that region, so a
         brighter star just outside it can't block one inside. nearest_gaia_* is
         the matched star if there is one, otherwise the best-scoring star in the
-        whole box; gaia_id and nearest_gaia_id always agree when gaia_id is set. Events without a calibrated
-        centroid_err (not PSF-like) and tagged Asteroid / CosmicRay / Junk events
-        are not crossmatched: their gaia_id stays '-' and nearest_gaia_* empty.
+        whole box; gaia_id and nearest_gaia_id always agree when gaia_id is set.
+
+        Runs after the classification (ML, or the rules for injections). Events classified Asteroid / CosmicRay /
+        Junk (NO_CROSSMATCH_CLASSES) are not crossmatched: gaia_id, nearest_gaia_id and var_type = '.'.
+        Events without a calibrated centroid_err (not PSF-like) aren't either: gaia_id '-', nearest_gaia_* empty.
+        Cuts localised before centroid_err existed keep the crossmatch they already have (their errors are on
+        another scale; redo='events' brings them up to date).
         """
+
+        if 'centroid_err' not in self.events:
+            print('   No centroid_err (older localisation): kept the existing Gaia / variable crossmatch',flush=True)
+            return
 
         events = deepcopy(self.events)
 
@@ -1946,9 +1956,11 @@ class Detector():
         gaia_rpmag_all = gaia.RPmag.values
         gaia_gmag_all = gaia.Gmag.values
 
-        # every event with a calibrated position (PSF-like): the rule tags no longer decide what an event is
-        crossmatch = np.isfinite(events.centroid_err)
+        # Flare / Variable / Unsure events (or untagged, for the rules) with a calibrated position (PSF-like)
+        skipped = events.classification.isin(NO_CROSSMATCH_CLASSES)
+        crossmatch = np.isfinite(events.centroid_err) & ~skipped
         events['var_type'] = '-'
+        events.loc[skipped, ['gaia_id', 'nearest_gaia_id', 'var_type']] = NOT_CHECKED
 
         for i, event in events.iterrows():
             if crossmatch[i]:
@@ -2459,15 +2471,15 @@ class Detector():
         saves the file when it finishes:
           no events                                    -> 'events'
           localisation only (no TSS names / rule_tag)  -> 'compile'
-          compiled, no ML probabilities                -> 'classify' (also cuts searched before the classifier)
-          classified (or a compiled injection run)     -> None, nothing to do
+          compiled, no ML probabilities / crossmatch   -> 'classify' (also cuts searched before the classifier)
+          classified and crossmatched                  -> None, nothing to do
         """
         if self.events is None:
             return 'events'
         cols = set(self.events.columns)
         if not cols & {'TSS Catalogue', 'rule_tag'}:
             return 'compile'
-        if not self.injection and 'p_Flare' not in cols:
+        if (not self.injection and 'p_Flare' not in cols) or 'gaia_id' not in cols:
             return 'classify'
         return None
 
@@ -2476,7 +2488,8 @@ class Detector():
         Build detected_events.csv, saving it after each stage so an interrupted run resumes where it stopped.
         start='events': from the sources -- event isolation and PSF localisation (the slow part); start='compile':
         from self.events loaded from detected_events.csv, redoing everything after localisation (units, asteroid
-        checks, crossmatches, frame-bin linking); start='classify': the ML classification only. Each stage runs
+        checks, frame-bin linking); start='classify': the ML classification, then the Gaia / variable crossmatch of
+        the events it keeps (Flare / Variable / Unsure; injections: the rules' untagged events). Each stage runs
         the ones after it. start=None: resume from whatever the file holds (_next_event_stage).
 
         Every compile step recomputes its columns from the localisation output (positions, errors, frames,
@@ -2515,7 +2528,8 @@ class Detector():
             events['classification'] = events['pipe_tag']
             
             redone = ['known_asteroid_designation', 'known_asteroid_dist_px', 'known_asteroid_frame', 'asteroid_id',
-                      'rule_tag', 'var_type', 'p_Flare', 'p_CosmicRay', 'p_Junk', 'p_Asteroid', 'p_Variable']
+                      'rule_tag', 'var_type', 'gaia_id', 'nearest_gaia_id', 'nearest_gaia_dx', 'nearest_gaia_dy',
+                      'p_Flare', 'p_CosmicRay', 'p_Junk', 'p_Asteroid', 'p_Variable']
             
             self.events = events.drop(columns=[c for c in redone if c in events])
 
@@ -2535,11 +2549,6 @@ class Detector():
 
             self.events = self.events.drop_duplicates(subset=['frame_bin','xint','yint','frame_max'],keep='first')
 
-            # -- Crossmatch with catalogues -- #
-            ts = clock()
-            self._catalogue_crossmatch()
-            print(f'   Crossmatching with Gaia and Variables -- done! ({(clock()-ts):.0f}s)',flush=True)
-
             # -- Crossmatch between different frame_bins -- #
             ts = clock()
             print(f'   Crossmatching between time bins',flush=True)
@@ -2558,10 +2567,16 @@ class Detector():
             save_table(self.events,save_path)                   # checkpoint: compilation done
             go = True
 
-        if (start == 'classify' or go) and not self.injection:
+        if start == 'classify' or go:
 
-            # -- Classify with the ML model (on the table in memory) -- #
-            self._ml_classify()
+            # -- Classify with the ML model (on the table in memory); injections keep the rules' tags -- #
+            if not self.injection:
+                self._ml_classify()
+
+            # -- Crossmatch with catalogues (only the classes worth it, so after the classification) -- #
+            ts = clock()
+            self._catalogue_crossmatch()
+            print(f'   Crossmatching with Gaia and Variables -- done! ({(clock()-ts):.0f}s)',flush=True)
 
             # -- Order nicely (after the classification, so it also places the ML columns) and save -- #
             self._order_events_columns()
@@ -2603,7 +2618,7 @@ class Detector():
                 classification = 'VRRLyr'
 
             # catalogue variable type: the most common one among the object's matched events
-            var_types = obj['var_type'][obj['var_type'] != '-'] if 'var_type' in obj else pd.Series(dtype=object)
+            var_types = obj['var_type'][~obj['var_type'].isin(['-', NOT_CHECKED])] if 'var_type' in obj else pd.Series(dtype=object)
             var_type = var_types.mode()[0] if len(var_types) else '-'
 
             row_data = {
@@ -2662,8 +2677,8 @@ class Detector():
         tessellate's overwrite of the search, which deletes the search outputs.
           'events'   - event isolation and PSF localisation (the slow part of event finding)
           'compile'  - everything after localisation, from the existing detected_events.csv: units, asteroid
-                       checks, Gaia / variable crossmatch, frame-bin linking, then the ML classification
-          'classify' - the ML classification only
+                       checks, frame-bin linking, then the classification stage
+          'classify' - the ML classification, then the Gaia / variable crossmatch of Flare / Variable / Unsure
         Objects are always rebuilt.
         """
 

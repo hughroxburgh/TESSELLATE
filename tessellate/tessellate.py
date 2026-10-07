@@ -3214,7 +3214,8 @@ export PYTHONUNBUFFERED=1\n\
         return job_id
 
     def _merge_asteroid_store(self,dependency=()):
-        """Submit the sector's merge of staged lightcurves into the asteroid store, held until every
+        """Submit the sector's merge of staged lightcurves into the asteroid store (one core: the merge
+        reads, sorts and writes designation parts in order; peak 10 GB on a Year 4 sector), held until every
         CCD job in dependency has succeeded (a failed CCD job leaves the merge pending; rerunning
         the lightcurves resumes the missing cuts and submits a new merge)."""
 
@@ -3236,8 +3237,8 @@ merge_sector('{self.data_path}', {self.sector})"
 #\n\
 #SBATCH --ntasks=1\n\
 #SBATCH --time=1:00:00\n\
-#SBATCH --cpus-per-task=4\n\
-#SBATCH --mem-per-cpu=16G\n\
+#SBATCH --cpus-per-task=1\n\
+#SBATCH --mem=24G\n\
 #SBATCH --account=oz335\n\
 {depend}\
 \n\

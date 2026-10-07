@@ -95,6 +95,9 @@ FEATURE_GROUPS = ('tab', 'lc', 'shape', 'ctx', 'pix', 'xm')
 ML_VERSION = '1.0.0'        # = development model v5_E (labels to 2026-10-06, incl. S54); see development/claude_context.md
 DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rfc_files',
                                   f'event_classifier_v{ML_VERSION}.joblib')
+ML_MAX_JOBS = 8             # workers for the per-event features: more is slower on the cluster (ml_cpu_benchmark.py:
+                            # 8 workers 173 ev/s, 16: 164, 32: 109 -- the workers contend for the memory-mapped cube)
+CHUNKS_PER_JOB = 4          # each worker gets ~this many chunks of events (one task per event is ~3x slower)
 UNSURE_BELOW = 0.6          # most likely class below this -> 'Unsure' (S54: 3% of events at lc_sig_max >= 5,
                             # right only half the time; the rest 95% right)
 FEATURE_VERSION = 5     # 5: event margin for the baseline capped at max_mask_pad_days (long events kept their
@@ -1148,6 +1151,11 @@ def _event_features_safe(ev, cd, cfg):
             return None
 
 
+def _features_chunk(evs, cd, cfg):
+    """Features for a list of events -- one joblib task, so the cut data is sent to a worker once per chunk."""
+    return [_event_features_safe(ev, cd, cfg) for ev in evs]
+
+
 def extract_cut_features(data_path, sector, cam, ccd, cut, n=8, events=None, config=None, all_events=None,
                          progress=False, n_jobs=1):
     """
@@ -1159,8 +1167,9 @@ def extract_cut_features(data_path, sector, cam, ccd, cut, n=8, events=None, con
     all_events : the cut's whole event table, if already in memory (e.g. the detector's, before it is
         saved); None = read detected_events.csv.
     progress : show a tqdm progress bar over the events (off by default: parallel callers would print one each).
-    n_jobs : joblib workers over the events (1 = a plain loop; -1 = every core). Leave at 1 when the caller is
-        already running cuts in parallel (extract_sector_features), or the workers multiply.
+    n_jobs : joblib workers over the events (1 = a plain loop), at most ML_MAX_JOBS. Each worker gets
+        CHUNKS_PER_JOB chunks of events. Leave at 1 when the caller is already running cuts in parallel
+        (extract_sector_features), or the workers multiply.
     """
     cfg = {**DEFAULT_CONFIG, **(config or {})}
     if all_events is None:
@@ -1172,15 +1181,32 @@ def extract_cut_features(data_path, sector, cam, ccd, cut, n=8, events=None, con
 
     cd = _CutData(data_path, sector, cam, ccd, cut, n, frame_stats=cfg['frame_stats'])
     evs = [ev for _, ev in selected.iterrows()]
+    n_jobs = max(1, min(n_jobs, ML_MAX_JOBS))
     if progress:
         from tqdm import tqdm
-        evs = tqdm(evs, desc='ML features')
+        bar = tqdm(total=len(evs), desc='ML features')
     if n_jobs == 1:
-        rows = [_event_features_safe(ev, cd, cfg) for ev in evs]
+        rows = []
+        for ev in evs:
+            rows.append(_event_features_safe(ev, cd, cfg))
+            if progress:
+                bar.update()
     else:
-        # -- One job per event; the flux cube is memory-mapped, so workers re-open the file, not copy it -- #
+        # -- A few chunks of events per worker; the flux cube is memory-mapped, so workers re-open the file -- #
         from joblib import Parallel, delayed
-        rows = Parallel(n_jobs=n_jobs)(delayed(_event_features_safe)(ev, cd, cfg) for ev in evs)
+        chunks = [c for c in np.array_split(np.arange(len(evs)), n_jobs * CHUNKS_PER_JOB) if len(c)]
+        tasks = (delayed(_features_chunk)([evs[i] for i in c], cd, cfg) for c in chunks)
+        try:
+            parallel = Parallel(n_jobs=n_jobs, return_as='generator')   # results as chunks finish, in order
+        except TypeError:                                                # joblib < 1.3: all at the end
+            parallel = Parallel(n_jobs=n_jobs)
+        rows = []
+        for part in parallel(tasks):
+            rows += part
+            if progress:
+                bar.update(len(part))
+    if progress:
+        bar.close()
     failed = sum(r is None for r in rows)
     rows = [{} if r is None else r for r in rows]
     if failed:

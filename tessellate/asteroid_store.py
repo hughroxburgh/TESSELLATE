@@ -180,14 +180,18 @@ def _to_table(df, schema):
     return pa.Table.from_pandas(df, schema=schema, preserve_index=False)
 
 
+def _write_options(schema):
+    """Float columns use byte-stream-split rather than dictionary encoding: measured on Sector 29
+    Cam 2 Ccd 2 Cuts 23-24, 38.7 bytes/row against 77.6 with the default dictionaries."""
+    floats = [f.name for f in schema if pa.types.is_floating(f.type)]
+    others = [f.name for f in schema if f.name not in floats]
+    return dict(compression='zstd', use_dictionary=others, use_byte_stream_split=floats)
+
+
 def _write_atomic(table, path, **kwargs):
-    """Write then rename, so a job killed mid-write never leaves a truncated file behind. Float
-    columns use byte-stream-split rather than dictionary encoding: measured on Sector 29 Cam 2
-    Ccd 2 Cuts 23-24, 38.7 bytes/row against 77.6 with the default dictionaries."""
-    floats = [f.name for f in table.schema if pa.types.is_floating(f.type)]
-    others = [f.name for f in table.schema if f.name not in floats]
+    """Write then rename, so a job killed mid-write never leaves a truncated file behind."""
     tmp = f'{path}.tmp'
-    pq.write_table(table, tmp, compression='zstd', use_dictionary=others, use_byte_stream_split=floats, **kwargs)
+    pq.write_table(table, tmp, **_write_options(table.schema), **kwargs)
     os.replace(tmp, path)
 
 
@@ -335,48 +339,71 @@ def _cut_key(table):
     return pc.add(key, pc.cast(table['part'], pa.int64()))
 
 
+MERGE_PART_ROWS = 20_000_000     # photometry rows per merge part (see merge_sector)
+
+
 def _mark_overlap_duplicates(photometry):
     """Where neighbouring cuts both measured an object at the same frame, mark every measurement but
     the one farthest from its cut's edge as overlap_duplicate."""
     t = photometry.sort_by([('designation', 'ascending'), ('mjd', 'ascending'), ('edge_px', 'descending')])
     dup = np.zeros(t.num_rows, dtype=bool)
     if t.num_rows > 1:
-        des = t['designation'].combine_chunks()
+        # large_string: one array of a whole Year 4 sector's designations passes the 2 GB that
+        # string's 32-bit offsets allow ("offset overflow while concatenating arrays")
+        des = pc.cast(t['designation'], pa.large_string()).combine_chunks()
         dup[1:] = (pc.equal(des[1:], des[:-1]).to_numpy(zero_copy_only=False)
                    & (np.abs(np.diff(t['mjd'].to_numpy())) < 1e-6))
     return t.set_column(t.schema.get_field_index('overlap_duplicate'), 'overlap_duplicate', pa.array(dup))
 
 
-def _fill_table_zeropoints(table, data_path, sector):
-    """Fill missing zp_ab/e_zp_ab from each cut's calibration file. Returns (table, n_cuts_filled)."""
+def _zeropoint_lookup(table, data_path, sector):
+    """{cut key: (zp_ab, e_zp_ab)} from the calibration file of every cut in table (a tracks table:
+    one row per track) that has no zeropoint yet, rounded as quantize rounds them; NaN where the
+    cut is still uncalibrated."""
     zp = table['zp_ab'].to_numpy(zero_copy_only=False)
-    missing = ~np.isfinite(zp)
-    if not missing.any():
-        return table, 0
     key = _cut_key(table).to_numpy()
     cols = {c: table[c].to_numpy() for c in ['cam', 'ccd', 'cut', 'part']}
-    zp, e_zp = zp.copy(), table['e_zp_ab'].to_numpy(zero_copy_only=False).copy()
-    filled = 0
-    for k in np.unique(key[missing]):
-        i = np.flatnonzero(key == k)
-        cam, ccd, cut, part = (int(cols[c][i[0]]) for c in ['cam', 'ccd', 'cut', 'part'])
+    lookup = {}
+    for k in np.unique(key[~np.isfinite(zp)]):
+        i = int(np.flatnonzero(key == k)[0])
+        cam, ccd, cut, part = (int(cols[c][i]) for c in ['cam', 'ccd', 'cut', 'part'])
         folder = f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}' + (f'/Part{part}' if part else '')
         found = glob.glob(f'{folder}/Cut{cut}of*')
         z, e = read_zeropoint(found[0]) if len(found) == 1 else (np.nan, np.nan)
         e = float(_round_mantissa([e], ERROR_BITS)[0])
-        z = float(_round_to_step([z], _error_step([e]))[0])
-        if np.isfinite(z):
-            zp[i], e_zp[i] = z, e
+        lookup[int(k)] = (float(_round_to_step([z], _error_step([e]))[0]), e)
+    return lookup
+
+
+def _apply_zeropoints(table, lookup):
+    """Fill missing zp_ab/e_zp_ab from lookup. Returns (table, number of cuts filled)."""
+    usable = {k: v for k, v in lookup.items() if np.isfinite(v[0])}
+    zp = table['zp_ab'].to_numpy(zero_copy_only=False)
+    missing = ~np.isfinite(zp)
+    if not usable or not missing.any():
+        return table, 0
+    key = _cut_key(table).to_numpy()
+    zp, e_zp = zp.copy(), table['e_zp_ab'].to_numpy(zero_copy_only=False).copy()
+    filled = 0
+    for k in np.unique(key[missing]):
+        if int(k) in usable:
+            i = missing & (key == k)
+            zp[i], e_zp[i] = usable[int(k)]
             filled += 1
     table = table.set_column(table.schema.get_field_index('zp_ab'), 'zp_ab', pa.array(zp, pa.float32()))
     table = table.set_column(table.schema.get_field_index('e_zp_ab'), 'e_zp_ab', pa.array(e_zp, pa.float32()))
     return table, filled
 
 
-def _count_points(tracks, photometry):
+def _point_counts(photometry):
     # n_points/mjd range per track, not counting overlap duplicates
     keys = ['designation', 'cam', 'ccd', 'cut', 'part']
-    counts = photometry.filter(pc.invert(photometry['overlap_duplicate'])).group_by(keys).aggregate([('mjd', 'count'), ('mjd', 'min'), ('mjd', 'max')])
+    return photometry.filter(pc.invert(photometry['overlap_duplicate'])).group_by(keys).aggregate(
+        [('mjd', 'count'), ('mjd', 'min'), ('mjd', 'max')])
+
+
+def _count_points(tracks, counts):
+    keys = ['designation', 'cam', 'ccd', 'cut', 'part']
     joined = tracks.drop_columns(['n_points', 'mjd_start', 'mjd_end']).join(counts, keys=keys)
     n_points = pc.fill_null(joined['mjd_count'], 0)
     joined = joined.append_column('n_points', pc.cast(n_points, pa.uint32()))
@@ -384,10 +411,41 @@ def _count_points(tracks, photometry):
     return joined.select(TRACKS_SCHEMA.names).cast(TRACKS_SCHEMA)
 
 
-def merge_sector(data_path, sector, rebuild=True):
+def _designation_parts(tracks, part_rows):
+    """Designation ranges [lo, hi) of about part_rows photometry rows each (weights: the tracks'
+    n_points), in order; None marks an open end."""
+    w = tracks.group_by('designation').aggregate([('n_points', 'sum')]).sort_by('designation')
+    cum = np.cumsum(w['n_points_sum'].to_numpy(zero_copy_only=False).astype(float))
+    des = w['designation'].to_pylist()
+    edges, target = [], part_rows
+    for d, c in zip(des, cum):
+        if c > target and (not edges or d != edges[-1]):
+            edges.append(d)
+            target = c + part_rows
+    bounds = [None] + edges + [None]
+    return list(zip(bounds[:-1], bounds[1:]))
+
+
+def _range_filter(lo, hi):
+    field = ds.field('designation')
+    if lo is None and hi is None:
+        return None
+    if lo is None:
+        return field < hi
+    if hi is None:
+        return field >= lo
+    return (field >= lo) & (field < hi)
+
+
+def merge_sector(data_path, sector, rebuild=True, part_rows=MERGE_PART_ROWS):
     """Fold the sector's staged cuts into photometry/ and tracks/ sector files, replacing the rows of
-    any cut already in them; drop overlap duplicates, fill zeropoints calibrated since staging,
-    then delete the merged staging files and rebuild objects.parquet."""
+    any cut already in them; mark overlap duplicates, fill zeropoints calibrated since staging,
+    then delete the merged staging files and rebuild objects.parquet.
+
+    Photometry is merged in designation ranges of about part_rows rows (from the tracks' point
+    counts), each read from the staged files and the existing sector file, marked and appended in
+    order, so peak memory is set by part_rows, not the sector (a Year 4 sector, ~200 M rows, ran
+    out of 64 GB merged whole)."""
     bases = staged_cuts(data_path, sector)
     if not bases:
         print(f'Sector {sector}: nothing staged to merge.')
@@ -395,30 +453,53 @@ def merge_sector(data_path, sector, rebuild=True):
     root = store_path(data_path)
     os.makedirs(f'{root}/photometry', exist_ok=True)
     os.makedirs(f'{root}/tracks', exist_ok=True)
+    phot_path = f'{root}/photometry/sector{sector:02d}.parquet'
+    tracks_path = f'{root}/tracks/sector{sector:02d}.parquet'
 
     # the staged cuts, from their file names (a re-staged cut can be empty, with no rows to key on)
     ids = [re.search(r'cam(\d+)_ccd(\d+)_cut(\d+)_part(\d+)$', b).groups() for b in bases]
     restaged = _cut_key(pa.table({c: pa.array([int(i[k]) for i in ids], pa.int64())
                                   for k, c in enumerate(['cam', 'ccd', 'cut', 'part'])}))
-    tables = {}
-    for kind, schema in [('photometry', PHOTOMETRY_SCHEMA), ('tracks', TRACKS_SCHEMA)]:
-        new = pa.concat_tables([pq.read_table(f'{b}_{kind}.parquet', schema=schema) for b in bases])
-        path = f'{root}/{kind}/sector{sector:02d}.parquet'
-        if os.path.exists(path):
-            old = pq.read_table(path, schema=schema)
-            new = pa.concat_tables([old.filter(pc.invert(pc.is_in(_cut_key(old), value_set=restaged))), new])
-        tables[kind], filled = _fill_table_zeropoints(new, data_path, sector)
-        if kind == 'photometry':
-            print(f'Sector {sector}: zeropoints filled from calibration for {filled} cuts')
 
-    tables['photometry'] = _mark_overlap_duplicates(tables['photometry'])
-    print(f'Sector {sector}: {pc.sum(tables["photometry"]["overlap_duplicate"]).as_py() or 0:,} overlap duplicates marked')
-    tables['tracks'] = _count_points(tables['tracks'], tables['photometry']).sort_by(
+    def keep_old(t):
+        return t.filter(pc.invert(pc.is_in(_cut_key(t), value_set=restaged)))
+
+    tracks = pa.concat_tables([pq.read_table(f'{b}_tracks.parquet', schema=TRACKS_SCHEMA) for b in bases])
+    if os.path.exists(tracks_path):
+        tracks = pa.concat_tables([keep_old(pq.read_table(tracks_path, schema=TRACKS_SCHEMA)), tracks])
+    lookup = _zeropoint_lookup(tracks, data_path, sector)
+    tracks, filled = _apply_zeropoints(tracks, lookup)
+    print(f'Sector {sector}: zeropoints filled from calibration for {filled} cuts')
+
+    staged = ds.dataset([f'{b}_photometry.parquet' for b in bases], schema=PHOTOMETRY_SCHEMA, format='parquet')
+    old = ds.dataset(phot_path, schema=PHOTOMETRY_SCHEMA, format='parquet') if os.path.exists(phot_path) else None
+    parts = _designation_parts(tracks, part_rows)
+    tmp = f'{phot_path}.tmp'
+    writer = pq.ParquetWriter(tmp, PHOTOMETRY_SCHEMA, **_write_options(PHOTOMETRY_SCHEMA))
+    counts, n_rows, n_dup = [], 0, 0
+    try:
+        for lo, hi in parts:
+            expr = _range_filter(lo, hi)
+            part = staged.to_table(filter=expr)
+            if old is not None:
+                part = pa.concat_tables([keep_old(old.to_table(filter=expr)), part])
+            part, _ = _apply_zeropoints(part, lookup)
+            part = _mark_overlap_duplicates(part)
+            counts.append(_point_counts(part))
+            n_rows += part.num_rows
+            n_dup += pc.sum(part['overlap_duplicate']).as_py() or 0
+            writer.write_table(part, row_group_size=ROW_GROUP_SIZE)
+            del part
+    finally:
+        writer.close()
+    os.replace(tmp, phot_path)
+    print(f'Sector {sector}: {n_dup:,} overlap duplicates marked')
+    print(f'Sector {sector}: photometry {n_rows:,} rows in {len(parts)} parts -> {phot_path}')
+
+    tracks = _count_points(tracks, pa.concat_tables(counts)).sort_by(
         [('designation', 'ascending'), ('cam', 'ascending'), ('ccd', 'ascending'), ('cut', 'ascending')])
-    for kind, table in tables.items():
-        path = f'{root}/{kind}/sector{sector:02d}.parquet'
-        _write_atomic(table, path, row_group_size=ROW_GROUP_SIZE)
-        print(f'Sector {sector}: {kind} {table.num_rows:,} rows -> {path}')
+    _write_atomic(tracks, tracks_path, row_group_size=ROW_GROUP_SIZE)
+    print(f'Sector {sector}: tracks {tracks.num_rows:,} rows -> {tracks_path}')
 
     for b in bases:
         os.remove(f'{b}_photometry.parquet')
@@ -430,16 +511,28 @@ def merge_sector(data_path, sector, rebuild=True):
 
 def fill_zeropoints(data_path, sector):
     """Fill zeropoints for cuts calibrated after the sector was merged; rewrites the sector's files
-    only if something was filled."""
+    (photometry one row group at a time, keeping its order) only if something was filled."""
     root = store_path(data_path)
-    for kind, schema in [('photometry', PHOTOMETRY_SCHEMA), ('tracks', TRACKS_SCHEMA)]:
-        path = f'{root}/{kind}/sector{sector:02d}.parquet'
-        if not os.path.exists(path):
-            continue
-        table, filled = _fill_table_zeropoints(pq.read_table(path, schema=schema), data_path, sector)
-        if filled:
-            _write_atomic(table, path, row_group_size=ROW_GROUP_SIZE)
-        print(f'Sector {sector}: {kind} zeropoints filled for {filled} cuts')
+    tracks_path = f'{root}/tracks/sector{sector:02d}.parquet'
+    phot_path = f'{root}/photometry/sector{sector:02d}.parquet'
+    if not os.path.exists(tracks_path):
+        return
+    tracks = pq.read_table(tracks_path, schema=TRACKS_SCHEMA)
+    lookup = _zeropoint_lookup(tracks, data_path, sector)
+    tracks, filled = _apply_zeropoints(tracks, lookup)
+    print(f'Sector {sector}: zeropoints filled for {filled} cuts')
+    if not filled:
+        return
+    _write_atomic(tracks, tracks_path, row_group_size=ROW_GROUP_SIZE)
+    src = pq.ParquetFile(phot_path)
+    tmp = f'{phot_path}.tmp'
+    writer = pq.ParquetWriter(tmp, PHOTOMETRY_SCHEMA, **_write_options(PHOTOMETRY_SCHEMA))
+    try:
+        for g in range(src.num_row_groups):
+            writer.write_table(_apply_zeropoints(src.read_row_group(g).cast(PHOTOMETRY_SCHEMA), lookup)[0])
+    finally:
+        writer.close()
+    os.replace(tmp, phot_path)
 
 
 def physical_flux(df):

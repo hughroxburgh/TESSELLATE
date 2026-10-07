@@ -46,6 +46,7 @@ are ratios or rounding of stored columns (sig, sig_detrended, xfrac, yfrac) are 
 import glob
 import os
 import re
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -426,6 +427,51 @@ def _designation_parts(tracks, part_rows):
     return list(zip(bounds[:-1], bounds[1:]))
 
 
+def _split_into_parts(files, parts, folder, flush_rows=500_000):
+    """Rows of the staged photometry files routed into one temporary file per designation range
+    (parts from _designation_parts), reading every staged file once. Returns the part file paths,
+    in range order (a range with no staged rows has no file).
+
+    Each file's designations are dictionary-encoded, so only its few dozen distinct names are
+    placed in a range (range k holds edges[k-1] <= designation < edges[k], as _range_filter);
+    the rows are then grouped by one stable sort, and each range's slices are buffered and written
+    in blocks of flush_rows (written slice by slice, the many tiny row groups cost more than the
+    reading)."""
+    shutil.rmtree(folder, ignore_errors=True)
+    os.makedirs(folder)
+    edges = np.array([lo for lo, _ in parts[1:]], dtype=object)
+    paths = [f'{folder}/part{k:04d}.parquet' for k in range(len(parts))]
+    writers, buffers = {}, {}
+
+    def flush(part):
+        if part not in writers:
+            writers[part] = pq.ParquetWriter(paths[part], PHOTOMETRY_SCHEMA, compression='lz4')
+        writers[part].write_table(pa.concat_tables(buffers.pop(part)))
+
+    try:
+        for f in files:
+            t = pq.read_table(f, schema=PHOTOMETRY_SCHEMA)
+            if t.num_rows == 0:
+                continue
+            enc = pc.dictionary_encode(t['designation']).combine_chunks()
+            names = enc.dictionary.to_numpy(zero_copy_only=False)
+            k = np.searchsorted(edges, names, side='right')[enc.indices.to_numpy()]
+            order = np.argsort(k, kind='stable')
+            t, k = t.take(pa.array(order)), k[order]
+            starts = np.flatnonzero(np.r_[True, k[1:] != k[:-1]])
+            for s0, s1 in zip(starts, np.r_[starts[1:], len(k)]):
+                part = int(k[s0])
+                buffers.setdefault(part, []).append(t.slice(s0, s1 - s0))
+                if sum(b.num_rows for b in buffers[part]) >= flush_rows:
+                    flush(part)
+        for part in list(buffers):
+            flush(part)
+    finally:
+        for w in writers.values():
+            w.close()
+    return paths
+
+
 def _range_filter(lo, hi):
     field = ds.field('designation')
     if lo is None and hi is None:
@@ -443,9 +489,11 @@ def merge_sector(data_path, sector, rebuild=True, part_rows=MERGE_PART_ROWS):
     then delete the merged staging files and rebuild objects.parquet.
 
     Photometry is merged in designation ranges of about part_rows rows (from the tracks' point
-    counts), each read from the staged files and the existing sector file, marked and appended in
-    order, so peak memory is set by part_rows, not the sector (a Year 4 sector, ~200 M rows, ran
-    out of 64 GB merged whole)."""
+    counts), so peak memory is set by part_rows, not the sector (a Year 4 sector, ~450 M rows, ran
+    out of 64 GB merged whole). The staged files are read once, their rows split into one
+    temporary file per range (reading every staged file once per range took Year 4 merges 20-60
+    min); each range is then read back with the existing sector file's rows for it (sorted, so
+    only its row groups), marked and appended in order."""
     bases = staged_cuts(data_path, sector)
     if not bases:
         print(f'Sector {sector}: nothing staged to merge.')
@@ -471,18 +519,19 @@ def merge_sector(data_path, sector, rebuild=True, part_rows=MERGE_PART_ROWS):
     tracks, filled = _apply_zeropoints(tracks, lookup)
     print(f'Sector {sector}: zeropoints filled from calibration for {filled} cuts')
 
-    staged = ds.dataset([f'{b}_photometry.parquet' for b in bases], schema=PHOTOMETRY_SCHEMA, format='parquet')
     old = ds.dataset(phot_path, schema=PHOTOMETRY_SCHEMA, format='parquet') if os.path.exists(phot_path) else None
     parts = _designation_parts(tracks, part_rows)
+    part_files = _split_into_parts([f'{b}_photometry.parquet' for b in bases], parts,
+                                   f'{_staging_dir(data_path, sector)}_parts')
     tmp = f'{phot_path}.tmp'
     writer = pq.ParquetWriter(tmp, PHOTOMETRY_SCHEMA, **_write_options(PHOTOMETRY_SCHEMA))
     counts, n_rows, n_dup = [], 0, 0
     try:
-        for lo, hi in parts:
-            expr = _range_filter(lo, hi)
-            part = staged.to_table(filter=expr)
+        for (lo, hi), part_file in zip(parts, part_files):
+            part = (pq.read_table(part_file, schema=PHOTOMETRY_SCHEMA) if os.path.exists(part_file)
+                    else PHOTOMETRY_SCHEMA.empty_table())
             if old is not None:
-                part = pa.concat_tables([keep_old(old.to_table(filter=expr)), part])
+                part = pa.concat_tables([keep_old(old.to_table(filter=_range_filter(lo, hi))), part])
             part, _ = _apply_zeropoints(part, lookup)
             part = _mark_overlap_duplicates(part)
             counts.append(_point_counts(part))
@@ -492,6 +541,7 @@ def merge_sector(data_path, sector, rebuild=True, part_rows=MERGE_PART_ROWS):
             del part
     finally:
         writer.close()
+        shutil.rmtree(f'{_staging_dir(data_path, sector)}_parts', ignore_errors=True)
     os.replace(tmp, phot_path)
     print(f'Sector {sector}: {n_dup:,} overlap duplicates marked')
     print(f'Sector {sector}: photometry {n_rows:,} rows in {len(parts)} parts -> {phot_path}')

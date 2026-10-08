@@ -399,10 +399,14 @@ class PSF_Fitter():
 # Localisation model for PSF-fit positions (psf_like > 0.5). Constants from development/localisation_calibration.py.
 #
 # centroid_err: the 1-sigma error per axis (pixels) of a PSF-fit position,
-#     sigma(snr_psf) = sqrt((LOCALISATION_A * snr_psf**-LOCALISATION_B)**2 + LOCALISATION_FLOOR**2)
+#     sigma(snr_psf) = LOCALISATION_SCALE * sqrt((LOCALISATION_A * snr_psf**-LOCALISATION_B)**2 + LOCALISATION_FLOOR**2)
 # A and B come from injection-recovery, which injects and fits with the same PRF (fitting noise alone).
 # LOCALISATION_FLOOR adds, in quadrature to the injection floor, a real-sky term measured on manually sorted S55
 # flare stars after the radial shift below is removed.
+# LOCALISATION_SCALE: real flares on isolated Gaia hosts (S53-55, 5.8k p_Flare >= 0.9 flares, no 3-sigma cut;
+# development/localisation_neighbours.py + scratch fits) scatter 1.21x the model at every snr_psf (1.14-1.30 over
+# isolation choices), on top of ~11% outliers ~0.5 px off. Gaia positions are epoch 2016 (no proper motions), so
+# part of it may be stellar motion.
 #
 # Radial shift: PSF-fit positions of flares sit closer to the camera's optical axis than their Gaia star, by an
 # amount that depends only on the distance r from the axis (the same curve for every camera and CCD): ~0.02 px at
@@ -412,10 +416,13 @@ class PSF_Fitter():
 # ----------------------------------------------------------------------------------------------------------------------------- #
 
 CROSSMATCH_NSIGMA = 3.0          # an event matches a Gaia star / catalogued variable within this many centroid_err
+ISOLATION_PX = 1.5               # gaia_dmag: brightest OTHER Gaia star within this many pixels of the event (TESS can't
+                                 # separate stars this close; the radius the LOCALISATION_SCALE calibration used)
 
 LOCALISATION_A = 0.6118
 LOCALISATION_B = 0.8828
 LOCALISATION_FLOOR = 0.0407      # injection floor 0.0247 (+) real-sky 0.0324
+LOCALISATION_SCALE = 1.2         # real-sky scatter / model, isolated flare hosts (2026-10)
 
 OPTICAL_AXIS_PX = {
     (1, 1): (2147.7, 2103.6),
@@ -442,7 +449,7 @@ RADIAL_SHIFT_RANGE = (200, 3000)
 def localisation_sigma(snr_psf):
     """1-sigma error per axis (pixels) of a PSF-fit position with this snr_psf (> 0)."""
     snr = np.asarray(snr_psf, dtype=float)
-    return np.hypot(LOCALISATION_A * snr**(-LOCALISATION_B), LOCALISATION_FLOOR)
+    return LOCALISATION_SCALE * np.hypot(LOCALISATION_A * snr**(-LOCALISATION_B), LOCALISATION_FLOOR)
 
 
 def get_snr_to_localisation_func():

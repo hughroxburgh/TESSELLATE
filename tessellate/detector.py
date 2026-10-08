@@ -9,7 +9,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 from .tools import RoundToInt, load_table, save_table, table_exists
 
-from .localisation import CROSSMATCH_NSIGMA    # crossmatch radius, in units of the 1-sigma centroid_err
+from .localisation import CROSSMATCH_NSIGMA, ISOLATION_PX    # crossmatch radius (in 1-sigma centroid_err); isolation radius (px)
 
 # Detector.transient_search(redo=...): the first stage to repeat even though its output exists (later stages follow)
 REDO_STAGES = (None, 'events', 'compile', 'classify', 'crossmatch')
@@ -662,6 +662,11 @@ def _Lightcurve_significance(time,flux,frame_start,frame_end,pos,flux_sign,
 
     # same exclusion of THIS event's frames, but ignoring event_mask entirely
     ind_abs = ((frames > window_start) & (frames < buffer_start)) | ((frames < window_end) & (frames > buffer_end))
+
+    # the object's other events can fill the whole window (busy / variable stars): then measure against the
+    # unmasked window rather than giving no significance
+    if ind.sum() < 2:
+        ind = ind_abs
 
     t_window = t[ind]
     lc_window = lc[ind]
@@ -1774,6 +1779,14 @@ class Detector():
 
         events = deepcopy(self.events)
 
+        # -- centroid_err from the current localisation model (so a recompile picks up a model change) -- #
+        if 'snr_psf' in events and 'centroid_err' in events:
+            from .localisation import localisation_sigma
+            snr = pd.to_numeric(events['snr_psf'], errors='coerce')
+            redo = np.isfinite(events['centroid_err']) & (snr > 0)
+            events.loc[redo, 'centroid_err'] = localisation_sigma(snr[redo])
+            events.loc[redo, 'centroid_err_psf'] = events.loc[redo, 'centroid_err']
+
         events['ra'],events['dec'] = self.wcs.all_pix2world(events['xcentroid'],events['ycentroid'],0)
 
         delta = 0.1
@@ -1930,6 +1943,14 @@ class Detector():
         the matched star if there is one, otherwise the best-scoring star in the
         whole box; gaia_id and nearest_gaia_id always agree when gaia_id is set.
 
+        How trustworthy the match is (both refer to the nearest_gaia_* star, i.e. the match if there is one):
+          gaia_n_3sig  number of Gaia stars inside the match region (CROSSMATCH_NSIGMA sigma), a plain count
+                       (0 = no match; more than 1 = several candidates)
+          gaia_dmag    G of the brightest OTHER Gaia star within ISOLATION_PX px of the event minus G of this star
+                       (inf if there is none): small = a blend TESS can't separate, the flare could be on either
+          gaia_n_local number of Gaia stars (any G; the catalogue reaches G ~ 21) within ISOLATION_PX px of the
+                       event, matched or not: the local crowding
+
         Runs after the classification (ML, or the rules for injections). Events classified Asteroid / CosmicRay /
         Junk (NO_CROSSMATCH_CLASSES) are not crossmatched: gaia_id, nearest_gaia_id and var_type = '.'.
         Events without a calibrated centroid_err (not PSF-like) aren't either: gaia_id '-', nearest_gaia_* empty.
@@ -1948,6 +1969,9 @@ class Detector():
         events['nearest_gaia_id'] = '-'
         events['nearest_gaia_dx'] = np.nan   # pixels
         events['nearest_gaia_dy'] = np.nan   # pixels
+        events['gaia_n_3sig'] = np.nan
+        events['gaia_dmag'] = np.nan
+        events['gaia_n_local'] = np.nan
 
         box_deg = nearest_search_box_arcsec / 3600.0
 
@@ -1972,6 +1996,7 @@ class Detector():
                     (np.abs(dra_wrapped * np.cos(np.radians(event.dec))) < box_deg) &
                     (np.abs(gaia.dec - event.dec) < box_deg)
                 ).values
+                events.loc[i, ['gaia_n_3sig', 'gaia_n_local']] = 0
 
                 if diag_box_mask.any():
                     diag_source = gaia_source_all[diag_box_mask]
@@ -1985,6 +2010,7 @@ class Detector():
                     dx_pix = diag_gaia_x - event_x
                     dy_pix = diag_gaia_y - event_y
                     sep_pix = np.sqrt(dx_pix**2 + dy_pix**2)
+                    events.loc[i, 'gaia_n_local'] = int(np.sum(sep_pix <= ISOLATION_PX))
 
                     # brightness-weighted "effective distance": brighter (lower mag)
                     # stars get an effective distance reduction, so they can win over
@@ -2017,6 +2043,12 @@ class Detector():
                     events.loc[i, 'nearest_gaia_id'] = str(diag_source[best_idx])
                     events.loc[i, 'nearest_gaia_dx'] = float(dx_pix[best_idx])
                     events.loc[i, 'nearest_gaia_dy'] = float(dy_pix[best_idx])
+
+                    # -- how trustworthy: candidates inside the region, and isolation of this star -- #
+                    events.loc[i, 'gaia_n_3sig'] = int(inside.sum())
+                    others = (sep_pix <= ISOLATION_PX) & (np.arange(len(sep_pix)) != best_idx) & np.isfinite(diag_gmag)
+                    events.loc[i, 'gaia_dmag'] = (float(np.min(diag_gmag[others]) - diag_gmag[best_idx])
+                                                  if others.any() else np.inf)
 
         # -- Cross matches location to variable catalog -- #
         variables = load_table(f'{self.path}/Cut{self.cut}of{self.n**2}/variable_catalog.csv')
@@ -2392,7 +2424,7 @@ class Detector():
             'var_type', 'rule_tag', 'pipe_tag',
             'known_asteroid_designation','known_asteroid_dist_px','known_asteroid_frame',
             'source_mask', 'nearest_gaia_id','nearest_gaia_dx','nearest_gaia_dy',
-            'asteroid_id', 'TSS Catalogue','gaia_id',# 'prob', 'GaaID', 'cf_class', 'cf_prob',
+            'asteroid_id', 'TSS Catalogue','gaia_id','gaia_n_3sig','gaia_dmag','gaia_n_local',# 'prob', 'GaaID', 'cf_class', 'cf_prob',
             
             # Miscellaneous
             'crossbin_ids','n_detections','total_events','frame_bin', 
@@ -2534,6 +2566,7 @@ class Detector():
             
             redone = ['known_asteroid_designation', 'known_asteroid_dist_px', 'known_asteroid_frame', 'asteroid_id',
                       'rule_tag', 'var_type', 'gaia_id', 'nearest_gaia_id', 'nearest_gaia_dx', 'nearest_gaia_dy',
+                      'gaia_n_3sig', 'gaia_dmag', 'gaia_n_local',
                       'p_Flare', 'p_CosmicRay', 'p_Junk', 'p_Asteroid', 'p_Variable']
             
             self.events = events.drop(columns=[c for c in redone if c in events])
@@ -2606,7 +2639,8 @@ class Detector():
             'lc_sig_max', 'flux_maxsig', 'frame_maxsig',
             'mjd_maxsig','psf_maxsig','flux_sign', 'n_events',
             'min_eventlength_frame', 'max_eventlength_frame',
-            'min_eventlength_mjd','max_eventlength_mjd','gaia_id','classification','var_type','TSS Catalogue',
+            'min_eventlength_mjd','max_eventlength_mjd','gaia_id','gaia_n_3sig','gaia_dmag','gaia_n_local','classification',
+            'var_type','TSS Catalogue',
             'known_asteroid_designation','known_asteroid_dist_px','known_asteroid_frame'
         ]
         objects = pd.DataFrame(columns=columns)
@@ -2658,6 +2692,9 @@ class Detector():
                 'min_eventlength_mjd': obj['mjd_duration'].min(),
                 'max_eventlength_mjd': obj['mjd_duration'].max(),
                 'gaia_id' : maxevent['gaia_id'],
+                'gaia_n_3sig' : maxevent.get('gaia_n_3sig'),
+                'gaia_dmag' : maxevent.get('gaia_dmag'),
+                'gaia_n_local' : maxevent.get('gaia_n_local'),
                 'asteroid_id' : asteroid_id,
                 'frame_bin':  maxevent['frame_bin'],
                 'flux_sign': np.sum(obj['flux_sign'].unique()).astype(int),

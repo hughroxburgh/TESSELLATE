@@ -281,11 +281,13 @@ def _forced_aperture_photometry_core(cube, ephemeris_df, radius_px, sigma_clip_c
 # Forced PSF photometry
 # ---------------------------------------------------------------------------
 
-_PSF_COLUMNS = ["designation", "frame", "mjd", "x", "y", "flux", "e_flux", "background", "sig", "leak"]
+_PSF_COLUMNS = ["designation", "frame", "mjd", "x", "y", "flux", "e_flux", "background", "sig", "leak", "trail_px"]
+TRAIL_STEP_PX = 0.1     # spacing of the sub-positions along a trail (px); the PRF models are sampled at 1/9 px
 
 
 def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
-                            prf_path=None, stamp_size=STAMP_SIZE, n_workers=None, vectorised=True, background=None):
+                            prf_path=None, stamp_size=STAMP_SIZE, n_workers=None, vectorised=True, background=None,
+                            exptime_s=None, trail=True):
     """Forced PSF photometry (joint fit of [target PRF shape, flat local
     background]) at every predicted (frame, x, y), reusing the same
     per-frame linear solve psf_flux_calibration.py's zeropoint calibration
@@ -308,12 +310,25 @@ def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
     sky (S43 cam 4 ccd 4 cut 10). With it, every row also gets 'leak': the same PRF + flat fit applied
     to the background-model stamp, whose flux coefficient is the light absorbed in that frame;
     flux + leak is the asteroid's flux. 'flux' itself stays the measurement on the reduced cube.
-    NaN without a background cube or on the per-frame path."""
+    NaN without a background cube or on the per-frame path.
+
+    exptime_s, trail : an asteroid moves during the exposure, so its image is the PRF averaged along
+    its path, not a point PRF at the mid-exposure position: a point PRF fitted to a source trailed
+    over L px recovers 99.7 / 98.6 / 95 / 82 / 67 / 43 % of its flux at L = 0.25 / 0.5 / 1 / 2 / 3 /
+    5 px (noise-free, SPOC PRF), and the loss changes along a track as the sky motion changes. With
+    trail and the exposure time (the cut's frame spacing, s), each row's template is the PRF averaged
+    over the centres of equal segments (at most TRAIL_STEP_PX long) of the row's motion over the exposure (its own track's
+    ephemeris rate), in a stamp grown to hold the trail; 'trail_px' records the trail length. The
+    flux keeps the point-source convention the zero point was calibrated with (the template divided by
+    the point PRF's sum in the stamp_size stamp), so trailed and point rows report the same quantity.
+    Without exptime_s (or with trail=False) every row is a point source, as before. Vectorised path
+    only; the per-frame path stays point-source."""
     from .psf_flux_calibration import PRF_PATH_DEFAULT
     prf_path = prf_path or PRF_PATH_DEFAULT
     if vectorised:
         return _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
-                                                 prf_path, stamp_size, background=background)
+                                                 prf_path, stamp_size, background=background,
+                                                 exptime_s=exptime_s if trail else None)
 
     result = _run_parallel_by_track(cube, ephemeris_df, _psf_track_worker,
                                       (sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size),
@@ -323,8 +338,28 @@ def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
     return result.reindex(columns=_PSF_COLUMNS)
 
 
+def _half_exposure_motion(eph, exptime_s):
+    """(hx, hy): each row's displacement over half an exposure (px), from its own track's ephemeris
+    rate (np.gradient of x and y against mjd within each designation, as sso_mask.build_sso_mask);
+    zero for single-row tracks or without an exposure time."""
+    hx, hy = np.zeros(len(eph)), np.zeros(len(eph))
+    if not exptime_s:
+        return hx, hy
+    t = eph['mjd'].to_numpy(float)
+    xv, yv = eph['x'].to_numpy(float), eph['y'].to_numpy(float)
+    for ix in eph.groupby('designation', sort=False).indices.values():
+        o = ix[np.argsort(t[ix], kind='stable')]
+        if len(o) > 1 and np.all(np.diff(t[o]) > 0):
+            hx[o], hy[o] = np.gradient(xv[o], t[o]), np.gradient(yv[o], t[o])
+    half_exp = 0.5 * exptime_s / 86400.0
+    hx, hy = hx * half_exp, hy * half_exp
+    bad = ~(np.isfinite(hx) & np.isfinite(hy))
+    hx[bad], hy[bad] = 0.0, 0.0
+    return hx, hy
+
+
 def _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size,
-                                      chunk=5000, background=None):
+                                      chunk=5000, background=None, exptime_s=None):
     """_psf_lc_core's fit -- PRF template (normalised to 1 within the stamp) plus a flat background,
     least squares on the finite pixels, error from 1.4826 x the median absolute residual -- for
     every row at once, in closed form, with each row's PRF at its exact detector position
@@ -338,58 +373,82 @@ def _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_
     if len(ephemeris_df) == 0:
         return pd.DataFrame(columns=_PSF_COLUMNS)
     grid = get_grid(cam, ccd, sector, prf_path)
-    half = stamp_size // 2
-    off = np.arange(-half, half + 1)
+    half0 = stamp_size // 2
     eph = ephemeris_df[['designation', 'frame', 'mjd', 'x', 'y']].reset_index(drop=True)
     x, y, f = eph['x'].to_numpy(float), eph['y'].to_numpy(float), eph['frame'].to_numpy(int)
     xi, yi = np.round(x).astype(int), np.round(y).astype(int)          # as int(round()) in the per-frame path
-    inside = np.flatnonzero((xi - half >= 0) & (yi - half >= 0) & (xi + half + 1 <= cube.shape[2])
-                            & (yi + half + 1 <= cube.shape[1]))
+    hx, hy = _half_exposure_motion(eph, exptime_s)
+    lh = np.hypot(hx, hy)                                              # half the trail length (px)
+    nsub = np.where(lh > 0.5 * TRAIL_STEP_PX, np.ceil(2 * lh / TRAIL_STEP_PX).astype(int), 1)
+    hrow = np.where(nsub > 1, half0 + np.ceil(lh).astype(int), half0)  # stamp half-size holding the whole trail
+    lh = np.where(nsub > 1, lh, 0.0)                                   # trails below half a step are fitted as points
     parts = []
-    for start in range(0, len(inside), chunk):
-        k = inside[start:start + chunk]
-        D = np.asarray(cube[f[k][:, None, None], (yi[k][:, None] + off)[:, :, None],
-                            (xi[k][:, None] + off)[:, None, :]], dtype=float).reshape(len(k), -1)
-        T = grid.images(ccd_x0 + x[k], ccd_y0 + y[k], x[k] - xi[k], y[k] - yi[k], half).reshape(len(k), -1)
-        s = np.nansum(T, axis=1)
-        T = np.where((np.isfinite(s) & (s > 0))[:, None], T / np.where(s > 0, s, 1)[:, None], 0.0)
-        good = np.isfinite(D) & np.isfinite(T)
-        n = good.sum(axis=1).astype(float)
-        Dz, Tz = np.where(good, D, 0.0), np.where(good, T, 0.0)
-        stt, st, sd, std = (Tz * Tz).sum(1), Tz.sum(1), Dz.sum(1), (Tz * Dz).sum(1)
-        det = n * stt - st ** 2
-        ok = (n >= 3) & (np.abs(det) > 1e-12 * np.maximum(n * stt, 1e-300))
-        det = np.where(ok, det, np.nan)
-        flux = (n * std - st * sd) / det
-        bg = (stt * sd - st * std) / det
-        resid = np.where(good, D - flux[:, None] * T - bg[:, None], np.nan)
-        med = np.nanmedian(resid, axis=1)
-        sigma = 1.4826 * np.nanmedian(np.abs(resid - med[:, None]), axis=1)
-        e_flux = sigma * np.sqrt(n / det)
-        out = eph.iloc[k[ok]].copy()
-        out['flux'], out['e_flux'], out['background'] = flux[ok], e_flux[ok], bg[ok]
-        if background is not None:
-            # the same fit on the subtracted background-model stamp: its PRF coefficient is the asteroid light the
-            # background estimate absorbed in this frame (see forced_psf_photometry)
-            B = np.asarray(background[f[k][:, None, None], (yi[k][:, None] + off)[:, :, None],
-                                      (xi[k][:, None] + off)[:, None, :]], dtype=float).reshape(len(k), -1)
-            gb = good & np.isfinite(B)
-            nb = gb.sum(axis=1).astype(float)
-            Bz, Tb = np.where(gb, B, 0.0), np.where(gb, T, 0.0)
-            tt, t1, b1, tb = (Tb * Tb).sum(1), Tb.sum(1), Bz.sum(1), (Tb * Bz).sum(1)
-            detb = nb * tt - t1 ** 2
-            okb = (nb >= 3) & (np.abs(detb) > 1e-12 * np.maximum(nb * tt, 1e-300))
-            leak = np.where(okb, (nb * tb - t1 * b1) / np.where(okb, detb, 1.0), np.nan)
-            out['leak'] = leak[ok]
-        else:
-            out['leak'] = np.nan
-        parts.append(out)
+    for h, K in np.unique(np.column_stack([hrow, nsub]), axis=0):
+        off = np.arange(-h, h + 1)
+        inside = np.flatnonzero((hrow == h) & (nsub == K) & (xi - h >= 0) & (yi - h >= 0)
+                                & (xi + h + 1 <= cube.shape[2]) & (yi + h + 1 <= cube.shape[1]))
+        for start in range(0, len(inside), chunk):
+            k = inside[start:start + chunk]
+            parts.append(_psf_fit_rows(cube, background, grid, eph, k, x, y, f, xi, yi, hx, hy, lh,
+                                       ccd_x0, ccd_y0, half0, h, K, off))
     if not parts:
         return pd.DataFrame(columns=_PSF_COLUMNS)
     out = pd.concat(parts).sort_index().reset_index(drop=True)
     e = out['e_flux'].to_numpy()
     out['sig'] = np.where(np.isfinite(e) & (e > 0), out['flux'].to_numpy() / np.where(e > 0, e, 1), np.nan)
     return out[_PSF_COLUMNS]
+
+
+def _psf_fit_rows(cube, background, grid, eph, k, x, y, f, xi, yi, hx, hy, lh, ccd_x0, ccd_y0, half0, h, K, off):
+    """The closed-form PRF + flat background fit (and the leak) for rows k, which share a stamp
+    half-size h and a number of trail sub-positions K (see _forced_psf_photometry_vectorised)."""
+    D = np.asarray(cube[f[k][:, None, None], (yi[k][:, None] + off)[:, :, None],
+                        (xi[k][:, None] + off)[:, None, :]], dtype=float).reshape(len(k), -1)
+    # the point PRF at the mid-exposure position in the stamp_size stamp: its sum c0 sets the flux
+    # convention (the zero point was calibrated with it normalised to 1 there)
+    P0 = grid.images(ccd_x0 + x[k], ccd_y0 + y[k], x[k] - xi[k], y[k] - yi[k], half0).reshape(len(k), -1)
+    c0 = np.nansum(P0, axis=1)
+    if K == 1 and h == half0:
+        T = P0
+    else:
+        T = 0.0
+        for s_ in (2 * np.arange(K) + 1) / K - 1:                       # centres of K equal segments of the path
+            xs, ys = x[k] + s_ * hx[k], y[k] + s_ * hy[k]
+            T = T + grid.images(ccd_x0 + xs, ccd_y0 + ys, xs - xi[k], ys - yi[k], h).reshape(len(k), -1)
+        T = T / K
+    T = np.where((np.isfinite(c0) & (c0 > 0))[:, None], T / np.where(c0 > 0, c0, 1)[:, None], 0.0)
+    good = np.isfinite(D) & np.isfinite(T)
+    n = good.sum(axis=1).astype(float)
+    Dz, Tz = np.where(good, D, 0.0), np.where(good, T, 0.0)
+    stt, st, sd, std = (Tz * Tz).sum(1), Tz.sum(1), Dz.sum(1), (Tz * Dz).sum(1)
+    det = n * stt - st ** 2
+    ok = (n >= 3) & (np.abs(det) > 1e-12 * np.maximum(n * stt, 1e-300))
+    det = np.where(ok, det, np.nan)
+    flux = (n * std - st * sd) / det
+    bg = (stt * sd - st * std) / det
+    resid = np.where(good, D - flux[:, None] * T - bg[:, None], np.nan)
+    med = np.nanmedian(resid, axis=1)
+    sigma = 1.4826 * np.nanmedian(np.abs(resid - med[:, None]), axis=1)
+    e_flux = sigma * np.sqrt(n / det)
+    out = eph.iloc[k[ok]].copy()
+    out['flux'], out['e_flux'], out['background'] = flux[ok], e_flux[ok], bg[ok]
+    if background is not None:
+        # the same fit on the subtracted background-model stamp: its PRF coefficient is the asteroid light the
+        # background estimate absorbed in this frame (see forced_psf_photometry)
+        B = np.asarray(background[f[k][:, None, None], (yi[k][:, None] + off)[:, :, None],
+                                  (xi[k][:, None] + off)[:, None, :]], dtype=float).reshape(len(k), -1)
+        gb = good & np.isfinite(B)
+        nb = gb.sum(axis=1).astype(float)
+        Bz, Tb = np.where(gb, B, 0.0), np.where(gb, T, 0.0)
+        tt, t1, b1, tb = (Tb * Tb).sum(1), Tb.sum(1), Bz.sum(1), (Tb * Bz).sum(1)
+        detb = nb * tt - t1 ** 2
+        okb = (nb >= 3) & (np.abs(detb) > 1e-12 * np.maximum(nb * tt, 1e-300))
+        leak = np.where(okb, (nb * tb - t1 * b1) / np.where(okb, detb, 1.0), np.nan)
+        out['leak'] = leak[ok]
+    else:
+        out['leak'] = np.nan
+    out['trail_px'] = 2 * lh[k[ok]]
+    return out
 
 
 def _forced_psf_photometry_core(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size):

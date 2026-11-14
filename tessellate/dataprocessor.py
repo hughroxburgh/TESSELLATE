@@ -1034,8 +1034,10 @@ class DataProcessor():
             # alongside the flux ('leak' column; forced_psf_photometry). Memory-mapped: only the stamps are read.
             bkg_path = f'{cutFolder}/{base}_Background.npy'
             background = np.load(bkg_path, mmap_mode='r') if os.path.exists(bkg_path) else None
+            # the template is the PRF averaged along each asteroid's motion over the exposure (the frame spacing)
+            exptime_s = float(np.nanmedian(np.diff(reduced_mjd))) * 86400.0
             psf_df = forced_psf_photometry(cube, photometry_ephemeris, self.sector, cam, ccd,
-                                             cut_corner[0], cut_corner[1], background=background)
+                                             cut_corner[0], cut_corner[1], background=background, exptime_s=exptime_s)
             psf_df = detrend_pixel_phase(psf_df)
 
             # Step 3: contamination flags, on the one photometry result actually being saved

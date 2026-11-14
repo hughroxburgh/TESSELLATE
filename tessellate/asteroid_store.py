@@ -77,7 +77,7 @@ PRECISION = {
         'flux': ('error', 'e_flux'), 'flux_detrended': ('error', 'e_flux'), 'background': ('error', 'e_flux'),
         'leak': ('error', 'e_flux'),
         'zp_ab': ('error', 'e_zp_ab'),
-        'x': _PIXELS, 'y': _PIXELS, 'edge_px': _PIXELS, 'contaminating_star_dist_px': _PIXELS,
+        'x': _PIXELS, 'y': _PIXELS, 'edge_px': _PIXELS, 'contaminating_star_dist_px': _PIXELS, 'trail_px': _PIXELS,
         'ra': ('step', DEGREE_STEP), 'dec': ('step', DEGREE_STEP),
         'mjd': ('step', 2.0 ** -24),                    # 5 ms
         'mjd_utc': ('step', 2.0 ** -24),                # 5 ms
@@ -113,6 +113,7 @@ PHOTOMETRY_SCHEMA = pa.schema([
     ('flux_detrended', pa.float32()),
     ('background', pa.float32()),
     ('leak', pa.float32()),       # asteroid flux absorbed by the subtracted background model (e-/s); flux + leak = asteroid flux
+    ('trail_px', pa.float32()),   # trail length over the exposure (px) the PSF template was averaged along; 0 = point source
     ('x', pa.float32()),
     ('y', pa.float32()),
     ('ra', pa.float32()),     # kept to DEGREE_STEP; TESS pixels are 21 arcsec

@@ -754,7 +754,9 @@ class DataProcessor():
                 print('\n')
 
     def _reduce_part_cuts(self,cam,ccd,n,cut,filepath):
+        from .sso_mask import reduce_with_sso_mask
 
+        cut_corners,_,_,_ = self.find_cuts(cam,ccd,n,plot=False)
         for i in range(2):
             cutFolder = f'{filepath}/Part{i+1}/Cut{cut}of{n**2}'
             cutName = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}.fits'
@@ -772,9 +774,12 @@ class DataProcessor():
                 tessreduce = 0
 
                 # -- reduce -- #
-                tessreduce = tr.tessreduce(tpf=cutPath,sector=self.sector,reduce=True,corr_correction=True,
+                tessreduce = tr.tessreduce(tpf=cutPath,sector=self.sector,reduce=False,corr_correction=True,
                                             calibrate=False,catalogue_path=f'{cutFolder}/local_gaia_cat.csv',
                                             prf_path='/fred/oz335/_local_TESS_PRFs',backend='multiprocessing',verbose=2)
+                # predicted asteroids are excluded from the background (the reference never removes them)
+                reduce_with_sso_mask(tessreduce,f'{cutFolder}/asteroids/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_Asteroids.csv',
+                                     cam,ccd,self.sector,cut_corners[cut-1],'/fred/oz335/_local_TESS_PRFs',verbose=self.verbose)
                 
                 if self.verbose > 0:
                     print(f'--Reduction Part {i+1} Complete (Time: {((t()-ts)/60):.2f} mins)--')
@@ -819,6 +824,7 @@ class DataProcessor():
 
         import tessreduce as tr
         from .localisation import CutWCS
+        from .sso_mask import reduce_with_sso_mask
         
         filepath = f'{self.path}/Cam{cam}/Ccd{ccd}'
         injection_dir = injection_dir if injection else '.'
@@ -867,11 +873,14 @@ class DataProcessor():
             # -- reduce -- #
             tessreduce = tr.tessreduce(tpf=cutPath,sector=self.sector,camera=cam,ccd=ccd,
                                        flux=flux,mjd=mjd,shifts=shifts,wcs=wcs,
-                                        reduce=True,corr_correction=True,
+                                        reduce=False,corr_correction=True,
                                         calibrate=False,catalogue_path=f'{cutFolder}/local_gaia_cat.csv',col_offset=int(cut_corners[cut-1][0]),#-44,
                                         prf_path='/fred/oz335/_local_TESS_PRFs',vector_path='/fred/oz335/_local_TESS_vectors',
                                         ref_ind=ref_ind,quality_bitmask='hard',shift_method='sep_core',smooth_motion=False,
                                         orbit_ref=True,create_lc=False,timing=True,backend='multiprocessing',verbose=2)
+            # predicted asteroids are excluded from the background (the reference never removes them)
+            reduce_with_sso_mask(tessreduce,f'{cutFolder}/asteroids/{cutBase}_Asteroids.csv',
+                                 cam,ccd,self.sector,cut_corners[cut-1],'/fred/oz335/_local_TESS_PRFs',verbose=self.verbose)
 
             # # -- reduce -- #
             # tessreduce = tr.tessreduce(tpf=cutPath,flux=fluxPath,time=timePath,ref=refPath,

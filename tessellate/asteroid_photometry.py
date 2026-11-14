@@ -283,11 +283,13 @@ def _forced_aperture_photometry_core(cube, ephemeris_df, radius_px, sigma_clip_c
 
 _PSF_COLUMNS = ["designation", "frame", "mjd", "x", "y", "flux", "e_flux", "background", "sig", "leak", "trail_px"]
 TRAIL_STEP_PX = 0.1     # spacing of the sub-positions along a trail (px); the PRF models are sampled at 1/9 px
+RESAMPLE_PAD = 6        # stamp padding (px) for the resampled template, as tessreduce's scene_photom.resampled_target_columns
+RESAMPLE_ORDER = 5      # spline order of the reduction's frame alignment (tessreduce: ndimage.shift(..., order=5, mode='nearest'))
 
 
 def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
                             prf_path=None, stamp_size=STAMP_SIZE, n_workers=None, vectorised=True, background=None,
-                            exptime_s=None, trail=True):
+                            exptime_s=None, trail=True, shifts=None):
     """Forced PSF photometry (joint fit of [target PRF shape, flat local
     background]) at every predicted (frame, x, y), reusing the same
     per-frame linear solve psf_flux_calibration.py's zeropoint calibration
@@ -322,13 +324,25 @@ def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
     flux keeps the point-source convention the zero point was calibrated with (the template divided by
     the point PRF's sum in the stamp_size stamp), so trailed and point rows report the same quantity.
     Without exptime_s (or with trail=False) every row is a point source, as before. Vectorised path
-    only; the per-frame path stays point-source."""
+    only; the per-frame path stays point-source.
+
+    shifts : the reduction's alignment shift of every frame of the cube (the cut's _Shifts.npy, tessreduce's
+    shift: (n_frames, 2) = (dy, dx)), optional. The reduced frames are the raw frames resampled onto the
+    reference grid (ndimage.shift(raw, shifts[t], order=5, mode='nearest')), which changes the undersampled
+    PRF by an amount that depends on the shift and the source's sub-pixel phase, so a template rendered
+    straight at the aligned position makes the flux follow the sub-pixel phase ((22) Kalliope, S43 cam 4 ccd 4
+    cut 10: 32 % of the PSF / aperture flux scatter). With shifts, each row's template (point or trailed) is
+    rendered at its raw-frame position (aligned position - shift) in a stamp padded by RESAMPLE_PAD px, given
+    that same order-5 shift and cropped: tessreduce's scene_photom.resampled_target_columns, per row since an
+    asteroid moves. It is still divided by the unshifted point PRF's sum c0, as tessreduce divides by the
+    reference-phase sum, so the flux the resampling moves in or out of the stamp stays in the template.
+    NaN shifts count as zero. Vectorised path only."""
     from .psf_flux_calibration import PRF_PATH_DEFAULT
     prf_path = prf_path or PRF_PATH_DEFAULT
     if vectorised:
         return _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
                                                  prf_path, stamp_size, background=background,
-                                                 exptime_s=exptime_s if trail else None)
+                                                 exptime_s=exptime_s if trail else None, shifts=shifts)
 
     result = _run_parallel_by_track(cube, ephemeris_df, _psf_track_worker,
                                       (sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size),
@@ -358,8 +372,17 @@ def _half_exposure_motion(eph, exptime_s):
     return hx, hy
 
 
+def _shift_operators(s, n):
+    """(len(s), n, n) matrices M with M @ v = ndimage.shift(v, s_k, order=RESAMPLE_ORDER, mode='nearest') for a
+    length-n vector v. The spline shift is separable, so a stamp R shifted by (sy, sx) is M(sy) R M(sx)^T, which
+    batches over rows with different shifts."""
+    from scipy.ndimage import shift as nd_shift
+    eye = np.eye(n)
+    return np.stack([nd_shift(eye, (s_, 0.0), order=RESAMPLE_ORDER, mode='nearest') for s_ in s])
+
+
 def _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size,
-                                      chunk=5000, background=None, exptime_s=None):
+                                      chunk=5000, background=None, exptime_s=None, shifts=None):
     """_psf_lc_core's fit -- PRF template (normalised to 1 within the stamp) plus a flat background,
     least squares on the finite pixels, error from 1.4826 x the median absolute residual -- for
     every row at once, in closed form, with each row's PRF at its exact detector position
@@ -382,6 +405,10 @@ def _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_
     nsub = np.where(lh > 0.5 * TRAIL_STEP_PX, np.ceil(2 * lh / TRAIL_STEP_PX).astype(int), 1)
     hrow = np.where(nsub > 1, half0 + np.ceil(lh).astype(int), half0)  # stamp half-size holding the whole trail
     lh = np.where(nsub > 1, lh, 0.0)                                   # trails below half a step are fitted as points
+    if shifts is not None:
+        shifts = np.nan_to_num(np.asarray(shifts, dtype=float))
+        if shifts.shape != (cube.shape[0], 2):
+            raise ValueError(f'shifts has shape {shifts.shape}, expected ({cube.shape[0]}, 2) for the cube')
     parts = []
     for h, K in np.unique(np.column_stack([hrow, nsub]), axis=0):
         off = np.arange(-h, h + 1)
@@ -390,7 +417,7 @@ def _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_
         for start in range(0, len(inside), chunk):
             k = inside[start:start + chunk]
             parts.append(_psf_fit_rows(cube, background, grid, eph, k, x, y, f, xi, yi, hx, hy, lh,
-                                       ccd_x0, ccd_y0, half0, h, K, off))
+                                       ccd_x0, ccd_y0, half0, h, K, off, shifts))
     if not parts:
         return pd.DataFrame(columns=_PSF_COLUMNS)
     out = pd.concat(parts).sort_index().reset_index(drop=True)
@@ -399,7 +426,8 @@ def _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_
     return out[_PSF_COLUMNS]
 
 
-def _psf_fit_rows(cube, background, grid, eph, k, x, y, f, xi, yi, hx, hy, lh, ccd_x0, ccd_y0, half0, h, K, off):
+def _psf_fit_rows(cube, background, grid, eph, k, x, y, f, xi, yi, hx, hy, lh, ccd_x0, ccd_y0, half0, h, K, off,
+                  shifts=None):
     """The closed-form PRF + flat background fit (and the leak) for rows k, which share a stamp
     half-size h and a number of trail sub-positions K (see _forced_psf_photometry_vectorised)."""
     D = np.asarray(cube[f[k][:, None, None], (yi[k][:, None] + off)[:, :, None],
@@ -408,7 +436,20 @@ def _psf_fit_rows(cube, background, grid, eph, k, x, y, f, xi, yi, hx, hy, lh, c
     # convention (the zero point was calibrated with it normalised to 1 there)
     P0 = grid.images(ccd_x0 + x[k], ccd_y0 + y[k], x[k] - xi[k], y[k] - yi[k], half0).reshape(len(k), -1)
     c0 = np.nansum(P0, axis=1)
-    if K == 1 and h == half0:
+    if shifts is not None:
+        # resampled template (see forced_psf_photometry): rendered at the raw-frame position in a padded stamp,
+        # given the frame's alignment shift, cropped to the fit stamp
+        sy, sx = shifts[f[k], 0], shifts[f[k], 1]
+        hp = h + RESAMPLE_PAD
+        R = 0.0
+        for s_ in ((2 * np.arange(K) + 1) / K - 1 if K > 1 else (0.0,)):
+            xs, ys = x[k] + s_ * hx[k] - sx, y[k] + s_ * hy[k] - sy
+            R = R + grid.images(ccd_x0 + xs, ccd_y0 + ys, xs - xi[k], ys - yi[k], hp)
+        fu, inv = np.unique(f[k], return_inverse=True)
+        My = _shift_operators(shifts[fu, 0], 2 * hp + 1)[inv.ravel()]
+        Mx = _shift_operators(shifts[fu, 1], 2 * hp + 1)[inv.ravel()]
+        T = (My @ (R / K) @ Mx.transpose(0, 2, 1))[:, RESAMPLE_PAD:-RESAMPLE_PAD, RESAMPLE_PAD:-RESAMPLE_PAD].reshape(len(k), -1)
+    elif K == 1 and h == half0:
         T = P0
     else:
         T = 0.0

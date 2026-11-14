@@ -75,6 +75,7 @@ PRECISION = {
     'photometry': {
         'e_flux': ('mantissa', ERROR_BITS), 'e_zp_ab': ('mantissa', ERROR_BITS),
         'flux': ('error', 'e_flux'), 'flux_detrended': ('error', 'e_flux'), 'background': ('error', 'e_flux'),
+        'leak': ('error', 'e_flux'),
         'zp_ab': ('error', 'e_zp_ab'),
         'x': _PIXELS, 'y': _PIXELS, 'edge_px': _PIXELS, 'contaminating_star_dist_px': _PIXELS,
         'ra': ('step', DEGREE_STEP), 'dec': ('step', DEGREE_STEP),
@@ -111,6 +112,7 @@ PHOTOMETRY_SCHEMA = pa.schema([
     ('e_flux', pa.float32()),
     ('flux_detrended', pa.float32()),
     ('background', pa.float32()),
+    ('leak', pa.float32()),       # asteroid flux absorbed by the subtracted background model (e-/s); flux + leak = asteroid flux
     ('x', pa.float32()),
     ('y', pa.float32()),
     ('ra', pa.float32()),     # kept to DEGREE_STEP; TESS pixels are 21 arcsec

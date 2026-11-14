@@ -1030,8 +1030,12 @@ class DataProcessor():
             # Aperture photometry is currently disabled -- not part of the pipeline for now
             # (forced_aperture_photometry itself is untouched in asteroid_photometry.py, just
             # not called here).
+            # the background model reduce() subtracted: the per-frame light it absorbed from each asteroid is measured
+            # alongside the flux ('leak' column; forced_psf_photometry). Memory-mapped: only the stamps are read.
+            bkg_path = f'{cutFolder}/{base}_Background.npy'
+            background = np.load(bkg_path, mmap_mode='r') if os.path.exists(bkg_path) else None
             psf_df = forced_psf_photometry(cube, photometry_ephemeris, self.sector, cam, ccd,
-                                             cut_corner[0], cut_corner[1])
+                                             cut_corner[0], cut_corner[1], background=background)
             psf_df = detrend_pixel_phase(psf_df)
 
             # Step 3: contamination flags, on the one photometry result actually being saved

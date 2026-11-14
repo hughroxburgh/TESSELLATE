@@ -281,11 +281,11 @@ def _forced_aperture_photometry_core(cube, ephemeris_df, radius_px, sigma_clip_c
 # Forced PSF photometry
 # ---------------------------------------------------------------------------
 
-_PSF_COLUMNS = ["designation", "frame", "mjd", "x", "y", "flux", "e_flux", "background", "sig"]
+_PSF_COLUMNS = ["designation", "frame", "mjd", "x", "y", "flux", "e_flux", "background", "sig", "leak"]
 
 
 def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
-                            prf_path=None, stamp_size=STAMP_SIZE, n_workers=None, vectorised=True):
+                            prf_path=None, stamp_size=STAMP_SIZE, n_workers=None, vectorised=True, background=None):
     """Forced PSF photometry (joint fit of [target PRF shape, flat local
     background]) at every predicted (frame, x, y), reusing the same
     per-frame linear solve psf_flux_calibration.py's zeropoint calibration
@@ -299,23 +299,32 @@ def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
     By default every frame of every track is fitted at once (_forced_psf_photometry_vectorised:
     the same fit, with the PRF at each frame's exact detector position from prf_grid). With
     vectorised=False, the per-frame path: parallelised across tracks (see _run_parallel_by_track)
-    when there's more than one and n_workers != 1; pass n_workers=1 to force sequential."""
+    when there's more than one and n_workers != 1; pass n_workers=1 to force sequential.
+
+    background : the background model reduce() subtracted (the cut's _Background.npy, same shape as
+    cube), optional. The reference subtraction never removes moving objects, so the background
+    estimate absorbs part of every asteroid's light -- a bump centred on the asteroid, a few e-/s in
+    a quiet sky and up to ~1000 e-/s (17 % of (22) Kalliope's flux) where scattered light raises the
+    sky (S43 cam 4 ccd 4 cut 10). With it, every row also gets 'leak': the same PRF + flat fit applied
+    to the background-model stamp, whose flux coefficient is the light absorbed in that frame;
+    flux + leak is the asteroid's flux. 'flux' itself stays the measurement on the reduced cube.
+    NaN without a background cube or on the per-frame path."""
     from .psf_flux_calibration import PRF_PATH_DEFAULT
     prf_path = prf_path or PRF_PATH_DEFAULT
     if vectorised:
         return _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
-                                                 prf_path, stamp_size)
+                                                 prf_path, stamp_size, background=background)
 
     result = _run_parallel_by_track(cube, ephemeris_df, _psf_track_worker,
                                       (sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size),
                                       _PSF_COLUMNS, n_workers)
-    if result is not None:
-        return result
-    return _forced_psf_photometry_core(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size)
+    if result is None:
+        result = _forced_psf_photometry_core(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size)
+    return result.reindex(columns=_PSF_COLUMNS)
 
 
 def _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size,
-                                      chunk=5000):
+                                      chunk=5000, background=None):
     """_psf_lc_core's fit -- PRF template (normalised to 1 within the stamp) plus a flat background,
     least squares on the finite pixels, error from 1.4826 x the median absolute residual -- for
     every row at once, in closed form, with each row's PRF at its exact detector position
@@ -359,6 +368,21 @@ def _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_
         e_flux = sigma * np.sqrt(n / det)
         out = eph.iloc[k[ok]].copy()
         out['flux'], out['e_flux'], out['background'] = flux[ok], e_flux[ok], bg[ok]
+        if background is not None:
+            # the same fit on the subtracted background-model stamp: its PRF coefficient is the asteroid light the
+            # background estimate absorbed in this frame (see forced_psf_photometry)
+            B = np.asarray(background[f[k][:, None, None], (yi[k][:, None] + off)[:, :, None],
+                                      (xi[k][:, None] + off)[:, None, :]], dtype=float).reshape(len(k), -1)
+            gb = good & np.isfinite(B)
+            nb = gb.sum(axis=1).astype(float)
+            Bz, Tb = np.where(gb, B, 0.0), np.where(gb, T, 0.0)
+            tt, t1, b1, tb = (Tb * Tb).sum(1), Tb.sum(1), Bz.sum(1), (Tb * Bz).sum(1)
+            detb = nb * tt - t1 ** 2
+            okb = (nb >= 3) & (np.abs(detb) > 1e-12 * np.maximum(nb * tt, 1e-300))
+            leak = np.where(okb, (nb * tb - t1 * b1) / np.where(okb, detb, 1.0), np.nan)
+            out['leak'] = leak[ok]
+        else:
+            out['leak'] = np.nan
         parts.append(out)
     if not parts:
         return pd.DataFrame(columns=_PSF_COLUMNS)

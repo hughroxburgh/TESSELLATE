@@ -375,10 +375,20 @@ def _half_exposure_motion(eph, exptime_s):
 def _shift_operators(s, n):
     """(len(s), n, n) matrices M with M @ v = ndimage.shift(v, s_k, order=RESAMPLE_ORDER, mode='nearest') for a
     length-n vector v. The spline shift is separable, so a stamp R shifted by (sy, sx) is M(sy) R M(sx)^T, which
-    batches over rows with different shifts."""
-    from scipy.ndimage import shift as nd_shift
-    eye = np.eye(n)
-    return np.stack([nd_shift(eye, (s_, 0.0), order=RESAMPLE_ORDER, mode='nearest') for s_ in s])
+    batches over rows with different shifts. Column j of M is the shifted unit vector e_j, so all of them, for every
+    shift, are one spline evaluation of the identity at (i - s_k, j)."""
+    from scipy.ndimage import map_coordinates
+    s = np.asarray(s, dtype=float)
+    i = np.arange(n, dtype=float)
+    rows = np.broadcast_to(i[None, :, None] - s[:, None, None], (len(s), n, n))
+    cols = np.broadcast_to(i[None, None, :], (len(s), n, n))
+    return map_coordinates(np.eye(n), [rows, cols], order=RESAMPLE_ORDER, mode='nearest')
+
+
+def _cropped_shift_operators(s, n):
+    """_shift_operators with only the rows that land in the fit stamp (the padding cropped): M_c(sy) R M_c(sx)^T is the
+    cropped shifted stamp, without computing the padding's (2 RESAMPLE_PAD of every n) rows and columns."""
+    return np.ascontiguousarray(_shift_operators(s, n)[:, RESAMPLE_PAD:n - RESAMPLE_PAD, :])
 
 
 def _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size,
@@ -405,19 +415,25 @@ def _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_
     nsub = np.where(lh > 0.5 * TRAIL_STEP_PX, np.ceil(2 * lh / TRAIL_STEP_PX).astype(int), 1)
     hrow = np.where(nsub > 1, half0 + np.ceil(lh).astype(int), half0)  # stamp half-size holding the whole trail
     lh = np.where(nsub > 1, lh, 0.0)                                   # trails below half a step are fitted as points
+    ops = None
     if shifts is not None:
         shifts = np.nan_to_num(np.asarray(shifts, dtype=float))
         if shifts.shape != (cube.shape[0], 2):
             raise ValueError(f'shifts has shape {shifts.shape}, expected ({cube.shape[0]}, 2) for the cube')
+        ops = {}                               # per stamp half-size: its rows' frames and their cropped shift operators
     parts = []
     for h, K in np.unique(np.column_stack([hrow, nsub]), axis=0):
         off = np.arange(-h, h + 1)
         inside = np.flatnonzero((hrow == h) & (nsub == K) & (xi - h >= 0) & (yi - h >= 0)
                                 & (xi + h + 1 <= cube.shape[2]) & (yi + h + 1 <= cube.shape[1]))
+        if ops is not None and h not in ops and len(inside):
+            fr = np.unique(f[hrow == h])
+            n = 2 * (h + RESAMPLE_PAD) + 1
+            ops[h] = (fr, _cropped_shift_operators(shifts[fr, 0], n), _cropped_shift_operators(shifts[fr, 1], n))
         for start in range(0, len(inside), chunk):
             k = inside[start:start + chunk]
             parts.append(_psf_fit_rows(cube, background, grid, eph, k, x, y, f, xi, yi, hx, hy, lh,
-                                       ccd_x0, ccd_y0, half0, h, K, off, shifts))
+                                       ccd_x0, ccd_y0, half0, h, K, off, shifts, ops[h] if ops is not None else None))
     if not parts:
         return pd.DataFrame(columns=_PSF_COLUMNS)
     out = pd.concat(parts).sort_index().reset_index(drop=True)
@@ -427,7 +443,7 @@ def _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_
 
 
 def _psf_fit_rows(cube, background, grid, eph, k, x, y, f, xi, yi, hx, hy, lh, ccd_x0, ccd_y0, half0, h, K, off,
-                  shifts=None):
+                  shifts=None, ops=None):
     """The closed-form PRF + flat background fit (and the leak) for rows k, which share a stamp
     half-size h and a number of trail sub-positions K (see _forced_psf_photometry_vectorised)."""
     D = np.asarray(cube[f[k][:, None, None], (yi[k][:, None] + off)[:, :, None],
@@ -445,10 +461,12 @@ def _psf_fit_rows(cube, background, grid, eph, k, x, y, f, xi, yi, hx, hy, lh, c
         for s_ in ((2 * np.arange(K) + 1) / K - 1 if K > 1 else (0.0,)):
             xs, ys = x[k] + s_ * hx[k] - sx, y[k] + s_ * hy[k] - sy
             R = R + grid.images(ccd_x0 + xs, ccd_y0 + ys, xs - xi[k], ys - yi[k], hp)
-        fu, inv = np.unique(f[k], return_inverse=True)
-        My = _shift_operators(shifts[fu, 0], 2 * hp + 1)[inv.ravel()]
-        Mx = _shift_operators(shifts[fu, 1], 2 * hp + 1)[inv.ravel()]
-        T = (My @ (R / K) @ Mx.transpose(0, 2, 1))[:, RESAMPLE_PAD:-RESAMPLE_PAD, RESAMPLE_PAD:-RESAMPLE_PAD].reshape(len(k), -1)
+        if ops is None:
+            fr = np.unique(f[k])
+            ops = (fr, _cropped_shift_operators(shifts[fr, 0], 2 * hp + 1), _cropped_shift_operators(shifts[fr, 1], 2 * hp + 1))
+        pos = np.searchsorted(ops[0], f[k])
+        My, Mx = ops[1][pos], ops[2][pos]
+        T = (My @ (R / K) @ Mx.transpose(0, 2, 1)).reshape(len(k), -1)
     elif K == 1 and h == half0:
         T = P0
     else:

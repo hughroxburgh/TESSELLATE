@@ -40,7 +40,8 @@ nothing, and rounding is idempotent, so merges never change stored values.
 
 Stored at native cadence. Stacking (asteroid_photometry.stack_lightcurves) and anything else
 derived is recomputed on read, so changing it never needs the photometry rerun. Columns that
-are ratios or rounding of stored columns (sig, sig_detrended, xfrac, yfrac) are not stored.
+are ratios, sums or rounding of stored columns (sig, flux + leak, xfrac, yfrac) are not stored; the light curves use
+flux + leak (asteroid_photometry.add_flux_with_leak), and flux_detrended is no longer written (2026-11-15).
 """
 
 import glob
@@ -74,7 +75,7 @@ _PIXELS = ('step', PIXEL_STEP)
 PRECISION = {
     'photometry': {
         'e_flux': ('mantissa', ERROR_BITS), 'e_zp_ab': ('mantissa', ERROR_BITS),
-        'flux': ('error', 'e_flux'), 'flux_detrended': ('error', 'e_flux'), 'background': ('error', 'e_flux'),
+        'flux': ('error', 'e_flux'), 'background': ('error', 'e_flux'),
         'leak': ('error', 'e_flux'),
         'zp_ab': ('error', 'e_zp_ab'),
         'x': _PIXELS, 'y': _PIXELS, 'edge_px': _PIXELS, 'contaminating_star_dist_px': _PIXELS, 'trail_px': _PIXELS,
@@ -110,7 +111,6 @@ PHOTOMETRY_SCHEMA = pa.schema([
     ('tess_z', pa.float32()),
     ('flux', pa.float32()),
     ('e_flux', pa.float32()),
-    ('flux_detrended', pa.float32()),
     ('background', pa.float32()),
     ('leak', pa.float32()),       # asteroid flux absorbed by the subtracted background model (e-/s); flux + leak = asteroid flux
     ('trail_px', pa.float32()),   # trail length over the exposure (px) the PSF template was averaged along; 0 = point source
@@ -263,7 +263,7 @@ def read_zeropoint(cut_folder):
 
 
 def photometry_table(psf_df, ephemeris, sector, cam, ccd, cut, part=0, shape=None, zp_ab=np.nan, e_zp_ab=np.nan):
-    """One cut's forced photometry (after detrend_pixel_phase and flag_star_contamination) with the
+    """One cut's forced photometry (after add_flux_with_leak and flag_star_contamination) with the
     ephemeris geometry of each measured frame joined on, in the store's photometry schema. shape is
     the cut's (ny, nx), for each point's distance to the cut edge."""
     # frame-time columns from the 2026-10-20 ephemeris (see asteroid_prediction._spacecraft_epoch); NaN for an
@@ -602,12 +602,13 @@ def fill_zeropoints(data_path, sector):
 
 
 def physical_flux(df):
-    """Add flux_ujy, e_flux_ujy and flux_detrended_ujy (microjansky, from each row's own cut
-    zeropoint; NaN where the cut is uncalibrated). The zeropoint error e_zp_ab is a per-cut
-    systematic and is not folded into e_flux_ujy."""
+    """Add flux_ujy, e_flux_ujy and leak_ujy (microjansky, from each row's own cut zeropoint; NaN
+    where the cut is uncalibrated); the light curve is flux_ujy + leak_ujy. flux_detrended_ujy for a
+    store written before 2026-11-15. The zeropoint error e_zp_ab is a per-cut systematic and is not
+    folded into e_flux_ujy."""
     scale = 10 ** (-0.4 * (df['zp_ab'].astype(float) - 23.9))
     out = df.copy()
-    for col in ['flux', 'e_flux', 'flux_detrended']:
+    for col in ['flux', 'e_flux', 'leak', 'flux_detrended']:
         if col in out.columns:
             out[f'{col}_ujy'] = out[col].astype(float) * scale
     return out
@@ -663,6 +664,12 @@ def _skip_duplicates(expr, kind, include_duplicates):
     return expr if kind != 'photometry' or include_duplicates else expr & ~ds.field('overlap_duplicate')
 
 
+def _present(columns, dset):
+    """The requested columns the store has (a store written before a column existed, e.g. 'leak' before
+    2026-11-15, still loads; the caller treats the missing column as absent)."""
+    return None if columns is None else [c for c in columns if c in dset.schema.names]
+
+
 def load_lightcurve(designation, data_path, sectors=None, columns=None, kind='photometry', include_duplicates=False):
     """Every stored measurement of one or more objects (designation strings or MPC numbers), sorted
     by designation and mjd, without overlap duplicates unless include_duplicates. kind='tracks'
@@ -672,7 +679,8 @@ def load_lightcurve(designation, data_path, sectors=None, columns=None, kind='ph
         return pd.DataFrame(columns=columns or PHOTOMETRY_SCHEMA.names)
     field = ds.field('designation')
     expr = _skip_duplicates(field == names[0] if len(names) == 1 else field.isin(names), kind, include_duplicates)
-    df = _dataset(data_path, kind, sectors).to_table(columns=columns, filter=expr).to_pandas()
+    dset = _dataset(data_path, kind, sectors)
+    df = dset.to_table(columns=_present(columns, dset), filter=expr).to_pandas()
     order = [c for c in ['designation', 'mjd', 'sector', 'cam', 'ccd', 'cut'] if c in df.columns]
     return df.sort_values(order, ignore_index=True) if order else df
 
@@ -692,6 +700,7 @@ def load_designation_range(lo, hi, data_path, sectors=None, columns=None, kind='
     include_duplicates); reads only the overlapping row groups."""
     field = ds.field('designation')
     expr = _skip_duplicates((field >= lo) & (field <= hi), kind, include_duplicates)
-    df = _dataset(data_path, kind, sectors).to_table(columns=columns, filter=expr).to_pandas()
+    dset = _dataset(data_path, kind, sectors)
+    df = dset.to_table(columns=_present(columns, dset), filter=expr).to_pandas()
     order = [c for c in ['designation', 'mjd', 'sector', 'cam', 'ccd', 'cut'] if c in df.columns]
     return df.sort_values(order, ignore_index=True) if order else df

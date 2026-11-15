@@ -285,6 +285,12 @@ _PSF_COLUMNS = ["designation", "frame", "mjd", "x", "y", "flux", "e_flux", "back
 TRAIL_STEP_PX = 0.1     # spacing of the sub-positions along a trail (px); the PRF models are sampled at 1/9 px
 RESAMPLE_PAD = 6        # stamp padding (px) for the resampled template, as tessreduce's scene_photom.resampled_target_columns
 RESAMPLE_ORDER = 5      # spline order of the reduction's frame alignment (tessreduce: ndimage.shift(..., order=5, mode='nearest'))
+POSITION_STEP_PX = 0.02       # smooth_track_positions: finite-difference step for the template's position derivatives
+POSITION_MAX_STEP_PX = 0.3    # largest per-frame position step used, and the largest smooth correction accepted
+POSITION_N_ITER = 3           # rounds of per-frame steps and smoothing
+POSITION_MAX_DEGREE = 2       # the smooth offset: polynomial in time up to this degree (degree by BIC)
+POSITION_MIN_FRAMES = 20      # fewer fitted frames: the track keeps its constant offset
+POSITION_MIN_LINEAR_FRACTION = 0.5   # the share of a track's fitted frames whose step must be in the linear regime
 
 
 def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
@@ -307,12 +313,16 @@ def forced_psf_photometry(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0,
 
     background : the background model reduce() subtracted (the cut's _Background.npy, same shape as
     cube), optional. The reference subtraction never removes moving objects, so the background
-    estimate absorbs part of every asteroid's light -- a bump centred on the asteroid, a few e-/s in
-    a quiet sky and up to ~1000 e-/s (17 % of (22) Kalliope's flux) where scattered light raises the
-    sky (S43 cam 4 ccd 4 cut 10). With it, every row also gets 'leak': the same PRF + flat fit applied
-    to the background-model stamp, whose flux coefficient is the light absorbed in that frame;
-    flux + leak is the asteroid's flux. 'flux' itself stays the measurement on the reduced cube.
-    NaN without a background cube or on the per-frame path.
+    estimate takes in part of every asteroid's light: a broad bump (the model is inpainted, Gaussian-
+    smoothed, Savitzky-Golay smoothed in time and given a 9 px box residual surface), a few e-/s in a
+    quiet sky and up to ~1000 e-/s where scattered light raises the sky (S43 cam 4 ccd 4 cut 10). With
+    it, every row also gets 'leak': the same PRF + flat fit applied to the background-model stamp. The
+    fit is linear, so flux + leak is that fit to the data before the background subtraction (the
+    saved model is the only background in the reduced flux: reduce() restarts from the raw frames
+    after its first pass); the leak is not the bump's total light, which the flat term mostly takes.
+    Except on catalogue source pixels changed by tessreduce's correlation correction (flux changed,
+    saved background not). 'flux' itself stays the measurement on the reduced cube. NaN without a
+    background cube or on the per-frame path.
 
     exptime_s, trail : an asteroid moves during the exposure, so its image is the PRF averaged along
     its path, not a point PRF at the mid-exposure position: a point PRF fitted to a source trailed
@@ -442,15 +452,23 @@ def _forced_psf_photometry_vectorised(cube, ephemeris_df, sector, cam, ccd, ccd_
     return out[_PSF_COLUMNS]
 
 
-def _psf_fit_rows(cube, background, grid, eph, k, x, y, f, xi, yi, hx, hy, lh, ccd_x0, ccd_y0, half0, h, K, off,
-                  shifts=None, ops=None):
-    """The closed-form PRF + flat background fit (and the leak) for rows k, which share a stamp
-    half-size h and a number of trail sub-positions K (see _forced_psf_photometry_vectorised)."""
-    D = np.asarray(cube[f[k][:, None, None], (yi[k][:, None] + off)[:, :, None],
-                        (xi[k][:, None] + off)[:, None, :]], dtype=float).reshape(len(k), -1)
+def _nanmedian_rows(a):
+    """np.nanmedian(a, axis=1) of a 2-D array, by sorting (NaNs sort last) and averaging the middle pair: the same
+    values, without np.nanmedian's masked-array path for short rows (17 % of a dense cut's PSF fit)."""
+    s = np.sort(a, axis=1)
+    n = np.isfinite(a).sum(axis=1)
+    r = np.arange(len(a))
+    med = 0.5 * (s[r, np.maximum((n - 1) // 2, 0)] + s[r, n // 2])
+    return np.where(n > 0, med, np.nan)
+
+
+def _row_templates(grid, k, px, py, f, xi, yi, hx, hy, ccd_x0, ccd_y0, half0, h, K, shifts=None, ops=None):
+    """The fit template (n_rows, (2 h + 1)^2) of rows k for mid-exposure positions px, py (one per row, cube
+    pixels), divided by the point PRF's sum in the stamp_size stamp: trailed over K sub-positions and, with
+    shifts, resampled with the frame's alignment shift (see forced_psf_photometry)."""
     # the point PRF at the mid-exposure position in the stamp_size stamp: its sum c0 sets the flux
     # convention (the zero point was calibrated with it normalised to 1 there)
-    P0 = grid.images(ccd_x0 + x[k], ccd_y0 + y[k], x[k] - xi[k], y[k] - yi[k], half0).reshape(len(k), -1)
+    P0 = grid.images(ccd_x0 + px, ccd_y0 + py, px - xi[k], py - yi[k], half0).reshape(len(k), -1)
     c0 = np.nansum(P0, axis=1)
     if shifts is not None:
         # resampled template (see forced_psf_photometry): rendered at the raw-frame position in a padded stamp,
@@ -459,7 +477,7 @@ def _psf_fit_rows(cube, background, grid, eph, k, x, y, f, xi, yi, hx, hy, lh, c
         hp = h + RESAMPLE_PAD
         R = 0.0
         for s_ in ((2 * np.arange(K) + 1) / K - 1 if K > 1 else (0.0,)):
-            xs, ys = x[k] + s_ * hx[k] - sx, y[k] + s_ * hy[k] - sy
+            xs, ys = px + s_ * hx[k] - sx, py + s_ * hy[k] - sy
             R = R + grid.images(ccd_x0 + xs, ccd_y0 + ys, xs - xi[k], ys - yi[k], hp)
         if ops is None:
             fr = np.unique(f[k])
@@ -472,10 +490,19 @@ def _psf_fit_rows(cube, background, grid, eph, k, x, y, f, xi, yi, hx, hy, lh, c
     else:
         T = 0.0
         for s_ in (2 * np.arange(K) + 1) / K - 1:                       # centres of K equal segments of the path
-            xs, ys = x[k] + s_ * hx[k], y[k] + s_ * hy[k]
+            xs, ys = px + s_ * hx[k], py + s_ * hy[k]
             T = T + grid.images(ccd_x0 + xs, ccd_y0 + ys, xs - xi[k], ys - yi[k], h).reshape(len(k), -1)
         T = T / K
-    T = np.where((np.isfinite(c0) & (c0 > 0))[:, None], T / np.where(c0 > 0, c0, 1)[:, None], 0.0)
+    return np.where((np.isfinite(c0) & (c0 > 0))[:, None], T / np.where(c0 > 0, c0, 1)[:, None], 0.0)
+
+
+def _psf_fit_rows(cube, background, grid, eph, k, x, y, f, xi, yi, hx, hy, lh, ccd_x0, ccd_y0, half0, h, K, off,
+                  shifts=None, ops=None):
+    """The closed-form PRF + flat background fit (and the leak) for rows k, which share a stamp
+    half-size h and a number of trail sub-positions K (see _forced_psf_photometry_vectorised)."""
+    D = np.asarray(cube[f[k][:, None, None], (yi[k][:, None] + off)[:, :, None],
+                        (xi[k][:, None] + off)[:, None, :]], dtype=float).reshape(len(k), -1)
+    T = _row_templates(grid, k, x[k], y[k], f, xi, yi, hx, hy, ccd_x0, ccd_y0, half0, h, K, shifts, ops)
     good = np.isfinite(D) & np.isfinite(T)
     n = good.sum(axis=1).astype(float)
     Dz, Tz = np.where(good, D, 0.0), np.where(good, T, 0.0)
@@ -486,14 +513,14 @@ def _psf_fit_rows(cube, background, grid, eph, k, x, y, f, xi, yi, hx, hy, lh, c
     flux = (n * std - st * sd) / det
     bg = (stt * sd - st * std) / det
     resid = np.where(good, D - flux[:, None] * T - bg[:, None], np.nan)
-    med = np.nanmedian(resid, axis=1)
-    sigma = 1.4826 * np.nanmedian(np.abs(resid - med[:, None]), axis=1)
+    med = _nanmedian_rows(resid)
+    sigma = 1.4826 * _nanmedian_rows(np.abs(resid - med[:, None]))
     e_flux = sigma * np.sqrt(n / det)
     out = eph.iloc[k[ok]].copy()
     out['flux'], out['e_flux'], out['background'] = flux[ok], e_flux[ok], bg[ok]
     if background is not None:
-        # the same fit on the subtracted background-model stamp: its PRF coefficient is the asteroid light the
-        # background estimate absorbed in this frame (see forced_psf_photometry)
+        # the same fit on the subtracted background-model stamp: flux + leak is the fit to the data before the
+        # background subtraction (see forced_psf_photometry)
         B = np.asarray(background[f[k][:, None, None], (yi[k][:, None] + off)[:, :, None],
                                   (xi[k][:, None] + off)[:, None, :]], dtype=float).reshape(len(k), -1)
         gb = good & np.isfinite(B)
@@ -508,6 +535,160 @@ def _psf_fit_rows(cube, background, grid, eph, k, x, y, f, xi, yi, hx, hy, lh, c
         out['leak'] = np.nan
     out['trail_px'] = 2 * lh[k[ok]]
     return out
+
+
+def _position_fit_rows(cube, grid, k, px, py, f, xi, yi, hx, hy, ccd_x0, ccd_y0, half0, h, K, off, shifts=None, ops=None):
+    """Per-frame position step of rows k: the [T, 1, dT/dx, dT/dy] least-squares fit in the photometry's stamp
+    (T as _psf_fit_rows renders it, derivatives by central differences of POSITION_STEP_PX), whose derivative
+    coefficients over the flux are the step: f T(p + d) ~ f T + (f d) dT/dp. Returns (dx, dy, e_dx, e_dy), NaN where the
+    fit fails or the flux is not positive; errors from 1.4826 x the median absolute residual."""
+    D = np.asarray(cube[f[k][:, None, None], (yi[k][:, None] + off)[:, :, None],
+                        (xi[k][:, None] + off)[:, None, :]], dtype=float).reshape(len(k), -1)
+    args = (f, xi, yi, hx, hy, ccd_x0, ccd_y0, half0, h, K, shifts, ops)
+    e = POSITION_STEP_PX
+    T = _row_templates(grid, k, px, py, *args)
+    Tx = (_row_templates(grid, k, px + e, py, *args) - _row_templates(grid, k, px - e, py, *args)) / (2 * e)
+    Ty = (_row_templates(grid, k, px, py + e, *args) - _row_templates(grid, k, px, py - e, *args)) / (2 * e)
+    good = np.isfinite(D) & np.isfinite(T) & np.isfinite(Tx) & np.isfinite(Ty)
+    A = np.stack([T, np.ones_like(T), Tx, Ty], -1) * good[..., None]
+    N = np.einsum('nki,nkj->nij', A, A)
+    b = np.einsum('nki,nk->ni', A, np.where(good, D, 0.0))
+    ok = good.sum(axis=1) >= 8
+    Ninv = np.full_like(N, np.nan)
+    if ok.any():
+        Ninv[ok] = np.linalg.pinv(N[ok])                  # per frame; a singular frame does not stop the others
+    c = np.einsum('nij,nj->ni', Ninv, b)
+    resid = np.where(good, D - np.einsum('nki,ni->nk', A, c), np.nan)
+    sigma = 1.4826 * _nanmedian_rows(np.abs(resid - _nanmedian_rows(resid)[:, None]))
+    flux = c[:, 0]
+    valid = ok & np.isfinite(flux) & (flux > 0) & np.isfinite(sigma)
+    fl = np.where(valid, flux, np.nan)
+    return (c[:, 2] / fl, c[:, 3] / fl, sigma * np.sqrt(np.abs(Ninv[:, 2, 2])) / fl, sigma * np.sqrt(np.abs(Ninv[:, 3, 3])) / fl)
+
+
+def _smooth_offset(t, d, e):
+    """The smooth position offset of one track: a polynomial in time of degree none (zero), 0, 1 or 2 fitted to the
+    per-frame offsets d (errors e), chosen by BIC = chi^2 / s^2 + p ln N, s the robust scale of the residual in units
+    of e (the per-frame errors carry the fit's model error), after iterative 3 s clipping with the degree-2 fit.
+    The polynomial is held flat beyond the fitted frames' time range (no extrapolation), and a curve that reaches
+    POSITION_MAX_STEP_PX anywhere is a failed fit (the stacked offset already applied is better than that): none.
+    Returns (offset at every t, degree; -1 = none)."""
+    ok = np.isfinite(d) & np.isfinite(e) & (e > 0)
+    if ok.sum() < POSITION_MIN_FRAMES:
+        return np.zeros(len(t)), -1
+    tc = t[ok].mean()
+    span = max(np.ptp(t[ok]), 1e-9)
+    tt = (np.clip(t, t[ok].min(), t[ok].max()) - tc) / span
+    keep = ok.copy()
+    for _ in range(10):
+        X = np.vander(tt[keep], POSITION_MAX_DEGREE + 1)
+        c = np.linalg.lstsq(X / e[keep, None], d[keep] / e[keep], rcond=None)[0]
+        z = (d - np.vander(tt, POSITION_MAX_DEGREE + 1) @ c) / e
+        s = 1.4826 * np.median(np.abs(z[keep] - np.median(z[keep])))
+        new = ok & (np.abs(z) < 3 * s)
+        if not s > 0 or (new == keep).all():
+            break
+        keep = new
+    if not s > 0:
+        return np.zeros(len(t)), -1
+    n = keep.sum()
+    best = (np.sum((d[keep] / e[keep]) ** 2) / s ** 2, -1, None)               # no change
+    for deg in range(POSITION_MAX_DEGREE + 1):
+        X = np.vander(tt[keep], deg + 1)
+        c = np.linalg.lstsq(X / e[keep, None], d[keep] / e[keep], rcond=None)[0]
+        bic = np.sum(((d[keep] - X @ c) / e[keep]) ** 2) / s ** 2 + (deg + 1) * np.log(n)
+        if bic < best[0]:
+            best = (bic, deg, c)
+    _, deg, c = best
+    if deg < 0:
+        return np.zeros(len(t)), -1
+    curve = np.vander(tt, deg + 1) @ c
+    if not np.all(np.abs(curve) < POSITION_MAX_STEP_PX):
+        return np.zeros(len(t)), -1
+    return curve, deg
+
+
+def smooth_track_positions(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0, designations, prf_path=None,
+                           stamp_size=STAMP_SIZE, exptime_s=None, shifts=None, chunk=5000):
+    """Smooth position offsets for the listed tracks (2026-11-15). A track's position is its ephemeris plus one
+    constant offset (track_offsets), but the offset drifts along a track ((7) Iris, S43 cam 4 ccd 4 cut 1: 0.1 px in y
+    over 2.8 d as it crosses the cut), and for a bright track a 0.01 px error leaves residuals well above its noise.
+    Per-frame positions follow the slow axis's sub-pixel phase cycle instead (a static PRF error's centroid bias),
+    so the offset is fitted as a smooth function: POSITION_N_ITER rounds of per-frame steps (_position_fit_rows, the
+    photometry's own trailed / resampled template) and a polynomial in time per track (_smooth_offset, degree by
+    BIC, none kept where the data do not ask for one). Light-curve precision (scatter about the rotation model, per
+    photon-limited error) with it: (554) Peraga 2.0 -> 1.6, Iris 9.9 -> 9.5, (22) Kalliope 5.4 -> 5.3. Not called by the
+    pipeline: across 48 tracks of all strata it left the scatter unchanged (median ratio 1.000, better in 23) and cost 84 s
+    of a dense cut's 231 s (multifield_photometry_check.py, asteroid_stage_timing.py, 2026-11-15).
+    Returns (ephemeris copy with the listed tracks' x, y moved; per-track diagnostics: degree_x, degree_y
+    (-1 = none), n_frames fitted, offset_rms_x, offset_rms_y (px))."""
+    from .psf_flux_calibration import PRF_PATH_DEFAULT
+    from .prf_grid import get_grid
+    prf_path = prf_path or PRF_PATH_DEFAULT
+    out = ephemeris_df.copy()
+    cols = ['designation', 'degree_x', 'degree_y', 'n_frames', 'offset_rms_x', 'offset_rms_y']
+    sel = np.flatnonzero(out['designation'].isin(set(designations)).to_numpy())
+    if len(sel) == 0:
+        return out, pd.DataFrame(columns=cols)
+    grid = get_grid(cam, ccd, sector, prf_path)
+    half0 = stamp_size // 2
+    eph = out.iloc[sel][['designation', 'frame', 'mjd', 'x', 'y']].reset_index(drop=True)
+    x_in, y_in, f = eph['x'].to_numpy(float), eph['y'].to_numpy(float), eph['frame'].to_numpy(int)
+    t = eph['mjd'].to_numpy(float)
+    xi, yi = np.round(x_in).astype(int), np.round(y_in).astype(int)
+    hx, hy = _half_exposure_motion(eph, exptime_s)
+    lh = np.hypot(hx, hy)
+    nsub = np.where(lh > 0.5 * TRAIL_STEP_PX, np.ceil(2 * lh / TRAIL_STEP_PX).astype(int), 1)
+    hrow = np.where(nsub > 1, half0 + np.ceil(lh).astype(int), half0)
+    ops = None
+    if shifts is not None:
+        shifts = np.nan_to_num(np.asarray(shifts, dtype=float))
+        ops = {}
+    groups = eph.groupby('designation', sort=False).indices
+    px, py = x_in.copy(), y_in.copy()
+    degrees, nfit, measured = {}, {}, {}
+    for it in range(POSITION_N_ITER):
+        dx, dy, ex, ey = (np.full(len(eph), np.nan) for _ in range(4))
+        for h, K in np.unique(np.column_stack([hrow, nsub]), axis=0):
+            off = np.arange(-h, h + 1)
+            inside = np.flatnonzero((hrow == h) & (nsub == K) & (xi - h >= 0) & (yi - h >= 0)
+                                    & (xi + h + 1 <= cube.shape[2]) & (yi + h + 1 <= cube.shape[1]))
+            if ops is not None and h not in ops and len(inside):
+                fr = np.unique(f[hrow == h])
+                n_ = 2 * (h + RESAMPLE_PAD) + 1
+                ops[h] = (fr, _cropped_shift_operators(shifts[fr, 0], n_), _cropped_shift_operators(shifts[fr, 1], n_))
+            for start in range(0, len(inside), chunk):
+                k = inside[start:start + chunk]
+                dx[k], dy[k], ex[k], ey[k] = _position_fit_rows(cube, grid, k, px[k], py[k], f, xi, yi, hx, hy, ccd_x0, ccd_y0,
+                                                                half0, h, K, off, shifts, ops[h] if ops is not None else None)
+        # frames whose step stays inside the largest accepted one, each weighted by its own position error; a step at
+        # or beyond it is outside the linear regime (often a frame without signal), and clipping it instead set the
+        # positions of faint tracks wandering over the rounds. No cut on the error itself: keeping only the frames
+        # whose noise happened to be small selected them by their noise
+        inf = (np.abs(dx) < POSITION_MAX_STEP_PX) & (np.abs(dy) < POSITION_MAX_STEP_PX)
+        if it == 0:
+            # a track's positions are measured frame by frame only if most of its fitted frames are in the linear regime;
+            # where few are (little signal per frame), the few that are follow noise and coherent structure, not the
+            # track, and the track keeps its constant offset
+            fitted = np.isfinite(dx) & np.isfinite(dy)
+            measured = {des: inf[ix].sum() >= POSITION_MIN_LINEAR_FRACTION * max(fitted[ix].sum(), 1) for des, ix in groups.items()}
+        dx, dy, ex, ey = (np.where(inf, v, np.nan) for v in (dx, dy, ex, ey))
+        est_x, est_y = px + dx, py + dy
+        for des, ix in groups.items():
+            if not measured[des]:
+                degrees[des], nfit[des] = (-1, -1), int(inf[ix].sum())
+                continue
+            sx_, gx = _smooth_offset(t[ix], est_x[ix] - x_in[ix], ex[ix])
+            sy_, gy = _smooth_offset(t[ix], est_y[ix] - y_in[ix], ey[ix])
+            px[ix], py[ix] = x_in[ix] + sx_, y_in[ix] + sy_
+            degrees[des], nfit[des] = (gx, gy), int((np.isfinite(dx[ix]) & np.isfinite(ex[ix])).sum())
+    out.loc[out.index[sel], 'x'] = px
+    out.loc[out.index[sel], 'y'] = py
+    diag = pd.DataFrame([dict(designation=des, degree_x=degrees[des][0], degree_y=degrees[des][1], n_frames=nfit[des],
+                              offset_rms_x=float(np.sqrt(np.mean((px[ix] - x_in[ix]) ** 2))),
+                              offset_rms_y=float(np.sqrt(np.mean((py[ix] - y_in[ix]) ** 2)))) for des, ix in groups.items()],
+                        columns=cols)
+    return out, diag
 
 
 def _forced_psf_photometry_core(cube, ephemeris_df, sector, cam, ccd, ccd_x0, ccd_y0, prf_path, stamp_size):
@@ -606,9 +787,27 @@ def _detrend_robust_fit(flux, xfrac, yfrac):
     return _detrend_design(xfrac, yfrac) @ coeffs
 
 
+def add_flux_with_leak(df):
+    """The flux the light curves use (2026-11-15): flux + leak (forced_psf_photometry: the PSF fit to the data before
+    the background subtraction; leak taken as 0 where it was not computed) as 'flux_with_leak', and its significance
+    'sig_with_leak' = flux_with_leak / e_flux. Replaces detrend_pixel_phase's flux_detrended in the pipeline."""
+    out = df.copy()
+    leak = out["leak"].to_numpy(dtype=float) if "leak" in out.columns else np.zeros(len(out))
+    out["flux_with_leak"] = out["flux"].to_numpy(dtype=float) + np.nan_to_num(leak)
+    e = out["e_flux"].to_numpy(dtype=float)
+    out["sig_with_leak"] = np.where(e > 0, out["flux_with_leak"].to_numpy() / np.where(e > 0, e, 1), np.nan)
+    return out
+
+
 def detrend_pixel_phase(df, flux_col="flux", e_flux_col="e_flux"):
     """Per-track pixel-phase detrending: removes the modulation (not the
     mean level) of a 2nd-order polynomial fit of flux vs sub-pixel phase.
+    No longer applied by the pipeline (2026-11-15): with the resampled template
+    the phase-dependent flux error it was fitted for is gone, and on the new
+    fluxes it raised the light-curve scatter in 35 of 48 tracks across fields
+    (multifield_photometry_check.py) and took rotation signal where an
+    asteroid's slow-axis phase cycle is near a rotation harmonic ((554) Peraga:
+    a +-8 % term, its rotation curve altered by 25 %).
     Confirmed empirically on real TESS forced-PSF photometry that this is
     a real, non-negligible effect (~30% scatter reduction on a bright,
     otherwise-clean track) -- intra-pixel sensitivity variation that a
@@ -945,7 +1144,7 @@ def _stack_track(track, n_stack):
     for bin_index, start in enumerate(range(0, len(track), n_stack)):
         chunk = track.iloc[start:start + n_stack]
         w = 1.0 / chunk["e_flux"].values ** 2
-        flux = np.sum(chunk["flux_detrended"].values * w) / np.sum(w)
+        flux = np.sum(chunk["flux_with_leak"].values * w) / np.sum(w)
         e_flux = 1.0 / np.sqrt(np.sum(w))
         mjd_lo, mjd_hi = chunk["mjd"].min(), chunk["mjd"].max()
         rows.append(dict(mjd=chunk["mjd"].mean(), mjd_err=(mjd_hi - mjd_lo) / 2,
@@ -963,7 +1162,7 @@ def stack_summary(psf_df, sig_target=STACK_SIG_TARGET):
     if len(clean) == 0:
         return pd.DataFrame(columns=cols).set_index("designation")
     g = clean.groupby("designation", sort=True)
-    summary = pd.DataFrame({"avg_sig": g["sig_detrended"].mean(), "n_frames": g.size()})
+    summary = pd.DataFrame({"avg_sig": g["sig_with_leak"].mean(), "n_frames": g.size()})
     avg = summary["avg_sig"].to_numpy()
     summary["stacking_needed"] = ~(avg > sig_target)
     ok = np.isfinite(avg) & (avg > 0)
@@ -978,7 +1177,7 @@ def stack_summary(psf_df, sig_target=STACK_SIG_TARGET):
         per_row_n = rows["designation"].map(need).to_numpy()
         bins = pd.DataFrame({"designation": rows["designation"].to_numpy(), "bin": rank // per_row_n})
         w = 1.0 / rows["e_flux"].to_numpy(dtype=float) ** 2
-        bins["w"], bins["fw"] = w, rows["flux_detrended"].to_numpy(dtype=float) * w
+        bins["w"], bins["fw"] = w, rows["flux_with_leak"].to_numpy(dtype=float) * w
         sums = bins.groupby(["designation", "bin"], sort=False)[["w", "fw"]].sum(min_count=1)
         sig = (sums["fw"] / np.sqrt(sums["w"])).groupby(level=0).max()
         summary.loc[sig.index, "achieved_sig"] = sig
@@ -1000,7 +1199,7 @@ def stack_lightcurves(psf_df, sig_target=STACK_SIG_TARGET):
     summary_rows = []
     stacked_all = []
     for designation, track in clean.groupby("designation"):
-        avg_sig = track["sig_detrended"].mean()
+        avg_sig = track["sig_with_leak"].mean()
         if avg_sig > sig_target:
             summary_rows.append(dict(designation=designation, avg_sig=avg_sig,
                                       stacking_needed=False, n_stack=1,
@@ -1048,6 +1247,32 @@ MATCHED_FIT_SIG = 50.0
 OFFSET_PARALLEL_MIN_TRACKS = 100
 
 
+def _aligned_stamps(track, cube, half):
+    """Every in-cube frame's (2 half + 1)^2 stamp about the rounded predicted position, shifted by the
+    sub-pixel remainder onto it: ndimage.shift(stamp, (-dy, -dx), order=1, mode='nearest') for all rows at
+    once (bilinear, edge pixels extended), in the cube's dtype as before. One gather and one interpolation in
+    place of a Python loop of 1.3M ndimage.shift calls on a dense cut. Returns (n_stamps, 2 half + 1, 2 half + 1)."""
+    x, y, f = track['x'].to_numpy(float), track['y'].to_numpy(float), track['frame'].to_numpy(int)
+    xi, yi = np.round(x).astype(int), np.round(y).astype(int)      # = Python round(): half to even
+    ok = (xi - half >= 0) & (yi - half >= 0) & (xi + half + 1 <= cube.shape[2]) & (yi + half + 1 <= cube.shape[1])
+    x, y, f, xi, yi = x[ok], y[ok], f[ok], xi[ok], yi[ok]
+    n, size = len(f), 2 * half + 1
+    if n == 0:
+        return np.zeros((0, size, size), dtype=cube.dtype)
+    off = np.arange(-half, half + 1)
+    S = np.asarray(cube[f[:, None, None], (yi[:, None] + off)[:, :, None], (xi[:, None] + off)[:, None, :]], dtype=float)
+    idx = np.arange(size, dtype=float)
+    cy, cx = idx[None, :] + (y - yi)[:, None], idx[None, :] + (x - xi)[:, None]   # sample positions, per row
+    fy, fx = np.floor(cy), np.floor(cx)
+    wy, wx = cy - fy, cx - fx
+    y0, y1 = np.clip(fy, 0, size - 1).astype(int), np.clip(fy + 1, 0, size - 1).astype(int)
+    x0, x1 = np.clip(fx, 0, size - 1).astype(int), np.clip(fx + 1, 0, size - 1).astype(int)
+    r = np.arange(n)[:, None, None]
+    out = ((1 - wy)[:, :, None] * ((1 - wx)[:, None, :] * S[r, y0[:, :, None], x0[:, None, :]] + wx[:, None, :] * S[r, y0[:, :, None], x1[:, None, :]])
+           + wy[:, :, None] * ((1 - wx)[:, None, :] * S[r, y1[:, :, None], x0[:, None, :]] + wx[:, None, :] * S[r, y1[:, :, None], x1[:, None, :]]))
+    return out.astype(cube.dtype)
+
+
 def measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0, prf_path=None,
                                     half=STACK_CENTROID_STAMP_HALF, min_stamps=STACK_CENTROID_MIN_STAMPS,
                                     search_radius_px=2.0):
@@ -1092,19 +1317,10 @@ def measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0,
     from, so a caller can convert it to a magnitude (with a known
     zeropoint) for a direct sanity check against the ephemeris's own
     predicted mag_expected."""
-    from scipy.ndimage import shift as ndshift
     from .psf_flux_calibration import PRF_PATH_DEFAULT, _get_prf
     prf_path = prf_path or PRF_PATH_DEFAULT
 
-    stamps = []
-    for row in track.itertuples():
-        xi, yi = int(round(row.x)), int(round(row.y))
-        if xi - half < 0 or yi - half < 0 or xi + half + 1 > cube.shape[2] or yi + half + 1 > cube.shape[1]:
-            continue
-        stamp = cube[row.frame, yi - half:yi + half + 1, xi - half:xi + half + 1]
-        dx, dy = row.x - xi, row.y - yi
-        stamps.append(ndshift(stamp, (-dy, -dx), order=1, mode="nearest"))
-
+    stamps = _aligned_stamps(track, cube, half)
     if len(stamps) < min_stamps:
         return np.nan, np.nan, np.nan, np.nan, len(stamps)
 
@@ -1154,20 +1370,28 @@ def measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0,
                        f"falling back to flux-weighted centroid", RuntimeWarning)
         return cx0, cy0, sig0, flux0, len(stamps)
 
-    def _fit_at(dx, dy):
-        """Joint [template amplitude, flat background] linear fit at one candidate
-        offset. Returns (sse, flux, e_flux) -- e_flux/flux are None if the template
-        itself is degenerate at this offset (kept out of the search via inf sse)."""
+    def _lsq_at(dx, dy):
+        """Joint [template amplitude, flat background] linear fit at one candidate offset:
+        (sse, design, coefficients, residual), or (inf, None, None, None) if the template itself is
+        degenerate at this offset (kept out of the search via inf sse)."""
         template = prf.locate(half + dx, half + dy, (stamp_size, stamp_size))
         s = np.nansum(template)
         if not (np.isfinite(s) and s > 0):
-            return np.inf, None, None
+            return np.inf, None, None, None
         template = (template / s).ravel()[finite]
         A = np.column_stack([template, np.ones(finite.sum())])
         d = data[finite]
         coeffs, *_ = np.linalg.lstsq(A, d, rcond=None)
         resid = d - A @ coeffs
-        sse = float(np.sum(resid ** 2))
+        return float(np.sum(resid ** 2)), A, coeffs, resid
+
+    def _fit_at(dx, dy):
+        """_lsq_at with the fit's flux and its error. Returns (sse, flux, e_flux) -- e_flux/flux
+        are None if the template is degenerate at this offset. The search uses _lsq_at's sse alone (the
+        same values), so the medians and the inverse are only computed for the adopted offsets."""
+        sse, A, coeffs, resid = _lsq_at(dx, dy)
+        if A is None:
+            return np.inf, None, None
         sigma = 1.4826 * np.median(np.abs(resid - np.median(resid)))
         try:
             ATA_inv = np.linalg.inv(A.T @ A)
@@ -1183,7 +1407,7 @@ def measure_stack_centroid_offset(track, cube, sector, cam, ccd, ccd_x0, ccd_y0,
     # a genuine interior optimum. scipy's own bounds handling reflects/clips the simplex
     # properly instead.
     bounds = [(-search_radius_px, search_radius_px)] * 2
-    res = minimize(lambda off: _fit_at(*off)[0], x0=[cx0, cy0], method="Nelder-Mead",
+    res = minimize(lambda off: _lsq_at(*off)[0], x0=[cx0, cy0], method="Nelder-Mead",
                     bounds=bounds, options={"xatol": 0.01, "fatol": 1e-6})
 
     sse_fit, flux_fit, e_flux_fit = _fit_at(*res.x)

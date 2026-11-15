@@ -936,8 +936,8 @@ class DataProcessor():
         import pandas as pd
         from astropy.io import fits
         from astropy.wcs import WCS
-        from .asteroid_photometry import (forced_psf_photometry,
-                                            match_ephemeris_to_reduced_frames, detrend_pixel_phase,
+        from .asteroid_photometry import (forced_psf_photometry, add_flux_with_leak,
+                                            match_ephemeris_to_reduced_frames,
                                             local_gaia_cat_to_stars, flag_star_contamination,
                                             stack_summary, STACK_SIG_TARGET, pool_offset_from_stacks,
                                             track_offsets)
@@ -1026,26 +1026,31 @@ class DataProcessor():
             photometry_ephemeris['x'] += photometry_ephemeris['designation'].map(per_track['offset_x']).to_numpy()
             photometry_ephemeris['y'] += photometry_ephemeris['designation'].map(per_track['offset_y']).to_numpy()
 
-            # Step 2: forced photometry, exactly once, at the position from step 1.
-            # Aperture photometry is currently disabled -- not part of the pipeline for now
-            # (forced_aperture_photometry itself is untouched in asteroid_photometry.py, just
-            # not called here).
-            # the background model reduce() subtracted: the per-frame light it absorbed from each asteroid is measured
-            # alongside the flux ('leak' column; forced_psf_photometry). Memory-mapped: only the stamps are read.
-            bkg_path = f'{cutFolder}/{base}_Background.npy'
-            background = np.load(bkg_path, mmap_mode='r') if os.path.exists(bkg_path) else None
             # the template is the PRF averaged along each asteroid's motion over the exposure (the frame spacing)
             exptime_s = float(np.nanmedian(np.diff(reduced_mjd))) * 86400.0
             # and resampled as reduce() resampled each frame onto the reference grid (forced_psf_photometry 'shifts')
             shifts_path = f'{cutFolder}/{base}_Shifts.npy'
             shifts = np.load(shifts_path) if os.path.exists(shifts_path) else None
+            # (asteroid_photometry.smooth_track_positions -- a smooth offset along a track in place of the constant one --
+            # is not used: across 48 tracks it left the light-curve scatter unchanged (median ratio 1.000) and cost 84 s of
+            # a dense cut's 231 s, 2026-11-15)
+
+            # Step 2: forced photometry, exactly once, at the position from step 1.
+            # Aperture photometry is currently disabled -- not part of the pipeline for now
+            # (forced_aperture_photometry itself is untouched in asteroid_photometry.py, just
+            # not called here).
+            # the background model reduce() subtracted: the PSF fit to it is the 'leak' column, and flux + leak the fit
+            # to the data before the subtraction (forced_psf_photometry). Memory-mapped: only the stamps are read.
+            bkg_path = f'{cutFolder}/{base}_Background.npy'
+            background = np.load(bkg_path, mmap_mode='r') if os.path.exists(bkg_path) else None
             psf_df = forced_psf_photometry(cube, photometry_ephemeris, self.sector, cam, ccd,
                                              cut_corner[0], cut_corner[1], background=background, exptime_s=exptime_s,
                                              shifts=shifts)
-            psf_df = detrend_pixel_phase(psf_df)
+            # the light curves use flux + leak; the sub-pixel phase detrend is no longer applied (detrend_pixel_phase)
+            psf_df = add_flux_with_leak(psf_df)
 
             # Step 3: contamination flags, on the one photometry result actually being saved
-            psf_df = flag_star_contamination(psf_df, stars, flux_col='flux_detrended')
+            psf_df = flag_star_contamination(psf_df, stars, flux_col='flux_with_leak')
             stack_summary_df = stack_summary(psf_df)
 
             # staged for the sector's designation-sorted store (asteroid_store.merge_sector), not

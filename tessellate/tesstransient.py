@@ -21,7 +21,7 @@ from astropy.coordinates import SkyCoord
 import astropy.units as u
 
 from .tessellate import Tessellate
-from .dataprocessor import DataProcessor
+from .dataprocessor import DataProcessor, find_good_wcs
 from .navigator import Navigator
 
 from shapely.geometry.polygon import Polygon
@@ -98,18 +98,9 @@ class TessTransient():
 
     def _get_wcs(self,cam,ccd):
 
-        data_path = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}'
-
-        if not os.path.exists(f'{data_path}/wcs/ref/corrected.fits'):
-            if len(glob(f'{data_path}/image_files/*ffic.fits')) == 0:
-                data_processor = DataProcessor(sector=self.sector,data_path=self.data_path,verbose=0)
-                data_processor.download(cam=cam,ccd=ccd,number=1)
-
-            file = glob(f'{data_path}/image_files/*ffic.fits')[0]
-            wcsItem = WCS(fits.open(file)[1].header)
-
-        else:
-            wcsItem = WCS(fits.open(f'{data_path}/wcs/ref/corrected.fits')[1].header)
+        wcsItem = find_good_wcs(self.sector,self.data_path,cam,ccd,verbose=self.verbose)
+        if wcsItem is None:
+            raise ValueError(f'No FFI with a good WCS for Sector {self.sector} Cam {cam} CCD {ccd}')
 
         return wcsItem
 

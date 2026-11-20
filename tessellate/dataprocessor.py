@@ -37,6 +37,79 @@ from .tools import _Save_space, _Remove_emptys, _Extract_fits, _Print_buff, save
 
 #     return wcsItem
 
+def _wcs_ok(wcsItem):
+    """True if a WCS looks like a real TESS CCD solution: celestial, finite across the chip,
+    ~21"/px at the centre, and pixel -> sky -> pixel round trips at the corners."""
+    try:
+        if not wcsItem.has_celestial:
+            return False
+        px = np.array([[1068,1024],[1069,1024],[44,0],[2091,0],[44,2047],[2091,2047]],dtype=float)
+        sky = wcsItem.all_pix2world(px,0)
+        if not np.all(np.isfinite(sky)):
+            return False
+        ra, dec = np.radians(sky[:2,0]), np.radians(sky[:2,1])
+        cos_sep = np.sin(dec[0])*np.sin(dec[1]) + np.cos(dec[0])*np.cos(dec[1])*np.cos(ra[0]-ra[1])
+        scale = np.degrees(np.arccos(np.clip(cos_sep,-1,1)))*3600
+        if not 15 < scale < 30:
+            return False
+        back = wcsItem.all_world2pix(sky[2:],0)
+        return bool(np.all(np.isfinite(back)) and np.max(np.abs(back - px[2:])) < 1)
+    except Exception:
+        return False
+
+def find_good_wcs(sector,data_path,cam,ccd,max_downloads=10,verbose=0):
+    """
+    WCS for a cam/ccd that passes _wcs_ok: the corrected reference if there is one, else the
+    already-downloaded FFIs, else single FFIs downloaded spread through the sector (up to
+    max_downloads). Returns None if none works.
+    """
+
+    from glob import glob
+    from astropy.io import fits
+    from astropy.wcs import WCS
+
+    path = f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}'
+
+    def read(file):
+        try:
+            with fits.open(file) as hdul:
+                w = WCS(hdul[1].header)
+            return w if _wcs_ok(w) else None
+        except Exception:
+            return None
+
+    if os.path.exists(f'{path}/wcs/ref/corrected.fits'):
+        w = read(f'{path}/wcs/ref/corrected.fits')
+        if w is not None:
+            return w
+
+    tried = set()
+    for file in sorted(glob(f'{path}/image_files/*ffic.fits')):
+        tried.add(file)
+        w = read(file)
+        if w is not None:
+            return w
+        if verbose > 0:
+            print(f'Bad WCS in {os.path.basename(file)}, trying another FFI')
+
+    data_processor = DataProcessor(sector=sector,data_path=data_path,verbose=0)
+    for ind in range(0,max_downloads*100,100):     # every 100th FFI, so one bad stretch isn't hit repeatedly
+        try:
+            data_processor.download(cam=cam,ccd=ccd,number=None,single=ind)
+        except IndexError:      # past the end of the sector
+            break
+        for file in sorted(set(glob(f'{path}/image_files/*ffic.fits')) - tried):
+            tried.add(file)
+            w = read(file)
+            if w is not None:
+                return w
+            if verbose > 0:
+                print(f'Bad WCS in {os.path.basename(file)}, trying another FFI')
+
+    if verbose > 0:
+        print(f'No FFI with a good WCS found for Sector {sector} Cam {cam} CCD {ccd}')
+    return None
+
 CUT_MARGIN_PX = 5      # rows kept beyond each cut's pixel square, for position offsets at its edge
 _CUT_WRITE = None      # (processor, CCD ephemeris, per-cut jobs), reaching forked workers without pickling
 
@@ -243,16 +316,7 @@ class DataProcessor():
 
         # wcsItem = WCS(fits.open(f'{newpath}/wcs/ref/corrected.fits')[1].header)
 
-        if not os.path.exists(f'{newpath}/wcs/ref/corrected.fits'):
-            if len(glob(f'{newpath}/image_files/*ffic.fits')) == 0:
-                data_processor = DataProcessor(sector=self.sector,data_path=self.data_path,verbose=0)
-                data_processor.download(cam=cam,ccd=ccd,number=1)
-
-            file = glob(f'{newpath}/image_files/*ffic.fits')[0]
-            wcsItem = WCS(fits.open(file)[1].header)
-
-        else:
-            wcsItem = WCS(fits.open(f'{newpath}/wcs/ref/corrected.fits')[1].header)
+        wcsItem = find_good_wcs(self.sector,self.data_path,cam,ccd,verbose=verbose)
 
         # wcsItem = _get_wcs(f'{newpath}/image_files',f'{newpath}/sector{self.sector}_cam{cam}_ccd{ccd}_wcs.fits') 
         # if not os.path.exists(f'{newpath}/sector{self.sector}_cam{cam}_ccd{ccd}_wcs.fits'):

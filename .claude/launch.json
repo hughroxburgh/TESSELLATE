@@ -20,6 +20,26 @@
       "name": "g2e-site",
       "url": "http://localhost:8772",
       "port": 8772
+    },
+    {
+      "name": "silver-port",
+      "url": "http://localhost:8774",
+      "port": 8774
+    },
+    {
+      "name": "flare-site-v5",
+      "url": "http://localhost:8776",
+      "port": 8776
+    },
+    {
+      "name": "period-test-site",
+      "url": "http://localhost:8778",
+      "port": 8778
+    },
+    {
+      "name": "tss-sites",
+      "url": "http://localhost:8790",
+      "port": 8790
     }
   ]
 }

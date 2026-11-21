@@ -55,7 +55,7 @@ class Tessellate():
                  download=None,make_cube=None,fix_wcs=None,make_cuts=None,predict_asteroids=None,
                  reduce=None,asteroid_lightcurves=None,calibrate=None,search=None,plot=None,delete=None,
                  injection=False,overwrite=None,reset_logs=None,use_suggestions=False,
-                 go=True):
+                 direct_cuts=False,go=True):
         
         """
         Initialise.
@@ -98,6 +98,9 @@ class Tessellate():
             if True, make cube
         make_cuts : bool
             if True, make cuts
+        direct_cuts : bool
+            if True, the make_cube job writes every cut TPF straight from the FFIs (DataProcessor.make_direct_cuts)
+            instead of building a cube, and make_cuts only builds the catalogues. Needs make_cuts as well.
         predict_asteroids : bool
             if True, predict catalogued asteroids crossing each cut's footprint
         reduce : bool
@@ -217,6 +220,7 @@ class Tessellate():
 
         self.ask_config = ask_config
         self.skip = []
+        self.direct_cuts = direct_cuts
 
         # -- Allows for no actual initialisation (TessTransient) -- #
         if go:
@@ -302,6 +306,10 @@ class Tessellate():
         # -- Reset Job Logs -- #
         if reset_logs != False:
             self._reset_logs(make_cube,make_cuts,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot)
+
+        if self.direct_cuts and make_cube and not make_cuts:
+            e = 'direct_cuts makes the cuts in the make_cube job: run make_cuts too (it sets n/cuts and builds the catalogues)\n'
+            raise ValueError(e)
 
         # -- Run Processes -- #
         if download:
@@ -766,6 +774,18 @@ class Tessellate():
             plot_time_sug = '10:00'
             plot_cpu_sug = '32'
             plot_mem_req = 50
+
+        if self.direct_cuts:
+            # one pass over the FFIs, a few FFIs in memory per worker; disk-bound, so the time is a guess --
+            # not yet benchmarked on OzSTAR (local SSD: ~0.1 s CPU per FFI for 64 cuts + frame stats)
+            cube_mem_sug = '4G'
+            cube_mem_req = 32
+            if self.sector in primary_mission:
+                cube_time_sug = '1:00:00'
+            elif self.sector in secondary_mission:
+                cube_time_sug = '2:00:00'
+            else:
+                cube_time_sug = '4:00:00'
 
         suggestions = [[cube_time_sug,cube_mem_sug,cube_mem_req],
                        [cut_time_sug,cut_mem_sug,cut_mem_req],
@@ -2186,13 +2206,19 @@ class Tessellate():
             if time is None:
                 time = self.cube_time
 
+            if self.direct_cuts:
+                make_call = (f'processor.make_direct_cuts(cam={cam},ccd={ccd},n={self.n},'
+                             f'cuts={[int(c) for c in self.cuts]},part={self.part})')
+            else:
+                make_call = f'processor.make_cube(cam={cam},ccd={ccd},part={self.part})'
+
             # -- Create python file for cubing-- #
             print(f'Creating Cubing Python File for Sector{self.sector} Cam{cam}Ccd{ccd}')
             python_text = f"\
 from tessellate import DataProcessor\n\
 \n\
 processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=2)\n\
-processor.make_cube(cam={cam},ccd={ccd},part={self.part})\n\
+{make_call}\n\
 with open(f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/cubed.txt', 'w') as file:\n\
     file.write('Cubed!')"
 
@@ -2239,6 +2265,9 @@ export PYTHONUNBUFFERED=1\n\
 
         if overwrite & (self.overwrite is not None):
             if (self.overwrite == 'all') | ('cube' in self.overwrite):
+                delete_files('cubes',self.data_path,self.sector,self.n,self.cam,self.ccd,part=self.part)
+            if self.direct_cuts and ((self.overwrite == 'all') | ('cut' in self.overwrite)):
+                delete_files('cuts',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts,part=self.part)
                 delete_files('cubes',self.data_path,self.sector,self.n,self.cam,self.ccd,part=self.part)
 
         for cam in self.cam:
@@ -2490,7 +2519,7 @@ export PYTHONUNBUFFERED=1\n\
         # # -- Delete old scripts -- #
         # os.system(f'rm -f {self.working_path}/cutting_scripts/S{self.sector}C*')
 
-        if overwrite & (self.overwrite is not None):
+        if overwrite & (self.overwrite is not None) & (not self.direct_cuts):   # direct cuts: deleted in make_cube
             if (self.overwrite == 'all') | ('cut' in self.overwrite):
                 delete_files('cuts',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts,part=self.part)
 
@@ -2516,6 +2545,10 @@ export PYTHONUNBUFFERED=1\n\
                             print('\n')
                         else:
                             go = True
+                    if go and self.direct_cuts:
+                        e = (f'Cam {cam} CCD {ccd} cut {cut} missing after direct cutting -- check the cubing job log, '
+                             'then rerun make_cube\n')
+                        raise ValueError(e)
                     if go:
                         # -- Create python file for cubing, cutting, reducing a cut-- # 
                         print(f'Creating Cutting Python File for Sector{self.sector} Cam{cam} Ccd{ccd} Cut{cut}')

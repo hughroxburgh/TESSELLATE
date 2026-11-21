@@ -72,11 +72,24 @@ class TessFixer():
         """
         Reference frame candidates for a CCD, best first, as (full index, index among quality-good frames).
         Medians of the n_cuts x n_cuts blocks of every frame are ranked by rank_reference_frames.
+        cube_path may instead be the frame-stats file (.npz) written by DataProcessor.make_direct_cuts, which
+        holds those medians already -- no cube needed.
         """
 
         if not os.path.exists(cube_path):
             e = 'No cube file exists!'
             raise NameError(e)
+
+        if cube_path.endswith('.npz'):
+            stats = np.load(cube_path)
+            if int(stats['blocks']) != n_cuts:
+                raise ValueError(f'{cube_path} has {int(stats["blocks"])}x{int(stats["blocks"])} block medians, '
+                                 f'not {n_cuts}x{n_cuts}')
+            dquality = np.asarray(stats['dquality'], int)
+            quality_mask = (dquality & HARD_BITMASK) == 0
+            yield from rank_reference_frames(stats['medians'], quality_mask,
+                                             not_reference=(dquality & NOT_REFERENCE_BITS) != 0)
+            return
 
         # -- Open data, and find notably bad frames -- #
         hdu = fits.open(cube_path)
@@ -162,7 +175,7 @@ class TessFixer():
         out = f'{save_folder}/corrected.fits'
         if not os.path.exists(save_folder): 
             os.mkdir(save_folder) 
-            shutil.move(image_path, out)
+            shutil.copy(image_path, out)   # copy, not move: image_files stays complete, so frame indices hold
             shutil.copy(out, out.replace('corrected.fits', 'old.fits'))
             if ref:
                 with open(f'{save_folder}/reference.txt', 'w') as file: 
@@ -195,7 +208,10 @@ class TessFixer():
                 # -- Best candidate whose FFI has a celestial WCS. The next candidate is the next-best quiet,
                 # -- quality-good frame (never just the next frame in time, which may be flagged or blank), and
                 # -- both indices come from the candidate itself, so GoodIdx can't drift.
-                cube_path = f'{ccd_folder}/sector{self.sector}_cam{cam}_ccd{ccd}_cube.fits'
+                # -- frame stats from direct cutting if there are any, else the cube -- #
+                cube_path = f'{ccd_folder}/sector{self.sector}_cam{cam}_ccd{ccd}_frame_stats.npz'
+                if not os.path.exists(cube_path):
+                    cube_path = f'{ccd_folder}/sector{self.sector}_cam{cam}_ccd{ccd}_cube.fits'
                 for ref_idx_full, ref_idx_good in self.reference_candidates(cube_path):
                     if not os.path.exists(f'{ccd_folder}/image_files/'):
                         data_processor.download(cam=cam,ccd=ccd,single=ref_idx_full,number=None)

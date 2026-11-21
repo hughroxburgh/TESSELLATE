@@ -227,6 +227,182 @@ def _parallel_cuts(sector,cam,ccd,cut,n,cube_path,file_path,coords,size,verbose)
             print(f'Cam {cam} CCD {ccd} cut {cut} complete.')
             print('\n')
 
+# ---------------------------------------------------------------------------
+# Direct cuts: TPFs written straight from the FFIs, no cube
+# ---------------------------------------------------------------------------
+
+FRAME_STAT_BLOCKS = 8   # TessFixer ranks reference frames on the medians of an 8x8 grid of 256 px blocks
+
+
+def _ffi_time(file):
+    """Start time (days) from an FFI's tess{YYYYDDDHHMMSS} file name -- for ordering and the part split only."""
+    import re
+    import datetime
+    stamp = re.search(r'tess(\d{13})', os.path.basename(file)).group(1)
+    date = datetime.datetime.strptime(stamp, '%Y%j%H%M%S')
+    return (date - datetime.datetime(2000, 1, 1)).total_seconds() / 86400
+
+
+def _frame_stats_path(ccd_folder, sector, cam, ccd):
+    return f'{ccd_folder}/sector{sector}_cam{cam}_ccd{ccd}_frame_stats.npz'
+
+
+def _tpf_row_dtype(size, name_len):
+    """One cadence of a direct-cut TPF, big-endian as FITS stores it. FLUX is column 5, as in SPOC/astrocut TPFs,
+    because lightkurve reads the cut's WCS from the column-5 keywords (1CTYP5, 1CRPX5, ...)."""
+    return np.dtype([('TIME', '>f8'), ('TIMECORR', '>f4'), ('CADENCENO', '>i4'), ('QUALITY', '>i4'),
+                     ('FLUX', '>f4', (size, size)), ('FLUX_ERR', '>f4', (size, size)),
+                     ('POS_CORR1', '>f4'), ('POS_CORR2', '>f4'), ('FFI_FILE', f'S{name_len}')])
+
+
+def _tpf_columns(size, name_len):
+    from astropy.io import fits
+    dim = f'({size},{size})'
+    return [fits.Column('TIME', 'D', unit='BJD - 2457000, days'),
+            fits.Column('TIMECORR', 'E', unit='d'),
+            fits.Column('CADENCENO', 'J'),
+            fits.Column('QUALITY', 'J'),
+            fits.Column('FLUX', f'{size*size}E', dim=dim, unit='e-/s'),
+            fits.Column('FLUX_ERR', f'{size*size}E', dim=dim, unit='e-/s'),
+            fits.Column('POS_CORR1', 'E', unit='pixel'),
+            fits.Column('POS_CORR2', 'E', unit='pixel'),
+            fits.Column('FFI_FILE', f'{name_len}A')]
+
+
+def _cut_linear_wcs(wcsItem, x0, y0, size):
+    """Linear TAN WCS fitted to the full (SIP) WCS across one cut, as PC/CDELT for the TPF's column-5 keywords."""
+    from astropy.coordinates import SkyCoord
+    from astropy.wcs.utils import fit_wcs_from_points
+    g = np.linspace(0, size - 1, 12)
+    xx, yy = [a.ravel() for a in np.meshgrid(g, g)]
+    ra, dec = wcsItem.all_pix2world(xx + x0, yy + y0, 0)
+    fit = fit_wcs_from_points((xx, yy), SkyCoord(ra, dec, unit='deg'), projection='TAN')
+    cd = fit.wcs.cd if fit.wcs.has_cd() else fit.wcs.get_pc() * fit.wcs.cdelt[:, None]
+    cdelt = np.hypot(cd[:, 0], cd[:, 1])
+    return fit.wcs.crpix, fit.wcs.crval, cdelt, cd / cdelt[:, None]
+
+
+def _create_direct_tpf(path, ffi_hdrs, wcsItem, x0, y0, size, nrows, name_len, sector, cam, ccd, cut, n):
+    """
+    Write a cut TPF's headers and APERTURE extension around an empty (sparse) PIXELS table of nrows cadences,
+    for workers to fill row by row. Returns the byte offset of the table's first row.
+    """
+    from astropy.io import fits
+
+    first0, first1, last1 = ffi_hdrs
+    centre_ra, centre_dec = wcsItem.all_pix2world(x0 + size / 2, y0 + size / 2, 0)
+
+    prim = fits.PrimaryHDU()
+    skip = {'SIMPLE', 'BITPIX', 'NAXIS', 'EXTEND', 'NEXTEND', 'EXTNAME', 'EXTVER', 'CHECKSUM', 'DATASUM'}
+    for card in first0.cards:
+        if card.keyword not in skip and card.keyword:
+            prim.header.append(card)
+    prim.header['EXTEND'] = True
+    prim.header['ORIGIN'] = 'STScI/MAST'     # as astrocut writes: what lightkurve recognises a TESScut-style TPF by
+    prim.header['CREATOR'] = 'TESSELLATE direct cutter'
+    prim.header['TSTART'] = first1['TSTART']
+    prim.header['TSTOP'] = last1['TSTOP']
+    prim.header['DATE-OBS'] = first1.get('DATE-OBS', '')
+    prim.header['DATE-END'] = last1.get('DATE-END', '')
+    prim.header['OBJECT'] = f'sector{sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
+    prim.header['SECTOR'] = sector
+    prim.header['CAMERA'] = cam
+    prim.header['CCD'] = ccd
+    prim.header['RA_OBJ'] = (float(centre_ra), '[deg] right ascension of cut centre')
+    prim.header['DEC_OBJ'] = (float(centre_dec), '[deg] declination of cut centre')
+
+    table = fits.BinTableHDU.from_columns(_tpf_columns(size, name_len), nrows=0, name='PIXELS')
+    th = table.header
+    th['NAXIS2'] = nrows
+    for key in ['TIMEREF', 'TIMESYS', 'BJDREFI', 'BJDREFF', 'TIMEUNIT', 'TIMEPIXR', 'TIERRELA', 'INT_TIME',
+                'FRAMETIM', 'NUM_FRM', 'TIMEDEL', 'BACKAPP', 'DEADAPP', 'VIGNAPP', 'GAINA', 'GAINB', 'GAINC',
+                'GAIND', 'READNOIA', 'READNOIB', 'READNOIC', 'READNOID', 'NREADOUT']:
+        if key in first1:
+            th[key] = first1[key]
+    th['TSTART'] = first1['TSTART']
+    th['TSTOP'] = last1['TSTOP']
+    th['TELAPSE'] = last1['TSTOP'] - first1['TSTART']
+    th['DATE-OBS'] = first1.get('DATE-OBS', '')
+    th['DATE-END'] = last1.get('DATE-END', '')
+    crpix, crval, cdelt, pc = _cut_linear_wcs(wcsItem, x0, y0, size)
+    for col in (5, 6):
+        th[f'1CTYP{col}'] = 'RA---TAN'
+        th[f'2CTYP{col}'] = 'DEC--TAN'
+        th[f'1CRPX{col}'], th[f'2CRPX{col}'] = crpix
+        th[f'1CRVL{col}'], th[f'2CRVL{col}'] = crval
+        th[f'1CUNI{col}'] = th[f'2CUNI{col}'] = 'deg'
+        th[f'1CDLT{col}'], th[f'2CDLT{col}'] = cdelt
+        th[f'11PC{col}'], th[f'12PC{col}'] = pc[0]
+        th[f'21PC{col}'], th[f'22PC{col}'] = pc[1]
+        th[f'1CRV{col}P'], th[f'2CRV{col}P'] = x0, y0      # lightkurve's tpf.column / tpf.row: the cut's corner
+    th['1CRV4P'], th['2CRV4P'] = x0, y0
+
+    row_bytes = _tpf_row_dtype(size, name_len).itemsize
+    if th['NAXIS1'] != row_bytes:
+        raise RuntimeError(f'TPF row layout mismatch: header {th["NAXIS1"]} bytes, dtype {row_bytes}')
+
+    aperture = fits.ImageHDU(np.ones((size, size), np.int32),
+                             header=wcsItem[y0:y0+size, x0:x0+size].to_header(relax=True), name='APERTURE')
+
+    head = prim.header.tostring().encode() + th.tostring().encode()
+    data_len = nrows * row_bytes
+    ap_data = aperture.data.astype('>i4').tobytes()
+    with open(path, 'wb') as f:
+        f.write(head)
+        f.seek(len(head) + data_len)
+        f.write(b'\0' * ((-data_len) % 2880))
+        f.write(aperture.header.tostring().encode())
+        f.write(ap_data)
+        f.write(b'\0' * ((-len(ap_data)) % 2880))
+    return len(head)
+
+
+def _direct_cut_chunk(files, frames, rows, parts, targets, corners, size, name_len):
+    """
+    Read a run of FFIs once each and write their cut images as rows of the target TPFs (os.pwrite at fixed
+    offsets, so workers never touch the same bytes). targets[part] = [(path, data_start), ...] matching corners.
+    Returns each frame's block medians and header times/quality, for the frame-stats file.
+    """
+    from astropy.io import fits
+
+    row_dtype = _tpf_row_dtype(size, name_len)
+    rec = np.zeros(1, dtype=row_dtype)
+    fds = {}
+    block = 2048 // FRAME_STAT_BLOCKS
+    out = dict(frames=np.asarray(frames), medians=np.full((len(files), FRAME_STAT_BLOCKS**2), np.nan, np.float32),
+               dquality=np.zeros(len(files), np.int32), tstart=np.zeros(len(files)), tstop=np.zeros(len(files)))
+    try:
+        for p, target in enumerate(targets):
+            for k, (path, _) in enumerate(target):
+                fds[(p, k)] = os.open(path, os.O_WRONLY)
+        for i, (file, frame, row, p) in enumerate(zip(files, frames, rows, parts)):
+            try:
+                with fits.open(file, memmap=False) as h:
+                    hdr = h[1].header
+                    cadence = h[0].header.get('FFIINDEX', frame)
+                    flux = h[1].data.astype(np.float32)
+                    err = h[2].data.astype(np.float32)
+            except Exception as e:
+                raise RuntimeError(f'Could not read FFI {file}: {e}') from e
+            rec['TIME'] = 0.5 * (hdr['TSTART'] + hdr['TSTOP'])
+            rec['TIMECORR'] = hdr.get('BARYCORR', 0.0)
+            rec['CADENCENO'] = cadence
+            rec['QUALITY'] = hdr.get('DQUALITY', 0)
+            rec['FFI_FILE'] = os.path.basename(file)
+            for k, (x0, y0) in enumerate(corners):
+                rec['FLUX'][0] = flux[y0:y0+size, x0:x0+size]
+                rec['FLUX_ERR'][0] = err[y0:y0+size, x0:x0+size]
+                os.pwrite(fds[(p, k)], rec.tobytes(), targets[p][k][1] + row * row_dtype.itemsize)
+            # -- same blocks and order as TessFixer.reference_candidates -- #
+            out['medians'][i] = [np.nanmedian(flux[block*a:block*(a+1), 44+block*b:44+block*(b+1)])
+                                 for a in range(FRAME_STAT_BLOCKS) for b in range(FRAME_STAT_BLOCKS)]
+            out['dquality'][i] = hdr.get('DQUALITY', 0)
+            out['tstart'][i], out['tstop'][i] = hdr['TSTART'], hdr['TSTOP']
+    finally:
+        for fd in fds.values():
+            os.close(fd)
+    return out
+
 class DataProcessor():
 
     def __init__(self,sector,verbose=1,data_path=None) -> None:
@@ -597,6 +773,160 @@ class DataProcessor():
             if self.verbose > 0:
                 print(f'Cam {cam} CCD {ccd} cut {cut} complete.')
                 print('\n')
+
+    def make_direct_cuts(self,cam,ccd,n,cuts=None,part=False,n_workers=None,chunk=32):
+        """
+        Make cut TPFs for this CCD straight from its FFIs, replacing make_cube + make_cuts.
+
+        Each FFI is read once and its cuts written as one row of each cut's TPF, so memory stays at a few FFIs
+        per worker and no cube is ever written. Also saves the per-frame block medians and quality flags
+        (sector*_frame_stats.npz) that TessFixer ranks reference frames on, so fix_wcs doesn't need a cube.
+
+        ------
+        Inputs
+        ------
+        cam : int
+            desired camera
+        ccd : int
+            desired ccd
+        n : int
+            n**2 cuts on the CCD
+
+        -------
+        Options
+        -------
+        cuts : list of int
+            cut numbers to write (default all n**2). Cuts whose cut.txt already exists are skipped.
+        part : bool
+            if True, split at the largest time gap into Part1/Part2 TPFs (as _make_part_cube)
+        n_workers : int
+            parallel workers (default: the CPUs this job may use)
+        chunk : int
+            FFIs per parallel task
+
+        -------
+        Creates
+        -------
+        [Part{i}/]Cut{cut}of{n**2}/sector*_cut*.fits and cut.txt for each cut; sector*_frame_stats.npz.
+
+        """
+
+        import shutil
+        from glob import glob
+        from astropy.io import fits
+        from joblib import Parallel, delayed
+        from tqdm import tqdm
+        from .asteroid_prediction import _available_cpus
+
+        broad_path = f'{self.path}/Cam{cam}/Ccd{ccd}'
+        file_path = f'{broad_path}/image_files'
+
+        input_files = glob(f'{file_path}/*ffic.fits')
+        if len(input_files) < 1:
+            print('No files to cut!')
+            return
+        deleted = _Remove_emptys(input_files)  # remove empty downloaded fits files
+        if self.verbose > 1:
+            print(f'Deleted {deleted} corrupted file/s.')
+
+        # -- sorted by name = by time: the frame order TessFixer's reference index refers to -- #
+        files = sorted(glob(f'{file_path}/*ffic.fits'))
+        if len(files) < 1:
+            print('No files to cut!')
+            return
+        times = np.array([_ffi_time(f) for f in files])
+        if np.any(np.diff(times) <= 0):
+            raise ValueError(f'FFI file names in {file_path} are not in strictly increasing time order')
+        n_frames = len(files)
+
+        # -- Parts: split after the largest gap -- #
+        if part:
+            split = int(np.argmax(np.diff(times))) + 1
+            part_of = (np.arange(n_frames) >= split).astype(int)
+            part_dirs = [f'{broad_path}/Part1', f'{broad_path}/Part2']
+            part_starts = [0, split]
+        else:
+            part_of = np.zeros(n_frames, int)
+            part_dirs = [broad_path]
+            part_starts = [0]
+        row_of = np.arange(n_frames) - np.array(part_starts)[part_of]
+        part_rows = np.bincount(part_of, minlength=len(part_dirs))
+
+        # -- Cut geometry, as make_cuts -- #
+        cutCorners, _, _, cutSize = self.find_cuts(cam=cam,ccd=ccd,n=n,plot=False,verbose=0)
+        wcsItem = find_good_wcs(self.sector,self.data_path,cam,ccd)
+        size = int(2 * cutSize)
+        cuts = list(range(1, n**2 + 1)) if cuts is None else [int(c) for c in cuts]
+        todo = [c for c in cuts
+                if not all(os.path.exists(f'{d}/Cut{c}of{n**2}/cut.txt') for d in part_dirs)]
+        stats_path = _frame_stats_path(broad_path, self.sector, cam, ccd)
+        if not todo and os.path.exists(stats_path):
+            print(f'Cam {cam} CCD {ccd} cuts {cuts} already made!')
+            return
+        corners = [tuple(int(v) for v in cutCorners[c-1]) for c in todo]
+
+        name_len = max(len(os.path.basename(f)) for f in files)
+        row_bytes = _tpf_row_dtype(size, name_len).itemsize
+        need = len(todo) * n_frames * row_bytes
+        free = shutil.disk_usage(broad_path).free
+        if self.verbose > 0:
+            print(_Print_buff(50,f'Direct Cutting Sector {self.sector} Cam {cam} CCD {ccd}'))
+            print(f'{n_frames} FFIs -> {len(todo)} cuts of {size}x{size} px'
+                  + (f' in 2 parts ({part_rows[0]} + {part_rows[1]} frames)' if part else '')
+                  + f', {need/1e9:.1f} GB to write ({free/1e9:.0f} GB free)')
+        if need > free:
+            raise OSError(f'Not enough disk for the cuts: need {need/1e9:.1f} GB, {free/1e9:.1f} GB free')
+
+        # -- Headers + empty tables, for the workers to fill row by row -- #
+        with fits.open(files[0]) as h:
+            first0 = h[0].header.copy()
+        ffi_hdrs = []
+        for p in range(len(part_dirs)):
+            ffi_hdrs.append((first0, fits.getheader(files[part_starts[p]], 1),
+                             fits.getheader(files[part_starts[p] + part_rows[p] - 1], 1)))
+        targets = []
+        for p, d in enumerate(part_dirs):
+            target = []
+            for c, (x0, y0) in zip(todo, corners):
+                folder = f'{d}/Cut{c}of{n**2}'
+                _Save_space(folder)
+                path = f'{folder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{c}_of{n**2}.fits'
+                start = _create_direct_tpf(path, ffi_hdrs[p], wcsItem, x0, y0, size, int(part_rows[p]), name_len,
+                                           self.sector, cam, ccd, c, n)
+                target.append((path, start))
+            targets.append(target)
+
+        # -- One pass over the FFIs -- #
+        n_workers = _available_cpus() if n_workers is None else n_workers
+        tasks = [np.arange(s, min(s + chunk, n_frames)) for s in range(0, n_frames, chunk)]
+        medians = np.full((n_frames, FRAME_STAT_BLOCKS**2), np.nan, np.float32)
+        dquality = np.zeros(n_frames, np.int32)
+        tstart = np.zeros(n_frames)
+        tstop = np.zeros(n_frames)
+        done = np.zeros(n_frames, bool)
+        ts = t()
+        results = Parallel(n_jobs=n_workers, return_as='generator')(
+            delayed(_direct_cut_chunk)([files[i] for i in idx], idx, row_of[idx], part_of[idx],
+                                       targets, corners, size, name_len) for idx in tasks)
+        with tqdm(total=n_frames, desc=f'Cam {cam} CCD {ccd} FFIs', unit='ffi', disable=self.verbose < 1) as bar:
+            for res in results:
+                f = res['frames']
+                medians[f], dquality[f], tstart[f], tstop[f] = res['medians'], res['dquality'], res['tstart'], res['tstop']
+                done[f] = True
+                bar.update(len(f))
+        if not done.all():
+            raise RuntimeError(f'{(~done).sum()} FFIs were not cut')
+
+        np.savez(stats_path, medians=medians, dquality=dquality, tstart=tstart, tstop=tstop,
+                 files=np.array([os.path.basename(f) for f in files]), blocks=FRAME_STAT_BLOCKS)
+        for d in part_dirs:
+            for c in todo:
+                with open(f'{d}/Cut{c}of{n**2}/cut.txt', 'w') as file:
+                    file.write('Cut!')
+
+        if self.verbose > 0:
+            print(f'Cam {cam} CCD {ccd} direct cuts complete ({(t()-ts)/60:.1f} min, {n_workers} workers).')
+            print('\n')
 
     def predict_asteroids(self,cam,ccd,n,cut,part=False,plot_trails=False):
         """

@@ -2446,6 +2446,9 @@ export PYTHONUNBUFFERED=1\n\
                 for cut in self.cuts:
                     if cut not in completed:
                         save_path = f'{base_path}/Cut{cut}of{self.n**2}'
+                        if self.direct_cuts and os.path.exists(f'{save_path}/cut.txt'):
+                            # -- direct cuts: put TessFixer's WCS in the TPF, for tessreduce's tpf.wcs -- #
+                            data_processor.stamp_cut_wcs(cam,ccd,self.n,cut,part=int(base_path[-1]) if self.part else False)
                         if table_exists(f'{save_path}/variable_catalog.csv') & os.path.exists(f'{save_path}/local_gaia_cat.csv'):
                             completed.append(cut)
                         elif os.path.exists(f'{save_path}/cut.txt'):

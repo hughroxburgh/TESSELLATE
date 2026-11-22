@@ -283,6 +283,58 @@ def _cut_linear_wcs(wcsItem, x0, y0, size):
     return fit, sep.max(), np.sqrt(np.mean(sep**2))
 
 
+APERTURE_HEADER_BLOCKS = 12   # fixed APERTURE header size (2880-byte blocks): room for TessFixer's order-6 SIP WCS,
+                               # so _stamp_tpf_wcs can rewrite it in place without moving any data
+
+
+def _fixed_header_bytes(header, nblocks):
+    """A FITS header padded with blank records to exactly nblocks blocks, so it can be rewritten in place."""
+    cards = header.tostring(sep='', endcard=False, padding=False)
+    size = nblocks * 2880
+    if len(cards) + 80 > size:
+        raise ValueError(f'Header needs {len(cards) // 80 + 1} records, only {size // 80} fit in {nblocks} blocks')
+    return (cards + ' ' * (size - 80 - len(cards)) + 'END'.ljust(80)).encode()
+
+
+def _aperture_header(size, wcs_header, extra):
+    """The APERTURE extension's header: image shape + WCS + extra (keyword, (value, comment)) cards."""
+    from astropy.io import fits
+    header = fits.ImageHDU(np.ones((size, size), np.int32), header=wcs_header, name='APERTURE').header
+    for key, value in extra.items():
+        header[key] = value
+    return header
+
+
+def _stamp_tpf_wcs(path, wcs_header, extra):
+    """Rewrite a direct-cut TPF's APERTURE header (its WCS, which tpf.wcs reads) in place."""
+    from astropy.io import fits
+    with fits.open(path) as h:
+        info = h.fileinfo(2)
+        size = h[2].header['NAXIS1']
+    nbytes = info['datLoc'] - info['hdrLoc']
+    if nbytes != APERTURE_HEADER_BLOCKS * 2880:
+        raise ValueError(f'{path} has no fixed-size APERTURE header (not a direct cut?)')
+    block = _fixed_header_bytes(_aperture_header(size, wcs_header, extra), APERTURE_HEADER_BLOCKS)
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        os.pwrite(fd, block, info['hdrLoc'])
+    finally:
+        os.close(fd)
+
+
+def _cutwcs_header(cut_wcs, size):
+    """
+    CutWCS (TessFixer's corrected CCD WCS, shifted by the cut corner and the cut's median source offset) as an
+    ordinary SIP WCS header for the cut's pixels. Slicing moves CRPIX by the corner; adding (dx, dy) to CRPIX
+    shifts the whole mapping, SIP terms included, exactly as CutWCS.all_world2pix does.
+    """
+    x0, y0 = int(cut_wcs.corner[0]), int(cut_wcs.corner[1])
+    header = cut_wcs.wcs[y0:y0+size, x0:x0+size].to_header(relax=True)
+    header['CRPIX1'] += float(cut_wcs.dx)
+    header['CRPIX2'] += float(cut_wcs.dy)
+    return header
+
+
 def _create_direct_tpf(path, ffi_hdrs, wcsItem, wcs_ffi, x0, y0, size, nrows, name_len, sector, cam, ccd, cut, n):
     """
     Write a cut TPF's headers and APERTURE extension around an empty (sparse) PIXELS table of nrows cadences,
@@ -334,20 +386,23 @@ def _create_direct_tpf(path, ffi_hdrs, wcsItem, wcs_ffi, x0, y0, size, nrows, na
 
     # -- WCS as astrocut: a linear fit to one FFI's WCS across the cut (tpf.wcs comes from here) -- #
     fit, msep, sig = _cut_linear_wcs(wcsItem, x0, y0, size)
-    aperture = fits.ImageHDU(np.ones((size, size), np.int32), header=fit.to_header(), name='APERTURE')
-    aperture.header['WCS_FFI'] = (wcs_ffi, 'FFI used for cutout WCS')
-    aperture.header['WCS_MSEP'] = (msep, '[deg] Max offset between cutout WCS and FFI WCS')
-    aperture.header['WCS_SIG'] = (sig, '[deg] Error measurement of cutout WCS fit')
+    # -- (DataProcessor.stamp_cut_wcs later replaces it with TessFixer's, in the same fixed-size header) -- #
+    fit, msep, sig = _cut_linear_wcs(wcsItem, x0, y0, size)
+    aperture = _aperture_header(size, fit.to_header(), {
+        'WCS_FFI': (wcs_ffi, 'FFI used for cutout WCS'),
+        'WCS_MSEP': (msep, '[deg] Max offset between cutout WCS and FFI WCS'),
+        'WCS_SIG': (sig, '[deg] Error measurement of cutout WCS fit'),
+        'WCS_SRC': ('FFI linear fit', 'origin of this WCS')})
     th['WCS_FFI'] = (wcs_ffi, 'FFI used for cutout WCS')
 
     head = prim.header.tostring().encode() + th.tostring().encode()
     data_len = nrows * row_bytes
-    ap_data = aperture.data.astype('>i4').tobytes()
+    ap_data = np.ones((size, size), '>i4').tobytes()
     with open(path, 'wb') as f:
         f.write(head)
         f.seek(len(head) + data_len)
         f.write(b'\0' * ((-data_len) % 2880))
-        f.write(aperture.header.tostring().encode())
+        f.write(_fixed_header_bytes(aperture, APERTURE_HEADER_BLOCKS))
         f.write(ap_data)
         f.write(b'\0' * ((-len(ap_data)) % 2880))
     return len(head)
@@ -940,6 +995,59 @@ class DataProcessor():
         if self.verbose > 0:
             print(f'Cam {cam} CCD {ccd} direct cuts complete ({(t()-ts)/60:.1f} min, {n_workers} workers).')
             print('\n')
+
+    def stamp_cut_wcs(self,cam,ccd,n,cut,part=False):
+        """
+        Write TessFixer's corrected WCS (as CutWCS gives it for this cut) into a direct cut's TPF, replacing the
+        linear FFI fit, so tessreduce and lightkurve (tpf.wcs) place sources with the corrected WCS.
+        Needs fix_wcs done (wcs/ref/corrected.fits and ccd_sourcefits.csv). In place: only the header changes.
+
+        ------
+        Inputs
+        ------
+        cam : int
+            desired camera
+        ccd : int
+            desired ccd
+        n : int
+            n**2 cuts on the CCD
+        cut : int
+            cut number
+
+        -------
+        Options
+        -------
+        part : bool or int
+            True stamps both Part1 and Part2 TPFs, 1 or 2 just that part
+        """
+
+        from astropy.io import fits
+        from .localisation import CutWCS
+
+        file_path = f'{self.path}/Cam{cam}/Ccd{ccd}'
+        if not os.path.exists(f'{file_path}/wcs/ref/corrected.fits'):
+            print('No corrected WCS found -- run fix_wcs first!')
+            return
+        cut_wcs = CutWCS(self.data_path,self.sector,cam,ccd,cut,n)
+        name = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}.fits'
+        if part is True:
+            folders = [f'{file_path}/Part{i}/Cut{cut}of{n**2}' for i in (1, 2)]
+        elif part:
+            folders = [f'{file_path}/Part{int(part)}/Cut{cut}of{n**2}']
+        else:
+            folders = [f'{file_path}/Cut{cut}of{n**2}']
+        for folder in folders:
+            path = f'{folder}/{name}'
+            hdr = fits.getheader(path, 2)
+            size = hdr['NAXIS1']
+            extra = {k: (hdr[k], hdr.comments[k]) for k in ('WCS_FFI',) if k in hdr}
+            extra['WCS_SRC'] = ('TessFixer', 'origin of this WCS: wcs/ref/corrected.fits + cut offset')
+            extra['WCS_DX'] = (float(cut_wcs.dx), '[pix] CutWCS median source offset, x')
+            extra['WCS_DY'] = (float(cut_wcs.dy), '[pix] CutWCS median source offset, y')
+            _stamp_tpf_wcs(path, _cutwcs_header(cut_wcs, size), extra)
+            if self.verbose > 0:
+                print(f'Cam {cam} CCD {ccd} cut {cut}: corrected WCS written to {name} '
+                      f'(offset {cut_wcs.dx:.2f}, {cut_wcs.dy:.2f} px)')
 
     def predict_asteroids(self,cam,ccd,n,cut,part=False,plot_trails=False):
         """

@@ -248,8 +248,7 @@ def _frame_stats_path(ccd_folder, sector, cam, ccd):
 
 
 def _tpf_row_dtype(size, name_len):
-    """One cadence of a direct-cut TPF, big-endian as FITS stores it. FLUX is column 5, as in SPOC/astrocut TPFs,
-    because lightkurve reads the cut's WCS from the column-5 keywords (1CTYP5, 1CRPX5, ...)."""
+    """One cadence of a direct-cut TPF, big-endian as FITS stores it. lightkurve takes the WCS from APERTURE."""
     return np.dtype([('TIME', '>f8'), ('TIMECORR', '>f4'), ('CADENCENO', '>i4'), ('QUALITY', '>i4'),
                      ('FLUX', '>f4', (size, size)), ('FLUX_ERR', '>f4', (size, size)),
                      ('POS_CORR1', '>f4'), ('POS_CORR2', '>f4'), ('FFI_FILE', f'S{name_len}')])
@@ -270,19 +269,21 @@ def _tpf_columns(size, name_len):
 
 
 def _cut_linear_wcs(wcsItem, x0, y0, size):
-    """Linear TAN WCS fitted to the full (SIP) WCS across one cut, as PC/CDELT for the TPF's column-5 keywords."""
+    """
+    Linear TAN WCS fitted to the full (SIP) FFI WCS across one cut, as astrocut writes in a cut's APERTURE header,
+    with the fit's max and rms sky offsets (deg) for its WCS_MSEP / WCS_SIG keywords.
+    """
     from astropy.coordinates import SkyCoord
     from astropy.wcs.utils import fit_wcs_from_points
-    g = np.linspace(0, size - 1, 12)
+    g = np.linspace(0, size - 1, 20)
     xx, yy = [a.ravel() for a in np.meshgrid(g, g)]
-    ra, dec = wcsItem.all_pix2world(xx + x0, yy + y0, 0)
-    fit = fit_wcs_from_points((xx, yy), SkyCoord(ra, dec, unit='deg'), projection='TAN')
-    cd = fit.wcs.cd if fit.wcs.has_cd() else fit.wcs.get_pc() * fit.wcs.cdelt[:, None]
-    cdelt = np.hypot(cd[:, 0], cd[:, 1])
-    return fit.wcs.crpix, fit.wcs.crval, cdelt, cd / cdelt[:, None]
+    sky = SkyCoord(*wcsItem.all_pix2world(xx + x0, yy + y0, 0), unit='deg')
+    fit = fit_wcs_from_points((xx, yy), sky, proj_point='center', projection='TAN')
+    sep = sky.separation(SkyCoord(*fit.all_pix2world(xx, yy, 0), unit='deg')).deg
+    return fit, sep.max(), np.sqrt(np.mean(sep**2))
 
 
-def _create_direct_tpf(path, ffi_hdrs, wcsItem, x0, y0, size, nrows, name_len, sector, cam, ccd, cut, n):
+def _create_direct_tpf(path, ffi_hdrs, wcsItem, wcs_ffi, x0, y0, size, nrows, name_len, sector, cam, ccd, cut, n):
     """
     Write a cut TPF's headers and APERTURE extension around an empty (sparse) PIXELS table of nrows cadences,
     for workers to fill row by row. Returns the byte offset of the table's first row.
@@ -324,25 +325,20 @@ def _create_direct_tpf(path, ffi_hdrs, wcsItem, x0, y0, size, nrows, name_len, s
     th['TELAPSE'] = last1['TSTOP'] - first1['TSTART']
     th['DATE-OBS'] = first1.get('DATE-OBS', '')
     th['DATE-END'] = last1.get('DATE-END', '')
-    crpix, crval, cdelt, pc = _cut_linear_wcs(wcsItem, x0, y0, size)
-    for col in (5, 6):
-        th[f'1CTYP{col}'] = 'RA---TAN'
-        th[f'2CTYP{col}'] = 'DEC--TAN'
-        th[f'1CRPX{col}'], th[f'2CRPX{col}'] = crpix
-        th[f'1CRVL{col}'], th[f'2CRVL{col}'] = crval
-        th[f'1CUNI{col}'] = th[f'2CUNI{col}'] = 'deg'
-        th[f'1CDLT{col}'], th[f'2CDLT{col}'] = cdelt
-        th[f'11PC{col}'], th[f'12PC{col}'] = pc[0]
-        th[f'21PC{col}'], th[f'22PC{col}'] = pc[1]
-        th[f'1CRV{col}P'], th[f'2CRV{col}P'] = x0, y0      # lightkurve's tpf.column / tpf.row: the cut's corner
-    th['1CRV4P'], th['2CRV4P'] = x0, y0
+    # -- No 1CRV4P/1CRV5P (tpf.column/row) or column WCS keys, as astrocut: tpf.column must stay 0, since reduce
+    # -- passes the cut's corner as col_offset itself (with column 551 too, S35 Cam3 Ccd3 Cut3 reduced with stripes)
 
     row_bytes = _tpf_row_dtype(size, name_len).itemsize
     if th['NAXIS1'] != row_bytes:
         raise RuntimeError(f'TPF row layout mismatch: header {th["NAXIS1"]} bytes, dtype {row_bytes}')
 
-    aperture = fits.ImageHDU(np.ones((size, size), np.int32),
-                             header=wcsItem[y0:y0+size, x0:x0+size].to_header(relax=True), name='APERTURE')
+    # -- WCS as astrocut: a linear fit to one FFI's WCS across the cut (tpf.wcs comes from here) -- #
+    fit, msep, sig = _cut_linear_wcs(wcsItem, x0, y0, size)
+    aperture = fits.ImageHDU(np.ones((size, size), np.int32), header=fit.to_header(), name='APERTURE')
+    aperture.header['WCS_FFI'] = (wcs_ffi, 'FFI used for cutout WCS')
+    aperture.header['WCS_MSEP'] = (msep, '[deg] Max offset between cutout WCS and FFI WCS')
+    aperture.header['WCS_SIG'] = (sig, '[deg] Error measurement of cutout WCS fit')
+    th['WCS_FFI'] = (wcs_ffi, 'FFI used for cutout WCS')
 
     head = prim.header.tostring().encode() + th.tostring().encode()
     data_len = nrows * row_bytes
@@ -774,7 +770,7 @@ class DataProcessor():
                 print(f'Cam {cam} CCD {ccd} cut {cut} complete.')
                 print('\n')
 
-    def make_direct_cuts(self,cam,ccd,n,cuts=None,part=False,n_workers=None,chunk=32):
+    def make_direct_cuts(self,cam,ccd,n,cuts=None,part=False,wcs_ffi=None,n_workers=None,chunk=32):
         """
         Make cut TPFs for this CCD straight from its FFIs, replacing make_cube + make_cuts.
 
@@ -799,6 +795,9 @@ class DataProcessor():
             cut numbers to write (default all n**2). Cuts whose cut.txt already exists are skipped.
         part : bool
             if True, split at the largest time gap into Part1/Part2 TPFs (as _make_part_cube)
+        wcs_ffi : str
+            file name of the FFI whose WCS the cuts' WCS is fitted to (default: the first FFI with a good WCS).
+            Set it to an astrocut cut's WCS_FFI to reproduce that cut's WCS exactly.
         n_workers : int
             parallel workers (default: the CPUs this job may use)
         chunk : int
@@ -814,6 +813,7 @@ class DataProcessor():
         import shutil
         from glob import glob
         from astropy.io import fits
+        from astropy.wcs import WCS
         from joblib import Parallel, delayed
         from tqdm import tqdm
         from .asteroid_prediction import _available_cpus
@@ -854,7 +854,19 @@ class DataProcessor():
 
         # -- Cut geometry, as make_cuts -- #
         cutCorners, _, _, cutSize = self.find_cuts(cam=cam,ccd=ccd,n=n,plot=False,verbose=0)
-        wcsItem = find_good_wcs(self.sector,self.data_path,cam,ccd)
+
+        # -- The raw FFI WCS the cut WCS is fitted to, as astrocut: never the TessFixer one, so reruns agree -- #
+        wcsItem = None
+        for f in ([f'{file_path}/{wcs_ffi}'] if wcs_ffi else files):
+            with fits.open(f) as h:
+                w = WCS(h[1].header)
+            if _wcs_ok(w):
+                wcs_ffi, wcsItem = os.path.basename(f), w
+                break
+            if wcs_ffi:
+                raise ValueError(f'{wcs_ffi} has no usable WCS')
+        if wcsItem is None:
+            raise ValueError(f'No FFI in {file_path} has a usable WCS')
         size = int(2 * cutSize)
         cuts = list(range(1, n**2 + 1)) if cuts is None else [int(c) for c in cuts]
         todo = [c for c in cuts
@@ -871,6 +883,7 @@ class DataProcessor():
         free = shutil.disk_usage(broad_path).free
         if self.verbose > 0:
             print(_Print_buff(50,f'Direct Cutting Sector {self.sector} Cam {cam} CCD {ccd}'))
+            print(f'WCS from {wcs_ffi}')
             print(f'{n_frames} FFIs -> {len(todo)} cuts of {size}x{size} px'
                   + (f' in 2 parts ({part_rows[0]} + {part_rows[1]} frames)' if part else '')
                   + f', {need/1e9:.1f} GB to write ({free/1e9:.0f} GB free)')
@@ -891,7 +904,7 @@ class DataProcessor():
                 folder = f'{d}/Cut{c}of{n**2}'
                 _Save_space(folder)
                 path = f'{folder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{c}_of{n**2}.fits'
-                start = _create_direct_tpf(path, ffi_hdrs[p], wcsItem, x0, y0, size, int(part_rows[p]), name_len,
+                start = _create_direct_tpf(path, ffi_hdrs[p], wcsItem, wcs_ffi, x0, y0, size, int(part_rows[p]), name_len,
                                            self.sector, cam, ccd, c, n)
                 target.append((path, start))
             targets.append(target)

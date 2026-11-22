@@ -389,11 +389,11 @@ def _create_direct_tpf(path, ffi_hdrs, wcsItem, wcs_ffi, x0, y0, size, nrows, na
     # -- (DataProcessor.stamp_cut_wcs later replaces it with TessFixer's, in the same fixed-size header) -- #
     fit, msep, sig = _cut_linear_wcs(wcsItem, x0, y0, size)
     aperture = _aperture_header(size, fit.to_header(), {
-        'WCS_FFI': (wcs_ffi, 'FFI used for cutout WCS'),
-        'WCS_MSEP': (msep, '[deg] Max offset between cutout WCS and FFI WCS'),
-        'WCS_SIG': (sig, '[deg] Error measurement of cutout WCS fit'),
+        'WCS_FFI': (wcs_ffi, 'FFI of cut WCS'),
+        'WCS_MSEP': (msep, '[deg] max cut WCS fit offset'),
+        'WCS_SIG': (sig, '[deg] rms cut WCS fit offset'),
         'WCS_SRC': ('FFI linear fit', 'origin of this WCS')})
-    th['WCS_FFI'] = (wcs_ffi, 'FFI used for cutout WCS')
+    th['WCS_FFI'] = (wcs_ffi, 'FFI of cut WCS')
 
     head = prim.header.tostring().encode() + th.tostring().encode()
     data_len = nrows * row_bytes
@@ -867,8 +867,9 @@ class DataProcessor():
 
         import shutil
         from glob import glob
+        import warnings
         from astropy.io import fits
-        from astropy.wcs import WCS
+        from astropy.wcs import WCS, FITSFixedWarning
         from joblib import Parallel, delayed
         from tqdm import tqdm
         from .asteroid_prediction import _available_cpus
@@ -908,6 +909,7 @@ class DataProcessor():
         part_rows = np.bincount(part_of, minlength=len(part_dirs))
 
         # -- Cut geometry, as make_cuts -- #
+        warnings.simplefilter('ignore', FITSFixedWarning)     # astropy's 'datfix' note on every FFI header
         cutCorners, _, _, cutSize = self.find_cuts(cam=cam,ccd=ccd,n=n,plot=False,verbose=0)
 
         # -- The raw FFI WCS the cut WCS is fitted to, as astrocut: never the TessFixer one, so reruns agree -- #
@@ -1041,9 +1043,9 @@ class DataProcessor():
             hdr = fits.getheader(path, 2)
             size = hdr['NAXIS1']
             extra = {k: (hdr[k], hdr.comments[k]) for k in ('WCS_FFI',) if k in hdr}
-            extra['WCS_SRC'] = ('TessFixer', 'origin of this WCS: wcs/ref/corrected.fits + cut offset')
-            extra['WCS_DX'] = (float(cut_wcs.dx), '[pix] CutWCS median source offset, x')
-            extra['WCS_DY'] = (float(cut_wcs.dy), '[pix] CutWCS median source offset, y')
+            extra['WCS_SRC'] = ('TessFixer', 'wcs/ref/corrected.fits + cut offset')
+            extra['WCS_DX'] = (float(cut_wcs.dx), '[pix] CutWCS source offset x')
+            extra['WCS_DY'] = (float(cut_wcs.dy), '[pix] CutWCS source offset y')
             _stamp_tpf_wcs(path, _cutwcs_header(cut_wcs, size), extra)
             if self.verbose > 0:
                 print(f'Cam {cam} CCD {ccd} cut {cut}: corrected WCS written to {name} '

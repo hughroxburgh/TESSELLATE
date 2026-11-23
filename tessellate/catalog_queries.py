@@ -229,7 +229,9 @@ def search_atlas_var(coords, radius):
         jobs = mastcasjobs.MastCasJobs(context="HLSP_ATLAS_VAR")
         results = jobs.quick(query, task_name="TESSELLATE Atlas var cat")
         results = results.to_pandas()
-    except:
+    except Exception as e:
+        # carry on without ATLAS, but say why (this used to fail silently)
+        print(f'--ATLAS variable query failed, carrying on without it: {type(e).__name__}: {str(e)[:200]}')
         results = None
     return results
 
@@ -365,7 +367,12 @@ def get_variable_cats(coords,radius,verbose):
         print(f'       ASASN...',end='\r')
         ts = t()
 
-    asasn = get_catalog("II/366/catalog",coords,radius)
+    # optional: VSX (below) holds the ASAS-SN variables too, and the CfA VizieR mirror can't serve II/366 (Nov 2026)
+    try:
+        asasn = get_catalog("II/366/catalog",coords,radius)
+    except RuntimeError as e:
+        print(f'--ASAS-SN variables unavailable, carrying on (VSX covers them): {e}')
+        asasn = None
     if verbose:
         print(f'       ASASN...Done! ({(t()-ts):.1f}s)')
         print(f'       DES...',end='\r')

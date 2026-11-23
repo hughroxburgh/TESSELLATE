@@ -1,7 +1,8 @@
+import os
 import pandas as pd
 from astropy.coordinates import SkyCoord, Angle
 import astropy.units as u
-from astroquery.vizier import Vizier
+from astroquery.vizier import VizierClass
 import numpy as np
 from astropy.io import fits 
 from astropy.wcs import WCS 
@@ -9,6 +10,75 @@ from time import time as t
 
 no_targets_found_message = ValueError('Either no sources were found in the query region '
                                         'or Vizier is unavailable')
+
+# -- VizieR mirrors for every catalogue query in tessellate, tried in order: a mirror that is down, or that reports a
+# -- catalogue unavailable, falls through to the next. Strasbourg was down in Nov 2026, so the CfA mirror goes first.
+# -- Override with a comma list in the TESSELLATE_VIZIER environment variable.
+VIZIER_SERVERS = [s.strip() for s in os.environ.get('TESSELLATE_VIZIER',
+                                                    'vizier.cfa.harvard.edu,vizier.cds.unistra.fr').split(',')]
+VIZIER_TIMEOUT = 60         # seconds per mirror and query
+VIZIER_RETRIES = 5          # attempts per mirror while it answers "database not currently reachable" (the CfA
+VIZIER_RETRY_DELAY = 5      # mirror flips in and out of that, Nov 2026), VIZIER_RETRY_DELAY seconds apart
+# -- If no mirror can serve a catalogue, raise (default) rather than quietly treat it as empty. Set True (or
+# -- TESSELLATE_VIZIER_ALLOW_MISSING=1) to warn and carry on without it, e.g. building variable catalogues
+# -- while one source catalogue (ASAS-SN on the CfA mirror, Nov 2026) is unreachable.
+VIZIER_ALLOW_MISSING = os.environ.get('TESSELLATE_VIZIER_ALLOW_MISSING', '0') == '1'
+
+
+class _HttpsVizier(VizierClass):
+    """astroquery's Vizier over https: older astroquery (0.4.6) always builds an http:// URL, and the mirrors
+    redirect that to https, which drops the POSTed query -- the result comes back silently empty."""
+
+    def _server_to_url(self, *args, **kwargs):
+        return super()._server_to_url(*args, **kwargs).replace('http://', 'https://', 1)
+
+
+def _vizier_unavailable(server, catalog, coord, radius):
+    """True if this mirror says it can't serve the catalogue (an empty result is then not a real 'no sources')."""
+    import requests
+    try:
+        r = requests.get(f'https://{server}/viz-bin/votable', timeout=VIZIER_TIMEOUT,
+                         params={'-source': catalog, '-c': f'{coord.ra.deg} {coord.dec.deg}',
+                                 '-c.rs': f'{Angle(radius).arcsec:.1f}', '-out.max': '1'})
+    except Exception:
+        return True
+    text = r.text
+    return ('not currently reachable' in text or 'no connection' in text or
+            ('QUERY_STATUS" value="ERROR' in text and 'OVERFLOW' not in text))
+
+
+def query_vizier(coords, catalog, radius, **kwargs):
+    """
+    Vizier.query_region(coords, catalog=catalog, radius=radius) on the first mirror in VIZIER_SERVERS that answers
+    and can serve the catalogue; kwargs (columns, column_filters, ...) go to the Vizier object. Returns astroquery's
+    TableList, empty if the region has no sources. Raises RuntimeError if no mirror can serve the catalogue
+    (or warns and returns an empty TableList with VIZIER_ALLOW_MISSING).
+    """
+    from time import sleep
+    from astroquery.utils import TableList
+    coord = coords if coords.isscalar else coords[0]
+    problems = []
+    for server in VIZIER_SERVERS:
+        for attempt in range(VIZIER_RETRIES):
+            try:
+                v = _HttpsVizier(vizier_server=server, timeout=VIZIER_TIMEOUT, row_limit=-1, **kwargs)
+                result = v.query_region(coords, catalog=catalog, radius=radius, cache=False)
+            except Exception as e:          # mirror down or not answering: no point retrying it
+                problems.append(f'{server}: {type(e).__name__}')
+                break
+            if result is not None and len(result) > 0:
+                return result
+            if not _vizier_unavailable(server, catalog, coord, radius):
+                return TableList([]) if result is None else result     # answered: genuinely no sources
+            sleep(VIZIER_RETRY_DELAY)
+        else:
+            problems.append(f'{server}: catalogue unavailable after {VIZIER_RETRIES} tries')
+    message = f'VizieR catalogue {catalog} could not be queried ({"; ".join(problems)})'
+    if VIZIER_ALLOW_MISSING:
+        print(f'WARNING: {message} -- carrying on without it')
+        return TableList([])
+    raise RuntimeError(message)
+
 
 def Get_Catalogue(ra,dec,size,Catalog = 'gaia'):
 	"""
@@ -32,7 +102,6 @@ def Get_Catalogue(ra,dec,size,Catalog = 'gaia'):
 	# Use pixel scale for query size
 	pix_scale = 21.0
 	# We are querying with a diameter as the radius, overfilling by 2x.
-	Vizier.ROW_LIMIT = -1
 	if Catalog == 'gaia':
 		catalog = "I/345/gaia2"
 	elif Catalog == 'dist':
@@ -44,11 +113,9 @@ def Get_Catalogue(ra,dec,size,Catalog = 'gaia'):
 	else:
 		raise ValueError(f"{catalog} not recognised as a catalog. Available options: 'gaia', 'dist','ps1'")
 	if Catalog == 'gaia':
-		result = Vizier.query_region(c1, catalog=[catalog],
-							 		 radius=Angle(size * pix_scale + 60, "arcsec"),column_filters={'Gmag':'<19'},cache=False)
+		result = query_vizier(c1, catalog, Angle(size * pix_scale + 60, "arcsec"), column_filters={'Gmag':'<19'})
 	else:
-		result = Vizier.query_region(c1, catalog=[catalog],
-									 radius=Angle(size * pix_scale + 60, "arcsec"),cache=False)
+		result = query_vizier(c1, catalog, Angle(size * pix_scale + 60, "arcsec"))
 
 	no_targets_found_message = ValueError('Either no sources were found in the query region '
 										  'or Vizier is unavailable')
@@ -186,15 +253,10 @@ def cross_match(obs_cat, viz_cat,tol=2*21,variable=True):
 def get_catalog(catalog, centre, radius,gaia=False):
     coords = SkyCoord(ra=centre[0]*u.deg,
                       dec=centre[1]*u.deg)
-    v = Vizier(row_limit=-1)
     if gaia:
-        t_result = v.query_region(coords, radius=radius*u.deg,
-                                  catalog=catalog,
-                                  column_filters={'Gmag':'<19.5'},cache=False)
+        t_result = query_vizier(coords, catalog, radius*u.deg, column_filters={'Gmag':'<19.5'})
     else:
-        t_result = v.query_region(coords, radius=radius*u.deg,
-                                  catalog=catalog,cache=False)
-    Vizier.clear_cache()
+        t_result = query_vizier(coords, catalog, radius*u.deg)
     if len(t_result) > 0:
         return t_result[catalog].to_pandas()
     else:
@@ -261,9 +323,7 @@ def get_catalog(catalog, centre, radius,gaia=False):
 def gaia_stars(obs_cat,size=2*21,mag_limit=19.5):
     coords = SkyCoord(ra=obs_cat.ra.values*u.deg,
                       dec=obs_cat.dec.values*u.deg)
-    v = Vizier(row_limit=-1)
-    gaia = v.query_region(coords, catalog=["I/355/gaiadr3"],
-                                 radius=Angle(size, "arcsec"),column_filters={'Gmag':f'<{mag_limit}'},cache=False)
+    gaia = query_vizier(coords, "I/355/gaiadr3", Angle(size, "arcsec"), column_filters={'Gmag':f'<{mag_limit}'})
     gaia = gaia['I/355/gaiadr3'].to_pandas()
     gaia = gaia.rename(columns={'RA_ICRS': 'ra',
                                 'DE_ICRS': 'dec'})

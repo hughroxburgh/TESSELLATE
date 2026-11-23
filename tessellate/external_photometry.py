@@ -577,16 +577,12 @@ def get_gaia_loc(ra,dec,size,path):
 
 
 def get_gaia_vizier(ra, dec, size):
-    from astroquery.vizier import Vizier
+    from .catalog_queries import query_vizier
     import astropy.units as u
     from astropy.coordinates import SkyCoord
-    v = Vizier(columns=['RA_ICRS', 'DE_ICRS', 'Gmag', 
-                        'PGal', 'PQso'], 
-               row_limit=-1)
     coord = SkyCoord(ra=ra, dec=dec, unit=u.degree)
-    result = v.query_region(coord, 
-                            radius=100*u.arcsec, 
-                            catalog='I/355/gaiadr3')
+    result = query_vizier(coord, 'I/355/gaiadr3', 100*u.arcsec,
+                          columns=['RA_ICRS', 'DE_ICRS', 'Gmag', 'PGal', 'PQso'])
     if result:
         j = result[0].to_pandas()
         j['star'] = 1

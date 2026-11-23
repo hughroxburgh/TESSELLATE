@@ -15,6 +15,9 @@ from .tools import delete_files, _Print_buff, _Save_space, _Check_job_status, _S
 # print(f'Imported .tools functions ({ts-t():.0f}s)')
 
 
+FOUR_ORBIT_SECTORS = {98}     # sectors observed over four orbits; others are found from their frame count
+
+
 def _parse_choice(choice, valid):
     """Cams / CCDs / cuts from an answer or argument: 'all', one value, or a comma list ('1,2' or [1, 2]).
     Returns a sorted list of ints, or None if anything isn't in valid."""
@@ -602,7 +605,7 @@ class Tessellate():
 
         primary_mission = range(1,27)       # ~1200 FFIs , 30 min cadence
         secondary_mission = range(27,56)    # ~3600 FFIs , 10 min cadence
-        tertiary_mission = range(56,100)    # ~12000 FFIs , 200 sec cadence
+        tertiary_mission = range(56,100)    # ~12000 FFIs , 200 sec cadence (~24000 in a 4-orbit sector)
 
         # cutting (DataProcessor.make_cuts, one job per CCD) reads each FFI once and holds a few per worker:
         # disk-bound and light on memory. Sector 98 Cam1 Ccd1 (24,162 FFIs, 64 cuts): 16 workers, ~15 min.
@@ -710,30 +713,49 @@ class Tessellate():
             predict_asteroids_cpu_sug = '16'
             predict_asteroids_mem_req = 160
 
-            # whole sector in one cut TPF: Sector 98 (4 orbits, 18,318 good frames) Cam1 Ccd1 Cut10 peaked at
-            # 243 GiB in 40 min (32 CPUs) and was killed at 200G
+            # whole sector in one cut TPF: about half the 4-orbit peak (243 GiB, below), with margin
             reduce_time_sug = '3:00:00'
             reduce_cpu_sug = '32'
-            reduce_mem_req = 300
+            reduce_mem_req = 200
 
             # scaled from the secondary tier's post-full-run-revision values (see there for why)
             asteroid_lightcurves_time_sug = '45:00'
             asteroid_lightcurves_cpu_sug = '16'
             asteroid_lightcurves_mem_req = 64
 
-            # detection limits load the whole reduced cube (~5 GB for a 4-orbit sector)
+            # detection limits load the whole reduced cube (~2.5 GB, ~5 GB in a 4-orbit sector)
             calibrate_time_sug = '30:00'
             calibrate_cpu_sug = '8'
-            calibrate_mem_req = 64
+            calibrate_mem_req = 32
 
-            search_time_sug = '1:00:00'
+            # not yet benchmarked at 200 sec cadence: 10G per CPU, and every bin from one frame to 12 hr
+            search_time_sug = '6:00:00'
             search_cpu_sug = '32'
-            search_mem_req = 60
-            search_time_bins = '200sec'
+            search_mem_req = 320
+            search_time_bins = '200sec,10min,30min,2hr,12hr'
 
             plot_time_sug = '10:00'
             plot_cpu_sug = '32'
             plot_mem_req = 50
+
+            if self._four_orbit_sector():
+                # twice the frames of a normal 200 sec sector, all in one cut TPF. Measured on Sector 98 Cam1 Ccd1:
+                # cutting ~15 min (16 CPUs); reduce of Cut10 peaked at 243 GiB in 40 min (32 CPUs; killed at 200G).
+                # The rest scale with frame count from the 200 sec values above, so are unbenchmarked guesses.
+                print('   (four-orbit sector: suggestions scaled for ~24000 frames)')
+                predict_asteroids_time_sug = '3:00:00'
+                predict_asteroids_mem_req = 320
+
+                reduce_time_sug = '3:00:00'
+                reduce_cpu_sug = '32'
+                reduce_mem_req = 300
+
+                asteroid_lightcurves_time_sug = '1:30:00'
+                asteroid_lightcurves_mem_req = 128
+
+                calibrate_mem_req = 64
+
+                search_time_sug = '12:00:00'
 
         suggestions = [[cut_time_sug,cut_mem_sug,cut_mem_req],
                        [reduce_time_sug,reduce_cpu_sug,reduce_mem_req],
@@ -744,6 +766,21 @@ class Tessellate():
                        [asteroid_lightcurves_time_sug,asteroid_lightcurves_cpu_sug,asteroid_lightcurves_mem_req]]
 
         return suggestions
+
+    def _four_orbit_sector(self):
+        """
+        True for a sector observed over four orbits (about twice a normal sector's FFIs): listed in
+        FOUR_ORBIT_SECTORS, or with more than 18000 frames in any of its CCDs' frame stats or image_files.
+        """
+
+        if self.sector in FOUR_ORBIT_SECTORS:
+            return True
+        sector_path = f'{self.data_path}/Sector{self.sector}'
+        for stats in glob(f'{sector_path}/Cam*/Ccd*/sector{self.sector}_cam*_ccd*_frame_stats.npz'):
+            return len(np.load(stats)['tstart']) > 18000
+        for folder in glob(f'{sector_path}/Cam*/Ccd*/image_files'):
+            return len(glob(f'{folder}/*ffic.fits')) > 18000
+        return False
 
     def _run_properties(self):
         """

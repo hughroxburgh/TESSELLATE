@@ -319,7 +319,7 @@ class Navigator():
         # -- Remove events within 'boundary_buffer' of the boundary -- #
         if boundary_buffer is not None:
             
-            from .tools import Get_Tess_Downlink
+            from .tools import Get_Tess_Breaks
 
             self.gather_data(cut, flux=False, verbose=False)
             
@@ -327,10 +327,10 @@ class Navigator():
             for frame_bin in np.unique(events.frame_bin):
                 bin_events = events[events.frame_bin == frame_bin]
                 time = Frame_Bin(self.sector, self.cam, self.time, frame_bin=frame_bin)
-                break_idx = Get_Tess_Downlink(self.sector, self.cam, time)
+                breaks = Get_Tess_Breaks(self.sector, self.cam, time)
                 last_idx = len(time) - 1
 
-                boundaries = [0, break_idx, break_idx + 1, last_idx]
+                boundaries = [0, last_idx] + [b for br in breaks for b in (br, br + 1)]
 
                 boundary_frames = set()
                 for b in boundaries:

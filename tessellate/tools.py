@@ -530,20 +530,36 @@ def Get_Tess_Vectors(sector, camera, data_path='/fred/oz335/_local_TESS_vectors'
     if os.path.isfile(local):
         return pd.read_csv(local, comment='#', index_col=False)
 
-def Get_Tess_Downlink(sector, camera, time):
+DOWNLINK_GAP = 0.25     # days: a gap this long in the frame times is a downlink, when there's no TESS vectors file
 
+
+def Get_Tess_Breaks(sector, camera, time):
+    """
+    Indices where each new orbit segment starts (one per downlink, so three for a
+    four-orbit sector like 98). Taken from the TESS vectors file's Segment column
+    when it is there, otherwise from gaps longer than DOWNLINK_GAP in the times.
+    """
+    time = np.asarray(time, dtype=float)
     df = Get_Tess_Vectors(sector, camera)
+    if df is not None:
+        btjd = time - 56999.5
+        segment = np.interp(btjd, df['MidTime'].values, df['Segment'].values).astype(int)
+        breaks = np.where(np.diff(segment) != 0)[0] + 1
+    else:
+        breaks = np.where(np.diff(time) > DOWNLINK_GAP)[0] + 1
+    return breaks
 
-    btjd = time - 56999.5
-    vec_t = df['MidTime'].values
-    segment = np.interp(btjd, vec_t, df['Segment'].values).astype(int)
-    break_idx = np.argmax(np.diff(segment)) + 1
 
-    return break_idx
+def Get_Tess_Downlink(sector, camera, time):
+    """The first downlink break (kept for callers that only want one)."""
+    breaks = Get_Tess_Breaks(sector, camera, time)
+    return int(breaks[0]) if len(breaks) else len(time)
+
 
 def Frame_Bin(sector, camera, time, flux=None, frame_bin=1):
 
-    break_idx = Get_Tess_Downlink(sector, camera, time)
+    breaks = Get_Tess_Breaks(sector, camera, time)
+    edges = np.concatenate([[0], breaks, [len(time)]]).astype(int)
 
     def _bin_segment(t, f=None):
         points = np.arange(0, len(t), frame_bin)
@@ -553,13 +569,12 @@ def Frame_Bin(sector, camera, time, flux=None, frame_bin=1):
         binned_flux = np.array([np.nanmean(f[i:i+frame_bin], axis=0) for i in points])
         return binned_time, binned_flux
 
+    segments = [(a, b) for a, b in zip(edges[:-1], edges[1:]) if b > a]
     if flux is None:
-        return np.concatenate([_bin_segment(time[:break_idx]), _bin_segment(time[break_idx:])])
-    
-    time_a, flux_a = _bin_segment(time[:break_idx], flux[:break_idx])
-    time_b, flux_b = _bin_segment(time[break_idx:], flux[break_idx:])
-    return np.concatenate([time_a, time_b]), np.concatenate([flux_a, flux_b])
+        return np.concatenate([_bin_segment(time[a:b]) for a, b in segments])
 
+    binned = [_bin_segment(time[a:b], flux[a:b]) for a, b in segments]
+    return np.concatenate([t for t, _ in binned]), np.concatenate([f for _, f in binned])
 
 
 def _Ask(prompt):

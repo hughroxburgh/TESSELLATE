@@ -178,26 +178,20 @@ def load_cut_events(data_path, sector, cam, ccd, cut, n=8):
     return events
 
 
-def _segment_break(sector, cam, time):
-    """
-    Downlink break index used by tools.Frame_Bin. Falls back to the largest
-    time gap when the TESS vectors file is not available (e.g. off-cluster).
-    """
-    try:
-        from .tools import Get_Tess_Downlink
-        return int(Get_Tess_Downlink(sector, cam, time))
-    except Exception:
-        _warn_once(('vectors', sector, cam),
-                   f'TESS vectors unavailable for sector {sector} camera {cam}; using the largest time gap '
-                   'as the downlink break. Copy TessVectors_S*_C*_FFI.csv locally to match Frame_Bin exactly.')
-        return int(np.nanargmax(np.diff(time)) + 1)
+def _segment_breaks(sector, cam, time):
+    """Downlink break indices, exactly as tools.Frame_Bin uses them (vectors file, else time gaps)."""
+    from .tools import Get_Tess_Breaks
+    return np.asarray(Get_Tess_Breaks(sector, cam, time), dtype=int)
 
 
-def _bin_frames(arr, frame_bin, break_idx):
+def _edges(breaks, n):
+    return np.concatenate([[0], breaks, [n]]).astype(int)
+
+
+def _bin_frames(arr, frame_bin, breaks):
     """
-    Mean over consecutive frame_bin frames, separately either side of the
-    downlink break -- the same binning as tools.Frame_Bin, for any array whose
-    first axis is time.
+    Mean over consecutive frame_bin frames, separately within each orbit segment
+    -- the same binning as tools.Frame_Bin, for any array whose first axis is time.
     """
     arr = np.asarray(arr, dtype=np.float32 if np.ndim(arr) > 1 else float)
     if frame_bin <= 1:
@@ -210,21 +204,26 @@ def _bin_frames(arr, frame_bin, break_idx):
             a = np.concatenate([a, np.full((pad,) + a.shape[1:], np.nan, dtype=a.dtype)])
         return np.nanmean(a.reshape((m, frame_bin) + a.shape[1:]), axis=1)
 
+    e = _edges(breaks, len(arr))
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
-        return np.concatenate([_segment(arr[:break_idx]), _segment(arr[break_idx:])])
+        return np.concatenate([_segment(arr[lo:hi]) for lo, hi in zip(e[:-1], e[1:]) if hi > lo])
 
 
-def _raw_range(index, frame_bin, break_idx, n_raw):
+def _raw_range(index, frame_bin, breaks, n_raw):
     """Raw frame range [lo, hi) averaged into binned frame `index`."""
     if frame_bin <= 1:
         return index, index + 1
-    n_first = -(-break_idx // frame_bin)
-    if index < n_first:
-        lo = index * frame_bin
-        return lo, min(lo + frame_bin, break_idx)
-    lo = break_idx + (index - n_first) * frame_bin
-    return lo, min(lo + frame_bin, n_raw)
+    e = _edges(breaks, n_raw)
+    for lo, hi in zip(e[:-1], e[1:]):
+        if hi <= lo:
+            continue
+        n_seg = -(-(hi - lo) // frame_bin)
+        if index < n_seg:
+            start = lo + index * frame_bin
+            return start, min(start + frame_bin, hi)
+        index -= n_seg
+    raise IndexError('binned frame index out of range')
 
 
 def _stamp(flux, x, y, half):
@@ -268,24 +267,24 @@ class _CutData():
         base = _cut_base(data_path, sector, cam, ccd, cut, n)
         self.time = np.load(f'{base}_Times.npy')
         self.flux = np.load(f'{base}_ReducedFlux.npy', mmap_mode='r')
-        self.break_idx = _segment_break(sector, cam, self.time)
+        self.breaks = _segment_breaks(sector, cam, self.time)
         self.noise = _frame_noise(self.flux) if frame_stats else None
         self._binned = {}
 
     def binned(self, frame_bin):
         """(time, per-frame noise, continuous segment bounds) at this binning."""
         if frame_bin not in self._binned:
-            t = _bin_frames(self.time, frame_bin, self.break_idx)
-            noise = None if self.noise is None else _bin_frames(self.noise, frame_bin, self.break_idx)
+            t = _bin_frames(self.time, frame_bin, self.breaks)
+            noise = None if self.noise is None else _bin_frames(self.noise, frame_bin, self.breaks)
             self._binned[frame_bin] = (t, noise, _segment_bounds(t))
         return self._binned[frame_bin]
 
     def stamp(self, x, y, half, frame_bin):
-        return _bin_frames(_stamp(self.flux, x, y, half), frame_bin, self.break_idx)
+        return _bin_frames(_stamp(self.flux, x, y, half), frame_bin, self.breaks)
 
     def image(self, x, y, half, frame_bin, index):
         """A single binned frame, without binning the whole time series."""
-        lo, hi = _raw_range(index, frame_bin, self.break_idx, len(self.time))
+        lo, hi = _raw_range(index, frame_bin, self.breaks, len(self.time))
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', RuntimeWarning)
             return np.nanmean(_stamp(self.flux[lo:hi], x, y, half), axis=0)

@@ -530,24 +530,52 @@ def Get_Tess_Vectors(sector, camera, data_path='/fred/oz335/_local_TESS_vectors'
     if os.path.isfile(local):
         return pd.read_csv(local, comment='#', index_col=False)
 
-DOWNLINK_GAP = 0.25     # days: a gap this long in the frame times is a downlink, when there's no TESS vectors file
+ORBIT_TIMES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'orbit_times', 'TESS_orbit_times.csv')
+DOWNLINK_GAP = 0.15     # days: last resort, a gap this long in the frame times is a downlink (they're ~5 hr since S56)
+
+
+def Get_Orbit_Boundaries(sector):
+    """
+    MJD midpoints of the gaps between consecutive orbit segments of *sector*, from
+    MIT's ground-contact table (tess.mit.edu/public/files/TESS_orbit_times.csv, UTC,
+    copied into the package Nov 2026, sectors 1-112). None if the sector isn't in it.
+    """
+    import pandas as pd
+    from astropy.time import Time
+
+    if not os.path.isfile(ORBIT_TIMES_FILE):
+        return None
+    df = pd.read_csv(ORBIT_TIMES_FILE, comment='#')
+    df = df[df['Sector'] == int(sector)]
+    if len(df) == 0:
+        return None
+    start = Time(list(df['Start of Orbit']), scale='utc').mjd
+    end = Time(list(df['End of Orbit']), scale='utc').mjd
+    order = np.argsort(start)
+    start, end = start[order], end[order]
+    return 0.5 * (end[:-1] + start[1:])
 
 
 def Get_Tess_Breaks(sector, camera, time):
     """
-    Indices where each new orbit segment starts (one per downlink, so three for a
-    four-orbit sector like 98). Taken from the TESS vectors file's Segment column
-    when it is there, otherwise from gaps longer than DOWNLINK_GAP in the times.
+    Indices where each new orbit segment starts, one per downlink: 1 for a two-orbit
+    sector before S56, 3 for one since S56, 7 for the four-orbit sector 98. In order of preference: the TESS vectors file's Segment
+    column, MIT's orbit-times table, then gaps longer than DOWNLINK_GAP.
+    *time* is MJD (BTJD + 56999.5) and sorted.
     """
     time = np.asarray(time, dtype=float)
     df = Get_Tess_Vectors(sector, camera)
     if df is not None:
         btjd = time - 56999.5
         segment = np.interp(btjd, df['MidTime'].values, df['Segment'].values).astype(int)
-        breaks = np.where(np.diff(segment) != 0)[0] + 1
-    else:
-        breaks = np.where(np.diff(time) > DOWNLINK_GAP)[0] + 1
-    return breaks
+        return np.where(np.diff(segment) != 0)[0] + 1
+
+    bounds = Get_Orbit_Boundaries(sector)
+    if bounds is not None:
+        breaks = np.unique(np.searchsorted(time, bounds))
+        return breaks[(breaks > 0) & (breaks < len(time))]
+
+    return np.where(np.diff(time) > DOWNLINK_GAP)[0] + 1
 
 
 def Get_Tess_Downlink(sector, camera, time):

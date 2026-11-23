@@ -332,6 +332,18 @@ def gaia_stars(obs_cat,size=2*21,mag_limit=19.5):
 
 ####### Download variables
 
+VSX_TRANSIENT_TYPES = {'TDE', 'GRB', 'N', 'NA', 'NB', 'NC', 'NR', 'KN', 'FBOT', 'LFBOT', 'MICROLENS'}   # + SN*
+
+
+def _vsx_transient(vsx_type):
+    """True for a VSX type that is a one-off transient rather than a variable (any of its '|' alternatives)."""
+    for t in vsx_type.upper().replace(':', '').split('|'):
+        t = t.strip()
+        if t.startswith('SN') or t in VSX_TRANSIENT_TYPES:
+            return True
+    return False
+
+
 def get_variable_cats(coords,radius,verbose):
     from time import time as t
 
@@ -362,9 +374,17 @@ def get_variable_cats(coords,radius,verbose):
     des_var = get_catalog("J/AJ/158/16/table11",coords,radius)
     if verbose:
         print(f'       DES...Done! ({(t()-ts):.1f}s)')
+        print(f'       VSX...',end='\r')
+        ts = t()
+
+    # VSX (AAVSO's index of every variable catalogue, ASAS-SN included) last: it only adds variables the others
+    # lack -- e.g. ASAS-SN's while a VizieR mirror can't serve II/366 (the CfA mirror, Nov 2026)
+    vsx = get_catalog("B/vsx/vsx",coords,radius)
+    if verbose:
+        print(f'       VSX...Done! ({(t()-ts):.1f}s)')
         print('\n')
 
-    if (varisum is None) & (asasn is None) & (des_var is None) & (atlas is None):
+    if (varisum is None) & (asasn is None) & (des_var is None) & (atlas is None) & (vsx is None):
         print("No known variables found ...")
         variables = pd.DataFrame(columns=['ra','dec','Type','Prob'])
         return variables
@@ -405,7 +425,21 @@ def get_variable_cats(coords,radius,verbose):
             des_var['Catalog'] = 'DES'
         else:
             des_var = None
-        tables = [varisum,asasn,des_var,atlas]
+
+        if vsx is not None:
+            vsx = vsx[vsx['V'] <= 1]                # 0 variable, 1 suspected; 2 constant/non-existent, 3 duplicate
+            # VSX also lists one-off transients (SNe, TDEs, novae, ...): those are what we search for, so leave
+            # them out (a TDE in the variable catalogue would mark its own events as a known variable)
+            vsx = vsx[~vsx['Type'].astype(str).map(_vsx_transient)]
+            vsx = vsx.rename(columns={'RAJ2000': 'ra',
+                                      'DEJ2000': 'dec',
+                                      'Name': 'ID'})
+            vsx['Prob'] = np.where(vsx['V'] == 0, 1.0, 0.5)
+            vsx = pd.DataFrame(vsx, columns=['ra','dec','Type','Prob','ID'])
+            vsx['Catalog'] = 'B/vsx/vsx'
+            if len(vsx) == 0:
+                vsx = None
+        tables = [varisum,asasn,des_var,atlas,vsx]
         variables = None
         for tab in tables:
             variables = join_cats(variables,tab)

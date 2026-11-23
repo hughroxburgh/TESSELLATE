@@ -43,7 +43,7 @@ class Tessellate():
     def __init__(self,data_path,sector=None,cam=None,ccd=None,n=None,
                  verbose=2,ask_config=True,save_config=True,
                  job_output_path=None,working_path=None,injection_dir='source_injection',
-                 download_number=None,cube_time=None,cube_mem=None,cube_cpu=None,
+                 download_number=None,
                  cuts=None,cut_time=None,cut_mem=None,cut_cpu=None,
                  predict_asteroids_time=None,predict_asteroids_cpu=None,predict_asteroids_mem=None,
                  reduce_time=None,reduce_cpu=None,reduce_mem=None,
@@ -52,10 +52,10 @@ class Tessellate():
                  search_time=None,search_cpu=None,search_mem=None,detect_mode='both',search_time_bins=None,search_snr=3.0,
                  search_redo='ask',
                  plot_time=None,plot_cpu=None,plot_mem=None,
-                 download=None,make_cube=None,fix_wcs=None,make_cuts=None,predict_asteroids=None,
+                 download=None,make_cuts=None,fix_wcs=None,make_catalogues=None,predict_asteroids=None,
                  reduce=None,asteroid_lightcurves=None,calibrate=None,search=None,plot=None,delete=None,
                  injection=False,overwrite=None,reset_logs=None,use_suggestions=False,
-                 direct_cuts=False,go=True):
+                 go=True):
         
         """
         Initialise.
@@ -94,13 +94,12 @@ class Tessellate():
 
         download : bool
             if True, download FFIs
-        make_cube : bool
-            if True, make cube
         make_cuts : bool
-            if True, make cuts
-        direct_cuts : bool
-            if True, the make_cube job writes every cut TPF straight from the FFIs (DataProcessor.make_direct_cuts)
-            instead of building a cube, and make_cuts only builds the catalogues. Needs make_cuts as well.
+            if True, cut each CCD's FFIs straight into its n^2 cut TPFs (one job per CCD)
+        fix_wcs : bool
+            if True, fit each CCD's corrected WCS (TessFixer) from the cuts' frame stats
+        make_catalogues : bool
+            if True, build each cut's Gaia and variable catalogues and write the corrected WCS into its TPF
         predict_asteroids : bool
             if True, predict catalogued asteroids crossing each cut's footprint
         reduce : bool
@@ -116,19 +115,12 @@ class Tessellate():
         Run Properties
         ------
 
-        cube_time : str
-            time allowed for cube generation, form = 'hh:mm:ss'
-        cube_cpu : int
-            number of cpu to request for cube generation
-        cube_mem : int
-            memory/cpu for cube generation (in GB)
-
         cut_time : str
-            time allowed for cut generation, form = 'hh:mm:ss'
+            time allowed for cutting a CCD, form = 'hh:mm:ss'
         cut_cpu : int
-            number of cpu to request for cut generation
+            number of cpu to request for cutting a CCD
         cut_mem : int
-            memory/cpu for cut generation (in GB)
+            memory/cpu for cutting a CCD (in GB)
 
         predict_asteroids_time : str
             time allowed for asteroid prediction, form = 'hh:mm:ss'
@@ -178,10 +170,6 @@ class Tessellate():
         self.n = n
         self.cuts = cuts
 
-        self.cube_time = cube_time
-        self.cube_mem = cube_mem
-        self.cube_cpu = cube_cpu
-
         self.cut_time = cut_time
         self.cut_mem = cut_mem
         self.cut_cpu = cut_cpu
@@ -220,14 +208,13 @@ class Tessellate():
 
         self.ask_config = ask_config
         self.skip = []
-        self.direct_cuts = direct_cuts
 
         # -- Allows for no actual initialisation (TessTransient) -- #
         if go:
-            self.run_tessellate(download,make_cube,fix_wcs,make_cuts,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot,delete,
+            self.run_tessellate(download,make_cuts,fix_wcs,make_catalogues,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot,delete,
                                 overwrite,reset_logs,save_config,use_suggestions)
 
-    def run_tessellate(self,download,make_cube,fix_wcs,make_cuts,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot,delete,
+    def run_tessellate(self,download,make_cuts,fix_wcs,make_catalogues,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot,delete,
                        overwrite,reset_logs,save_config,use_suggestions):
 
         # -- Initialise and check for previous config file -- #
@@ -236,7 +223,7 @@ class Tessellate():
         if load_prev:
 
             # -- Load config -- #
-            download, make_cube, fix_wcs, make_cuts, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot, delete = self._load_config()
+            download, make_cuts, fix_wcs, make_catalogues, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot, delete = self._load_config()
             if search:
                 self._search_redo_properties()      # a per-run choice, not stored in the config
                 print('\n')
@@ -249,22 +236,24 @@ class Tessellate():
             suggestions = self._sector_suggestions()
 
             # -- Ask for which tessellation steps to perform -- #
-            download, make_cube, fix_wcs, make_cuts, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot, delete = self._which_processes(download, make_cube, fix_wcs, make_cuts, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot, delete)
+            download, make_cuts, fix_wcs, make_catalogues, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot, delete = self._which_processes(download, make_cuts, fix_wcs, make_catalogues, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot, delete)
 
             # -- Ask for inputs -- #
             if download:
                 self._download_properties()
 
-            if make_cube:
-                self._cube_properties(suggestions[0],use_suggestions)
-                _Save_space(f'{self.job_output_path}/tessellate_cubing_logs')
-
             if make_cuts:
-                self._cut_properties(suggestions[1],use_suggestions)
+                self._cut_properties(suggestions[0],use_suggestions)
                 _Save_space(f'{self.job_output_path}/tessellate_cutting_logs')
 
+            if make_catalogues:
+                self._catalogue_properties(make_cuts)
+
+            # n and the cuts are set by the first stage that needs them (make_cuts, make_catalogues, or below)
+            cuts_set = make_cuts or make_catalogues
+
             if predict_asteroids:
-                self._predict_asteroids_properties(make_cuts,suggestions[6],use_suggestions)
+                self._predict_asteroids_properties(cuts_set,suggestions[5],use_suggestions)
                 _Save_space(f'{self.job_output_path}/tessellate_asteroid_prediction_logs')
 
             if reduce:
@@ -274,55 +263,52 @@ class Tessellate():
                 # re-resolve an already-resolved range and hit its elif chain's
                 # missing range case (confirmed the hard way: "Invalid Cut Input
                 # of range(1, 65)").
-                self._reduce_properties(make_cuts or predict_asteroids,suggestions[2],use_suggestions)
+                self._reduce_properties(cuts_set or predict_asteroids,suggestions[1],use_suggestions)
                 _Save_space(f'{self.job_output_path}/tessellate_reduction_logs')
 
             if asteroid_lightcurves:
-                self._asteroid_lightcurves_properties(make_cuts or predict_asteroids,suggestions[7],use_suggestions)
+                self._asteroid_lightcurves_properties(cuts_set or predict_asteroids,suggestions[6],use_suggestions)
                 _Save_space(f'{self.job_output_path}/tessellate_asteroid_lightcurves_logs')
 
             if calibrate:
-                self._calibrate_properties(reduce, suggestions[5],use_suggestions)
+                self._calibrate_properties(reduce, suggestions[4],use_suggestions)
                 _Save_space(f'{self.job_output_path}/tessellate_calibration_logs')
 
             if search:
-                cutting_reducing = make_cuts | reduce
-                self._search_properties(cutting_reducing,suggestions[3],use_suggestions)
+                cutting_reducing = cuts_set | reduce
+                self._search_properties(cutting_reducing,suggestions[2],use_suggestions)
                 _Save_space(f'{self.job_output_path}/tessellate_search_logs')
 
             if plot:
-                self._plotting_properties(search,suggestions[4],use_suggestions)
+                self._plotting_properties(search,suggestions[3],use_suggestions)
                 _Save_space(f'{self.job_output_path}/tessellate_plotting_logs')
 
             if save_config:
-                self._write_config(download,make_cube, fix_wcs, make_cuts, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot, delete)
+                self._write_config(download, make_cuts, fix_wcs, make_catalogues, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot, delete)
 
         # -- Check for overwriting -- #
         if overwrite != False:
-            self._overwrite_suggestions(make_cube, make_cuts, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot)
+            self._overwrite_suggestions(make_cuts, make_catalogues, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot)
         else:
             self.overwrite = None
 
         # -- Reset Job Logs -- #
         if reset_logs != False:
-            self._reset_logs(make_cube,make_cuts,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot)
-
-        if self.direct_cuts and make_cube and not make_cuts:
-            e = 'direct_cuts makes the cuts in the make_cube job: run make_cuts too (it sets n/cuts and builds the catalogues)\n'
-            raise ValueError(e)
+            self._reset_logs(make_cuts,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot)
 
         # -- Run Processes -- #
         if download:
             self.download()
 
-        if make_cube:
-            make_cube = self.make_cube()
+        cut_status = False
+        if make_cuts:
+            cut_status = self.make_cuts()       # cutting job ids per CCD, for fix_wcs/make_catalogues to wait on
 
         if fix_wcs:
-            self.fix_wcs(cube_status=make_cube)
+            self.fix_wcs(cut_status=cut_status)
 
-        if make_cuts:
-            self.make_cuts()
+        if make_catalogues:
+            self.make_catalogues(cut_status=cut_status)
 
         if predict_asteroids:
             predict_asteroids = self.predict_asteroids()   # returns prediction slurm job ids for use in asteroid_lightcurves
@@ -339,12 +325,12 @@ class Tessellate():
 
         if search:
             self.transient_search(calibrating=calibrate,reduction_status=reduce)
-        
+
         if plot:
             self.transient_plot(searching=search)
 
         if delete:
-            delete_files(filetype='ffis',data_path=self.data_path,sector=self.sector,part=False)  
+            delete_files(filetype='ffis',data_path=self.data_path,sector=self.sector)
 
     def _initialise(self):
 
@@ -417,29 +403,11 @@ class Tessellate():
             download = False
             print(f'   - Download FFIs? [y/n] = n')
         
-        # Make cubes
-        if 'make_cubes' in parser:
-            make_cube = parse_value(parser['make_cubes'].get('make_cubes', False))
-            self.cube_time = parse_value(parser['make_cubes'].get('cube job time', None))
-            self.cube_mem = parse_value(parser['make_cubes'].get('cube job memory', None))
-            self.cube_cpu = parse_value(parser['make_cubes'].get('cube job cpu', None))
-            print(f'   - Make Cube(s)? [y/n] = y')
-        else:
-            make_cube = False
-            print(f'   - Make Cube(s)? [y/n] = n')
-
-        # Fix WCS 
-        if 'fix_wcs' in parser:
-            fix_wcs = parse_value(parser['fix_wcs'].get('fix_wcs', False))
-        else:
-            fix_wcs = False
-            print(f'   - Fix WCS? [y/n] = n')
-        
         # Cut properties
         if 'cut_properties' in parser:
             self.n = parse_value(parser['cut_properties'].get('n', None))
             self.cuts = parse_value(parser['cut_properties'].get('cuts', None))
-        
+
         # Make cuts
         if 'make_cuts' in parser:
             make_cuts = parse_value(parser['make_cuts'].get('make_cuts', False))
@@ -450,6 +418,22 @@ class Tessellate():
         else:
             make_cuts = False
             print(f'   - Make Cut(s)? [y/n] = n')
+
+        # Fix WCS
+        if 'fix_wcs' in parser:
+            fix_wcs = parse_value(parser['fix_wcs'].get('fix_wcs', False))
+            print(f'   - Fix WCS? [y/n] = y')
+        else:
+            fix_wcs = False
+            print(f'   - Fix WCS? [y/n] = n')
+
+        # Make catalogues
+        if 'make_catalogues' in parser:
+            make_catalogues = parse_value(parser['make_catalogues'].get('make_catalogues', False))
+            print(f'   - Make Catalogues? [y/n] = y')
+        else:
+            make_catalogues = False
+            print(f'   - Make Catalogues? [y/n] = n')
 
         # Predict Asteroids
         if 'predict_asteroids' in parser:
@@ -540,13 +524,7 @@ class Tessellate():
             print(f'   - Download Number [int,all] = {self.download_number}')
             print('\n')
 
-        if make_cube:
-            print(f"   - Cube Batch Time ['h:mm:ss'] = {self.cube_time}")
-            print(f"   - Cube Mem/CPU = {self.cube_mem}")
-            print(f"   - Cube Num CPUs Needed = {self.cube_cpu}")
-            print('\n')
-
-        if make_cuts | reduce | calibrate | search | plot:
+        if make_cuts | make_catalogues | predict_asteroids | reduce | asteroid_lightcurves | calibrate | search | plot:
             print(f"   - n (Number of Cuts = n^2) = {self.n}")
     
             if self.cuts == list(range(1,17)):
@@ -615,7 +593,7 @@ class Tessellate():
                 go = input('      Invalid choice! Ready? [y/n] = ')
 
 
-        return download,make_cube,fix_wcs,make_cuts,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot,delete
+        return download,make_cuts,fix_wcs,make_catalogues,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot,delete
 
     def _sector_suggestions(self):
         """
@@ -626,15 +604,12 @@ class Tessellate():
         secondary_mission = range(27,56)    # ~3600 FFIs , 10 min cadence
         tertiary_mission = range(56,100)    # ~12000 FFIs , 200 sec cadence
 
-        self.part = False
+        # cutting (DataProcessor.make_cuts, one job per CCD) reads each FFI once and holds a few per worker:
+        # disk-bound and light on memory. Sector 98 Cam1 Ccd1 (24,162 FFIs, 64 cuts): 16 workers, ~15 min.
+        cut_mem_sug = '2G'
+        cut_mem_req = 32
         if self.sector in primary_mission:
-            cube_time_sug = '45:00'
-            cube_mem_sug = '20G'
-            cube_mem_req = 60
-
-            cut_time_sug = '10:00'
-            cut_mem_sug = '20G'
-            cut_mem_req = 20
+            cut_time_sug = '30:00'
 
             # scaled from the secondary tier's real benchmark by frame count -- ~1200 vs ~3600
             # FFIs/sector (30min vs 10min cadence, same ~27-day window) is the actual driver of
@@ -673,17 +648,7 @@ class Tessellate():
             plot_mem_req = 64
 
         elif self.sector in secondary_mission:
-            cube_time_sug = '1:45:00'
-            cube_mem_sug = '20G'
-            cube_mem_req = 140
-
-            # cut_time_sug = '2:00:00'
-            # cut_mem_sug = '20G'
-            # cut_mem_req = 60
-
-            cut_time_sug = '15:00'
-            cut_mem_sug = '20G'
-            cut_mem_req = 60
+            cut_time_sug = '30:00'
 
             # real-benchmarked (Sector 32, the only tier actually tested): max observed
             # 3 min / 3.6GB peak (Cam1 Ccd1 Cut57, 54 crossing tracks, 215 stage-2
@@ -733,15 +698,7 @@ class Tessellate():
             plot_mem_req = 64
 
         elif self.sector in tertiary_mission:
-            self.part = True
-
-            cube_time_sug = '6:00:00'
-            cube_mem_sug = '20G'
-            cube_mem_req = 200
-
-            cut_time_sug = '3:00:00'
-            cut_mem_sug = '20G'
-            cut_mem_req = 100
+            cut_time_sug = '1:00:00'
 
             # not itself benchmarked on a tertiary-mission sector. Scaled from the secondary
             # tier's real 3min/7:11 worst case by frame count -- ~12000 vs ~3600 FFIs/sector
@@ -753,18 +710,21 @@ class Tessellate():
             predict_asteroids_cpu_sug = '16'
             predict_asteroids_mem_req = 160
 
+            # whole sector in one cut TPF: Sector 98 (4 orbits, 18,318 good frames) Cam1 Ccd1 Cut10 peaked at
+            # 243 GiB in 40 min (32 CPUs) and was killed at 200G
             reduce_time_sug = '3:00:00'
             reduce_cpu_sug = '32'
-            reduce_mem_req = 200
+            reduce_mem_req = 300
 
             # scaled from the secondary tier's post-full-run-revision values (see there for why)
             asteroid_lightcurves_time_sug = '45:00'
             asteroid_lightcurves_cpu_sug = '16'
             asteroid_lightcurves_mem_req = 64
 
-            calibrate_time_sug = '10:00'
+            # detection limits load the whole reduced cube (~5 GB for a 4-orbit sector)
+            calibrate_time_sug = '30:00'
             calibrate_cpu_sug = '8'
-            calibrate_mem_req = 8
+            calibrate_mem_req = 64
 
             search_time_sug = '1:00:00'
             search_cpu_sug = '32'
@@ -775,20 +735,7 @@ class Tessellate():
             plot_cpu_sug = '32'
             plot_mem_req = 50
 
-        if self.direct_cuts:
-            # one pass over the FFIs, a few FFIs in memory per worker; disk-bound, so the time is a guess --
-            # not yet benchmarked on OzSTAR (local SSD: ~0.1 s CPU per FFI for 64 cuts + frame stats)
-            cube_mem_sug = '4G'
-            cube_mem_req = 32
-            if self.sector in primary_mission:
-                cube_time_sug = '1:00:00'
-            elif self.sector in secondary_mission:
-                cube_time_sug = '2:00:00'
-            else:
-                cube_time_sug = '4:00:00'
-
-        suggestions = [[cube_time_sug,cube_mem_sug,cube_mem_req],
-                       [cut_time_sug,cut_mem_sug,cut_mem_req],
+        suggestions = [[cut_time_sug,cut_mem_sug,cut_mem_req],
                        [reduce_time_sug,reduce_cpu_sug,reduce_mem_req],
                        [search_time_sug,search_cpu_sug,search_mem_req,search_time_bins],
                        [plot_time_sug,plot_cpu_sug,plot_mem_req],
@@ -874,155 +821,32 @@ class Tessellate():
             print(f'   - Cut = {"all" if cuts == list(all_cuts) else cuts}')
         self.cuts = all_cuts if cuts == list(all_cuts) else cuts
 
-    def _which_processes(self,download,make_cube,fix_wcs,make_cuts,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot,delete):
+    def _which_processes(self,download,make_cuts,fix_wcs,make_catalogues,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot,delete):
 
-        if download is None:
-            d = input('   - Download FFIs? [y/n] = ')
-            done = False
-            while not done:
-                if d.lower() == 'y':
-                    download = True
-                    done=True
-                elif d.lower() == 'n':
-                    download = False
-                    done=True
-                else:
-                    d = input('      Invalid choice! Download FFIs? [y/n] = ')
+        def ask(value, question):
+            if value is not None:
+                return value
+            d = input(f'   - {question}? [y/n] = ')
+            while d.lower() not in ('y', 'n'):
+                d = input(f'      Invalid choice! {question}? [y/n] = ')
+            return d.lower() == 'y'
 
-        if make_cube is None:
-            d = input('   - Make Cube(s)? [y/n] = ')
-            done = False
-            while not done:
-                if d.lower() == 'y':
-                    make_cube = True
-                    done=True
-                elif d.lower() == 'n':
-                    make_cube = False
-                    done=True
-                else:
-                    d = input('      Invalid choice! Make Cube(s)? [y/n] = ')
-
-        if fix_wcs is None:
-            d = input('   - Fix WCS? [y/n] = ')
-            done = False
-            while not done:
-                if d.lower() == 'y':
-                    fix_wcs = True
-                    done=True
-                elif d.lower() == 'n':
-                    fix_wcs = False
-                    done=True
-                else:
-                    d = input('      Invalid choice! Fix WCS? [y/n] = ')
-
-        if make_cuts is None:
-            d = input('   - Make Cut(s)? [y/n] = ')
-            done = False
-            while not done:
-                if d.lower() == 'y':
-                    make_cuts = True
-                    done=True
-                elif d.lower() == 'n':
-                    make_cuts = False
-                    done=True
-                else:
-                    d = input('      Invalid choice! Make Cut(s)? [y/n] = ')
-
-        if predict_asteroids is None:
-            d = input('   - Predict Asteroids on Cut(s)? [y/n] = ')
-            done = False
-            while not done:
-                if d.lower() == 'y':
-                    predict_asteroids = True
-                    done=True
-                elif d.lower() == 'n':
-                    predict_asteroids = False
-                    done=True
-                else:
-                    d = input('      Invalid choice! Predict Asteroids on Cut(s)? [y/n] = ')
-
-        if reduce is None:
-            d = input('   - Reduce Cut(s)? [y/n] = ')
-            done = False
-            while not done:
-                if d.lower() == 'y':
-                    reduce = True
-                    done=True
-                elif d.lower() == 'n':
-                    reduce = False
-                    done=True
-                else:
-                    d = input('      Invalid choice! Reduce Cut(s)? [y/n] = ')
-
-        if asteroid_lightcurves is None:
-            d = input('   - Build Asteroid Lightcurves on Cut(s)? [y/n] = ')
-            done = False
-            while not done:
-                if d.lower() == 'y':
-                    asteroid_lightcurves = True
-                    done=True
-                elif d.lower() == 'n':
-                    asteroid_lightcurves = False
-                    done=True
-                else:
-                    d = input('      Invalid choice! Build Asteroid Lightcurves on Cut(s)? [y/n] = ')
-
-        if calibrate is None:
-            d = input('   - Flux Calibrate Cut(s)? [y/n] = ')
-            done = False
-            while not done:
-                if d.lower() == 'y':
-                    calibrate = True
-                    done = True
-                elif d.lower() == 'n':
-                    calibrate = False
-                    done = True
-                else:
-                    d = input('      Invalid choice! Flux Calibrate Cut(s)? [y/n] = ')
-
-        if search is None:
-            d = input('   - Run Transient Search on Cut(s)? [y/n] = ')
-            done = False
-            while not done:
-                if d.lower() == 'y':
-                    search = True
-                    done=True
-                elif d.lower() == 'n':
-                    search = False
-                    done=True
-                else:
-                    d = input('      Invalid choice! Run Transient Search on Cut(s)? [y/n] = ')
-        
-        if plot is None:
-            d = input('   - Run Transient Plotting on Cut(s)? [y/n] = ')
-            done = False
-            while not done:
-                if d.lower() == 'y':
-                    plot = True
-                    done=True
-                elif d.lower() == 'n':
-                    plot = False
-                    done=True
-                else:
-                    d = input('      Invalid choice! Run Transient Plotting on Cut(s)? [y/n] = ')            
-
-        if delete is None:
-            d = input('   - Delete all FFIs upon completion? [y/n] = ')
-            done = False
-            while not done:
-                if d.lower() == 'y':
-                    delete = True
-                    done=True
-                elif d.lower() == 'n':
-                    delete = False
-                    done=True
-                else:
-                    d = input('      Invalid choice! Delete all FFIs upon completion? [y/n] = ')
+        download = ask(download, 'Download FFIs')
+        make_cuts = ask(make_cuts, 'Make Cut(s)')
+        fix_wcs = ask(fix_wcs, 'Fix WCS')
+        make_catalogues = ask(make_catalogues, 'Make Catalogues')
+        predict_asteroids = ask(predict_asteroids, 'Predict Asteroids on Cut(s)')
+        reduce = ask(reduce, 'Reduce Cut(s)')
+        asteroid_lightcurves = ask(asteroid_lightcurves, 'Build Asteroid Lightcurves on Cut(s)')
+        calibrate = ask(calibrate, 'Flux Calibrate Cut(s)')
+        search = ask(search, 'Run Transient Search on Cut(s)')
+        plot = ask(plot, 'Run Transient Plotting on Cut(s)')
+        delete = ask(delete, 'Delete all FFIs upon completion')
 
         print('\n')
 
-        return download, make_cube, fix_wcs, make_cuts, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot, delete
-    
+        return download, make_cuts, fix_wcs, make_catalogues, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot, delete
+
     def _download_properties(self):
         """
         Confirm download process properties.
@@ -1055,79 +879,35 @@ class Tessellate():
         
         print('\n')
     
-    def _cube_properties(self,suggestions,use_suggestions):
+    def _catalogue_properties(self,making_cuts):
         """
-        Confirm cube generation process properties.
+        Confirm catalogue-making properties: only n and the cuts, set here unless make_cuts already did.
+        Catalogues are built in this process (head node), so there are no job resources to ask for.
         """
 
-        if self.cube_time is None:
-            if use_suggestions:
-                self.cube_time = suggestions[0]
-                print(f'   - Cube Batch Time = {self.cube_time}')
-            else:
-                cube_time = input(f"   - Cube Batch Time ['h:mm:ss'] ({suggestions[0]} suggested) = ")
+        if not making_cuts:
+            if self.n is None:
+                n = input('   - n (Number of Cuts = n^2) = ')
                 done = False
                 while not done:
-                    if ':' in cube_time:
-                        self.cube_time = cube_time
-                        done = True
-                    else:
-                        cube_time = input(f"      Invalid format! Cube Batch Time ['h:mm:ss'] ({suggestions[0]} suggested) = ")
-        else:
-            print(f'   - Cube Batch Time = {self.cube_time}')
-
-        
-        if self.cube_mem is None:
-            if use_suggestions:
-                self.cube_mem = int(suggestions[1][:-1])
-                print(f'   - Cube Mem/CPU = {self.cube_mem}G')
-            else:
-                cube_mem = input(f"   - Cube Mem/CPU ({suggestions[1]} suggested) = ")
-                done = False
-                while not done:
-                    try: 
-                        cube_mem = int(cube_mem)
-                        if 0<cube_mem < 500:
-                            self.cube_mem = cube_mem
-                            done=True
-                        else:
-                            cube_mem = input(f"      Invalid format! Cube Mem/CPU ({suggestions[1]} suggested) = ")
-                    except:
-                        if cube_mem[-1].lower() == 'g':
-                            self.cube_mem = cube_mem[:-1]
+                    try:
+                        n = int(n)
+                        if n > 0:
+                            self.n = n
                             done = True
                         else:
-                            cube_mem = input(f"      Invalid format! Cube Mem/CPU ({suggestions[1]} suggested) = ")
-
-        elif 0 < self.cube_mem < 500:
-            print(f'   - Cube Mem/CPU = {self.cube_mem}G')
-        else:
-            e = f"Invalid Cube Mem/CPU Input of {self.cube_mem}\n"
-            raise ValueError(e)
-        
-                
-        if type(self.download_number) == int:
-            cube_cpu = input(f"   - Cube Num CPUs [1-32] = ")
-            done = False
-            while not done:
-                try:
-                    cube_cpu = int(cube_cpu)
-                    if 0 < cube_cpu < 33:
-                        self.cube_cpu = cube_cpu
-                        done = True
-                    else:
-                        cube_cpu = input(f"      Invalid format! Cube Num CPUs [1-32] = ")
-                except:
-                    cube_cpu = input(f"      Invalid format! Cube Num CPUs [1-32] = ")
-        else:
-            if suggestions[2] % int(self.cube_mem) != 0:
-                self.cube_cpu = suggestions[2] // int(self.cube_mem) + 1
+                            n = input('      Invalid choice! n (Number of Cuts = n^2) =  ')
+                    except:
+                        n = input('      Invalid choice! n (Number of Cuts = n^2) =  ')
+            elif self.n > 0:
+                print(f'   - n (Number of Cuts = n^2) = {self.n}')
             else:
-                self.cube_cpu = suggestions[2] // int(self.cube_mem)
+                e = f"Invalid 'n' value Input of {self.n}\n"
+                raise ValueError(e)
 
-            print(f'   - Cube Num CPUs Needed = {self.cube_cpu}')
+            self._choose_cuts()
 
-        print('\n')
+            print('\n')
 
     def _cut_properties(self,suggestions,use_suggestions):
         """
@@ -1885,13 +1665,13 @@ class Tessellate():
 
         print('\n')
     
-    def _overwrite_suggestions(self, make_cube, make_cuts, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot):
+    def _overwrite_suggestions(self, make_cuts, make_catalogues, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot):
 
         options = []
-        if make_cube:
-            options.append('cube')
         if make_cuts:
             options.append('cut')
+        if make_catalogues:
+            options.append('catalogues')
         if predict_asteroids:
             options.append('asteroids')
         if reduce:
@@ -1919,7 +1699,7 @@ class Tessellate():
                 self.overwrite = (over.replace(' ','')).split(',')
                 good = True
                 for thing in self.overwrite:
-                    if thing not in ['cube','cut','asteroids','reduce','lightcurves','calibrate','search','plot']:
+                    if thing not in ['cut','catalogues','asteroids','reduce','lightcurves','calibrate','search','plot']:
                         good = False
                 if good:
                     done = True
@@ -1929,7 +1709,7 @@ class Tessellate():
         
         print('\n')
     
-    def _write_config(self,download,make_cube, fix_wcs, make_cuts, predict_asteroids, reduce, asteroid_lightcurves, calibrate, search, plot,delete):
+    def _write_config(self,download,make_cuts,fix_wcs,make_catalogues,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot,delete):
 
         config = {
             "base": {
@@ -1943,18 +1723,7 @@ class Tessellate():
                 'download' : True,
                 'download_number' : self.download_number}
 
-        if make_cube:
-            config['make_cubes'] = {
-                'make_cubes' : True,
-                'cube job time' : self.cube_time,
-                'cube job memory' : self.cube_mem,
-                'cube job cpu' : self.cube_cpu}
-
-        if fix_wcs:
-            config['fix_wcs'] = {
-                'fix_wcs' : True}
-
-        if make_cuts | predict_asteroids | reduce | asteroid_lightcurves | calibrate | search | plot:
+        if make_cuts | make_catalogues | predict_asteroids | reduce | asteroid_lightcurves | calibrate | search | plot:
             config['cut_properties'] = {
                 'n' : self.n,
                 'cuts' : list(self.cuts)}
@@ -1965,6 +1734,14 @@ class Tessellate():
                 'cut job time' : self.cut_time,
                 'cut job memory' : self.cut_mem,
                 'cut job cpu' : self.cut_cpu}
+
+        if fix_wcs:
+            config['fix_wcs'] = {
+                'fix_wcs' : True}
+
+        if make_catalogues:
+            config['make_catalogues'] = {
+                'make_catalogues' : True}
 
         if predict_asteroids:
             config['predict_asteroids'] = {
@@ -2027,14 +1804,12 @@ class Tessellate():
                 f.write("\n")
 
         
-    def _reset_logs(self,make_cube,make_cuts,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot):
+    def _reset_logs(self,make_cuts,predict_asteroids,reduce,asteroid_lightcurves,calibrate,search,plot):
         """
         Reset slurm job logs in provided output path.
         """
 
         if input('Delete Past Job Logs? [y/n] :\n').lower() == 'y':
-            if make_cube:
-                os.system(f'rm -f {self.job_output_path}/tessellate_cubing_logs/*')
             if make_cuts:
                 os.system(f'rm -f {self.job_output_path}/tessellate_cutting_logs/*')
             if predict_asteroids:
@@ -2074,242 +1849,151 @@ class Tessellate():
                     # print(f'Sector {self.sector} Cam {cam} Ccd {ccd} Download Complete ({((t()-tDownload)/60):.2f} mins).')
                     print('\n')
 
-#     def make_cube(self,overwrite=True):
-#         """
-#         Make Cube! 
+    def _ccd_cuts_done(self,cam,ccd):
+        """True if every requested cut of this CCD has been made (cut.txt) and its frame stats saved."""
 
-#         Process : Generates a python script for generating cube, then generates and submits a slurm script to call the python script.
-#         """
+        ccd_path = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}'
+        stats = f'{ccd_path}/sector{self.sector}_cam{cam}_ccd{ccd}_frame_stats.npz'
+        return os.path.exists(stats) and all(os.path.exists(f'{ccd_path}/Cut{cut}of{self.n**2}/cut.txt')
+                                             for cut in self.cuts)
 
-#         _Save_space(f'{self.working_path}/cubing_scripts')
+    def _ccd_cut_job(self,cam,ccd,time=None):
+        """
+        Generates a python script that cuts one CCD's FFIs into its cuts (DataProcessor.make_cuts), then
+        generates and submits a slurm script to run it. Returns the submitted job_id.
+        """
 
-#         # # -- Delete old scripts -- #
-#         # os.system(f'rm -f {self.working_path}/cubing_scripts/S{self.sector}C*')
+        if time is None:
+            time = self.cut_time
 
-#         if overwrite & (self.overwrite is not None):
-#             if (self.overwrite == 'all') | ('cube' in self.overwrite):
-#                 delete_files('cubes',self.data_path,self.sector,self.n,self.cam,self.ccd,part=self.part)
-
-#         for cam in self.cam:
-#             for ccd in self.ccd: 
-#                 print(_Print_buff(60,f'Making Cube for Sector{self.sector} Cam{cam} Ccd{ccd}'))
-#                 print('\n')
-
-#                 # -- Generate Cube Path -- #
-#                 cube_check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/cubed.txt'
-#                 if os.path.exists(cube_check):
-#                     print(f'Cam {cam} CCD {ccd} cube already exists!')
-#                     print('\n')
-#                 else:
-
-#                     # -- Create python file for cubing-- # 
-#                     print(f'Creating Cubing Python File for Sector{self.sector} Cam{cam}Ccd{ccd}')
-#                     python_text = f"\
-# from tessellate import DataProcessor\n\
-# \n\
-# processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=2)\n\
-# processor.make_cube(cam={cam},ccd={ccd},part={self.part})\n\
-# with open(f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/cubed.txt', 'w') as file:\n\
-#     file.write('Cubed!')"   
-                
-#                     with open(f"{self.working_path}/cubing_scripts/S{self.sector}C{cam}C{ccd}_script.py", "w") as python_file:
-#                         python_file.write(python_text)
-
-#                     # -- Create bash file to submit job -- #
-#                     #print('Creating Cubing Batch File')
-#                     batch_text = f'\
-# #!/bin/bash\n\
-# #\n\
-# #SBATCH --job-name=TESS_S{self.sector}_Cam{cam}_Ccd{ccd}_Cubing\n\
-# #SBATCH --output={self.job_output_path}/tessellate_cubing_logs/%A_%x_job_output.txt\n\
-# #SBATCH --error={self.job_output_path}/tessellate_cubing_logs/%A_%x_errors.txt\n\
-# #\n\
-# #SBATCH --ntasks=1\n\
-# #SBATCH --time={self.cube_time}\n\
-# #SBATCH --cpus-per-task={self.cube_cpu}\n\
-# #SBATCH --mem-per-cpu={self.cube_mem}G\n\
-# #SBATCH --account=oz335\n\
-# \n\
-# PYTHONUNBUFFERED=1\n\
-# source {VENV_PATH}/bin/activate\n\
-# python {self.working_path}/cubing_scripts/S{self.sector}C{cam}C{ccd}_script.py'
-#                     with open(f"{self.working_path}/cubing_scripts/S{self.sector}C{cam}C{ccd}_script.sh", "w") as batch_file:
-#                         batch_file.write(batch_text)
-
-#                     # -- Submit job -- #
-#                     #print('Submitting Cubing Batch File')
-#                     os.system(f'sbatch {self.working_path}/cubing_scripts/S{self.sector}C{cam}C{ccd}_script.sh')
-#                     print('\n')
-
-#     def fix_wcs(self,cubing):
-#         """
-#         Calls the WCSfixer class to find the best reference image, PSF fit stars, and update WCS information.
-#         """
-
-#         from .WCSfixer import TessFixer
-
-#         tf = TessFixer(sector=self.sector,data_path=self.data_path)
-#         for cam in self.cam:
-#             for ccd in self.ccd: 
-#                 print(_Print_buff(60,f'Running WCSfixer for Sector{self.sector} Cam{cam} Ccd{ccd}'))
-#                 print('\n')
-
-#                 cube_check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/cubed.txt'
-#                 if not os.path.exists(cube_check):
-#                     if not cubing:
-#                         e = 'No Cube File Detected to Cut!\n'
-#                         raise ValueError(e)
-#                     else:
-#                         tStart = t()
-#                         l = self.cube_time.split(':')
-#                         seconds = 1 * int(l[-1]) + 60 * int(l[-2])
-#                         if len(l) == 3:
-#                             seconds += 3600 * int(l[-3])
-
-#                         if (len(self.cam)>1) | (len(self.ccd)>1): 
-#                             seconds = 42300
-
-#                         go = False
-#                         message = 'Waiting for Cube'
-#                         i = 0
-#                         while not go:
-#                             if t()-tStart > seconds + 3600:
-#                                 print('Restarting Cubing')
-#                                 print('\n')
-#                                 self.make_cube(overwrite=False)
-#                                 tStart = t()
-#                             else:
-#                                 if i > 0:
-#                                     print(message, end='\r')
-#                                     sleep(120)
-#                                 if os.path.exists(cube_check):
-#                                     go = True
-#                                     print('\n')
-#                                 else:
-#                                     message += '.'
-#                                     i += 1
-
-#                 # -- Generate Cube Path -- #
-#                 wcs_check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/wcs/ref/polyfit_coeffs.txt'
-#                 if os.path.exists(wcs_check):
-#                     print(f'Cam {cam} CCD {ccd} wcs already fixed!')
-#                 else:
-#                     tf.run(cam,ccd)
-#                 print('\n')
-
-    def _cam_ccd_cube(self, cam, ccd, time=None):
-            """
-            Generates a python script for generating a single cube, then generates and
-            submits a slurm script to call it. Returns the submitted job_id.
-            """
-
-            if time is None:
-                time = self.cube_time
-
-            if self.direct_cuts:
-                make_call = (f'processor.make_direct_cuts(cam={cam},ccd={ccd},n={self.n},'
-                             f'cuts={[int(c) for c in self.cuts]},part={self.part})')
-            else:
-                make_call = f'processor.make_cube(cam={cam},ccd={ccd},part={self.part})'
-
-            # -- Create python file for cubing-- #
-            print(f'Creating Cubing Python File for Sector{self.sector} Cam{cam}Ccd{ccd}')
-            python_text = f"\
+        # -- Create python file for cutting -- #
+        print(f'Creating Cutting Python File for Sector{self.sector} Cam{cam} Ccd{ccd}')
+        python_text = f"\
 from tessellate import DataProcessor\n\
 \n\
-processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=2)\n\
-{make_call}\n\
-with open(f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/cubed.txt', 'w') as file:\n\
-    file.write('Cubed!')"
+processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=1)\n\
+processor.make_cuts(cam={cam},ccd={ccd},n={self.n},cuts={[int(c) for c in self.cuts]})"
 
-            with open(f"{self.working_path}/cubing_scripts/S{self.sector}C{cam}C{ccd}_script.py", "w") as python_file:
-                python_file.write(python_text)
+        with open(f"{self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}_script.py", "w") as python_file:
+            python_file.write(python_text)
 
-            # -- Create bash file to submit job -- #
-            batch_text = f'\
+        # -- Create bash file to submit job -- #
+        batch_text = f'\
 #!/bin/bash\n\
 #\n\
-#SBATCH --job-name=TESS_S{self.sector}_Cam{cam}_Ccd{ccd}_Cubing\n\
-#SBATCH --output={self.job_output_path}/tessellate_cubing_logs/%A_%x_job_output.txt\n\
-#SBATCH --error={self.job_output_path}/tessellate_cubing_logs/%A_%x_errors.txt\n\
+#SBATCH --job-name=TESS_S{self.sector}_Cam{cam}_Ccd{ccd}_Cutting\n\
+#SBATCH --output={self.job_output_path}/tessellate_cutting_logs/%A_%x_job_output.txt\n\
+#SBATCH --error={self.job_output_path}/tessellate_cutting_logs/%A_%x_errors.txt\n\
 #\n\
 #SBATCH --ntasks=1\n\
 #SBATCH --time={time}\n\
-#SBATCH --cpus-per-task={self.cube_cpu}\n\
-#SBATCH --mem-per-cpu={self.cube_mem}G\n\
+#SBATCH --cpus-per-task={self.cut_cpu}\n\
+#SBATCH --mem-per-cpu={self.cut_mem}G\n\
 #SBATCH --account=oz335\n\
 \n\
 export PYTHONUNBUFFERED=1\n\
-{sys.executable} {self.working_path}/cubing_scripts/S{self.sector}C{cam}C{ccd}_script.py'
-            
-            with open(f"{self.working_path}/cubing_scripts/S{self.sector}C{cam}C{ccd}_script.sh", "w") as batch_file:
-                batch_file.write(batch_text)
+{sys.executable} {self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}_script.py'
 
-            # -- Submit job -- #
-            submission = os.popen(f'sbatch {self.working_path}/cubing_scripts/S{self.sector}C{cam}C{ccd}_script.sh').read()
-            job_id = submission.strip().split()[-1]
-            print('\n')
-            return job_id
+        with open(f"{self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}_script.sh", "w") as batch_file:
+            batch_file.write(batch_text)
 
-    def make_cube(self,overwrite=True):
+        job_id = _Submit_sbatch(f'{self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}_script.sh')
+        print(f'Submitted batch job {job_id}')
+        print('\n')
+        return job_id
+
+    def make_cuts(self,overwrite=True):
         """
-        Make Cube!
+        Make Cuts!
 
-        Process : Generates a python script for generating cube, then generates and submits a slurm script to call the python script.
-        Returns a cube_status dict keyed by (cam,ccd), matching the structure produced by reduce().
+        One job per CCD reads its FFIs once and writes every requested cut's TPF directly (no cube), plus
+        the per-frame stats fix_wcs ranks reference frames on. Returns a cut_status dict keyed by (cam,ccd)
+        for fix_wcs / make_catalogues to wait on.
         """
 
-        _Save_space(f'{self.working_path}/cubing_scripts')
-
-        cube_status = {}
+        _Save_space(f'{self.working_path}/cutting_scripts')
 
         if overwrite & (self.overwrite is not None):
-            if (self.overwrite == 'all') | ('cube' in self.overwrite):
-                delete_files('cubes',self.data_path,self.sector,self.n,self.cam,self.ccd,part=self.part)
-            if self.direct_cuts and ((self.overwrite == 'all') | ('cut' in self.overwrite)):
-                delete_files('cuts',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts,part=self.part)
-                delete_files('cubes',self.data_path,self.sector,self.n,self.cam,self.ccd,part=self.part)
+            if (self.overwrite == 'all') | ('cut' in self.overwrite):
+                delete_files('cuts',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts)
 
+        cut_status = {}
         for cam in self.cam:
-            for ccd in self.ccd: 
-                print(_Print_buff(60,f'Making Cube for Sector{self.sector} Cam{cam} Ccd{ccd}'))
+            for ccd in self.ccd:
+                print(_Print_buff(60,f'Making Cut(s) for Sector{self.sector} Cam{cam} Ccd{ccd}'))
                 print('\n')
 
-                cube_status[(cam,ccd)] = {'status': None, 'job_id': None, 'job_time': None}
-
-                # -- Generate Cube Path -- #
-                cube_check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/cubed.txt'
-                if os.path.exists(cube_check):
-                    print(f'Cam {cam} CCD {ccd} cube already exists!')
+                cut_status[(cam,ccd)] = {'status': None, 'job_id': None, 'job_time': None}
+                if self._ccd_cuts_done(cam,ccd):
+                    print(f'Cam {cam} CCD {ccd} cuts already made!')
                     print('\n')
-                    cube_status[(cam,ccd)]['status'] = 'COMPLETED'
+                    cut_status[(cam,ccd)]['status'] = 'COMPLETED'
                 else:
-                    job_id = self._cam_ccd_cube(cam,ccd)
-                    cube_status[(cam,ccd)]['status'] = 'INCOMPLETE'
-                    cube_status[(cam,ccd)]['job_id'] = job_id
-                    cube_status[(cam,ccd)]['job_time'] = self.cube_time
+                    job_id = self._ccd_cut_job(cam,ccd)
+                    cut_status[(cam,ccd)].update(status='INCOMPLETE', job_id=job_id, job_time=self.cut_time)
 
-        return cube_status
+        return cut_status
 
-    def fix_wcs(self,cube_status):
+    def _cuts_ready(self,cut_status):
         """
-        Calls the WCSfixer class to find the best reference image, PSF fit stars, and update WCS information.
-
-        cube_status : either
-            - False : cubing is not currently running. If a cube already exists for a given
-                      cam/ccd, proceed; otherwise raise an error.
-            - dict  : as returned by make_cube(), keyed by (cam,ccd) with 'status'/'job_id'/
-                      'job_time'. fix_wcs waits on incomplete cubing jobs (restarting on
-                      timeout), and runs the WCS fix for each cam/ccd as soon as its cube
-                      is ready, rather than waiting for all cubes to finish first.
+        Yields (cam,ccd) as each CCD's cuts become available: at once if already made, else when its cutting
+        job (from make_cuts' cut_status) completes. A timed-out job is resubmitted with 30 more minutes.
+        cut_status=False means no cutting job is running, so the cuts must already exist.
         """
 
         from datetime import timedelta
+
+        waiting = []
+        for cam in self.cam:
+            for ccd in self.ccd:
+                if self._ccd_cuts_done(cam,ccd):
+                    yield cam, ccd
+                elif cut_status is False or cut_status.get((cam,ccd), {}).get('job_id') is None:
+                    e = f'Cuts missing for Cam {cam} CCD {ccd} -- run make_cuts first!\n'
+                    raise ValueError(e)
+                else:
+                    waiting.append((cam,ccd))
+
+        i = 0
+        while waiting:
+            for key in list(waiting):
+                cam, ccd = key
+                job_id = cut_status[key]['job_id']
+                job_status = _Check_job_status(job_id)
+                if job_status == 'COMPLETED':
+                    if not self._ccd_cuts_done(cam,ccd):
+                        e = f'Cutting job {job_id} for Cam {cam} CCD {ccd} finished but cuts are missing -- check its log\n'
+                        raise ValueError(e)
+                    cut_status[key]['status'] = 'COMPLETED'
+                    waiting.remove(key)
+                    yield cam, ccd
+                elif job_status == 'TIMEOUT':
+                    parts = list(map(int, cut_status[key]['job_time'].split(':')))
+                    h, m, sec = parts if len(parts) == 3 else [0] + parts
+                    total = int((timedelta(hours=h, minutes=m, seconds=sec) + timedelta(minutes=30)).total_seconds())
+                    result = f"{total // 3600}:{(total % 3600) // 60:02}:{total % 60:02}"
+                    print(f'Restarting Cutting for Cam {cam} CCD {ccd} with new time limit of {result}')
+                    cut_status[key].update(job_id=self._ccd_cut_job(cam,ccd,time=result), job_time=result)
+                elif job_status not in ['RUNNING','PENDING','COMPLETING','CONFIGURING','SUSPENDED']:
+                    e = f'Job {job_id} for cutting of Cam {cam} CCD {ccd} has unexpected status: {job_status}\n'
+                    raise ValueError(e)
+
+            if waiting:
+                print('Waiting for Cuts' + i*'.', end='\r')
+                sleep(120)
+                i += 1
+
+    def fix_wcs(self,cut_status=False):
+        """
+        Calls the WCSfixer class to find the best reference frame (from the cuts' frame stats), PSF fit stars,
+        and fit the corrected WCS -- for each cam/ccd as soon as its cuts are ready (see _cuts_ready).
+        """
+
         from .WCSfixer import TessFixer
 
         tf = TessFixer(sector=self.sector,data_path=self.data_path)
 
-        def _run_wcs_fix(cam,ccd):
+        for cam, ccd in self._cuts_ready(cut_status):
             print(_Print_buff(60,f'Running WCSfixer for Sector{self.sector} Cam{cam} Ccd{ccd}'))
             print('\n')
 
@@ -2320,292 +2004,83 @@ export PYTHONUNBUFFERED=1\n\
                 tf.run(cam,ccd)
             print('\n')
 
-        if cube_status is False:
-            # ---- no cubing job running: cube must already exist ----
-            for cam in self.cam:
-                for ccd in self.ccd:
-                    cube_check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/cubed.txt'
-                    if not os.path.exists(cube_check):
-                        e = 'No Cube File Detected to Cut!\n'
-                        raise ValueError(e)
-                    _run_wcs_fix(cam,ccd)
-            return
-
-        # ---- cube_status is a dict: interleave waiting with WCS fixing ----
-        waiting_status = {}
-        for cam in self.cam:
-            for ccd in self.ccd:
-                cube_check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/cubed.txt'
-                if os.path.exists(cube_check):
-                    waiting_status[(cam,ccd)] = 'COMPLETED'
-                else:
-                    waiting_status[(cam,ccd)] = 'INCOMPLETE'
-
-        i = 0
-        while len(waiting_status.keys()) > 0:
-
-            for key in list(waiting_status.keys()):
-                cam, ccd = key
-                if waiting_status[key] == 'COMPLETED':
-                    _run_wcs_fix(cam,ccd)
-                    del(waiting_status[key])
-
-                elif cube_status[key]['status'] == 'COMPLETED':
-                    _run_wcs_fix(cam,ccd)
-                    del(waiting_status[key])
-
-                else:
-                    job_id = cube_status[key]['job_id']
-                    job_status = _Check_job_status(job_id)
-                    # if job_status == 'FAILED':
-                    #     print(f'Cubing Failed for Cam {cam} CCD {ccd}')
-                    #     print('\n')
-                    #     del(waiting_status[key])
-                    if job_status == 'TIMEOUT':
-                        parts = list(map(int, cube_status[key]['job_time'].split(':')))
-                        if len(parts) == 3:
-                            h, m, s = parts
-                        else:
-                            h = 0
-                            m, s = parts
-
-                        td = timedelta(hours=h, minutes=m, seconds=s)
-                        td += timedelta(minutes=30)
-                        total = int(td.total_seconds())
-                        h = total // 3600
-                        m = (total % 3600) // 60
-                        s = total % 60
-                        result = f"{h}:{m:02}:{s:02}"
-
-                        print(f'Restarting Cubing for Cam {cam} CCD {ccd} with new time limit of {result}')
-                        job_id = self._cam_ccd_cube(cam,ccd,time=result)
-                        cube_status[key]['job_id'] = job_id
-                        cube_status[key]['job_time'] = result
-
-                    elif job_status == 'COMPLETED':
-                        cube_status[key]['status'] = job_status
-                        _run_wcs_fix(cam,ccd)
-                        del(waiting_status[key])
-
-                    elif job_status not in ['RUNNING','PENDING','COMPLETING','CONFIGURING','SUSPENDED']:
-                        e = f'Job {job_id} for cubing of Cam {cam} CCD {ccd} has unexpected status: {job_status}\n'
-                        raise ValueError(e)
-
-            if len(waiting_status.keys()) > 0:
-                print('Waiting for Cubes' + i*'.', end='\r')
-                sleep(600)
-                i += 1
-                    
-
-    def _get_catalogues(self,cam,ccd,base_path):
+    def make_catalogues(self,cut_status=False,overwrite=True):
         """
-        Access internet, find Gaia sources and save for reduction.
+        Make Catalogues!
+
+        For every cut, once its CCD is cut and its WCS fixed: write the corrected WCS (CutWCS) into the cut's
+        TPF (what tessreduce's tpf.wcs reads), cut the CCD's Gaia catalogue (from fix_wcs) down to the cut,
+        and query the variable-star catalogue. Runs in this process: the variable catalogue needs the internet.
         """
 
-        # print('Importing .dataprocessor, .catalog_queries')
         from .dataprocessor import DataProcessor
         from .localisation import CutWCS
-        from .catalog_queries import create_external_var_cat, create_external_gaia_cat
+        from .catalog_queries import create_external_var_cat
         import pandas as pd
         import warnings
         warnings.filterwarnings("ignore")
-        # print('Done!')
-        # print('\n')
 
+        if overwrite & (self.overwrite is not None):
+            if (self.overwrite == 'all') | ('catalogues' in self.overwrite):
+                delete_files('catalogues',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts)
 
         data_processor = DataProcessor(sector=self.sector,data_path=self.data_path,verbose=self.verbose)
-        _,_,cutCentreCoords,cutRadPx = data_processor.find_cuts(cam=cam,ccd=ccd,n=self.n,plot=False)
-        rad = cutRadPx + 2*60/21
 
-        #image_path = glob(f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/*ffic.fits')[0]
+        for cam, ccd in self._cuts_ready(cut_status):
+            print(_Print_buff(60,f'Making Catalogues for Sector{self.sector} Cam{cam} Ccd{ccd}'))
+            print('\n')
 
-        l = self.cut_time.split(':')
-        seconds = 1 * int(l[-1]) + 60 * int(l[-2])
-        if len(l) == 3:
-            seconds += 3600 * int(l[-3])
+            ccd_path = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}'
+            if not os.path.exists(f'{ccd_path}/wcs/ref/corrected.fits'):
+                e = f'No corrected WCS for Cam {cam} CCD {ccd} -- run fix_wcs first!\n'
+                raise ValueError(e)
 
-        if (len(self.cam)>1) | (len(self.ccd)>1): 
-            seconds = 42300
+            _,_,cutCentreCoords,cutRadPx = data_processor.find_cuts(cam=cam,ccd=ccd,n=self.n,plot=False)
+            rad = cutRadPx + 2*60/21
+            gaia_ccd = None
 
-        # -- Waits for cuts to be completed. If max time exceeded , return not done so cut process is restarted -- #
-        gaia_ccd = None
-        completed = []
-        message = 'Waiting for Cuts'
-        timeStart = t()
-        done = True
-        i = 0
-        while len(completed) < len(self.cuts):
-            if (t()-timeStart) > seconds + 600:
-                done = False
-                break
-            else:
-                if i > 0:
-                    print(message, end='\r')
-                    sleep(120)
-                message += '.'
-                for cut in self.cuts:
-                    if cut not in completed:
-                        save_path = f'{base_path}/Cut{cut}of{self.n**2}'
-                        if self.direct_cuts and os.path.exists(f'{save_path}/cut.txt'):
-                            # -- direct cuts: put TessFixer's WCS in the TPF, for tessreduce's tpf.wcs -- #
-                            data_processor.stamp_cut_wcs(cam,ccd,self.n,cut,part=int(base_path[-1]) if self.part else False)
-                        if table_exists(f'{save_path}/variable_catalog.csv') & os.path.exists(f'{save_path}/local_gaia_cat.csv'):
-                            completed.append(cut)
-                        elif os.path.exists(f'{save_path}/cut.txt'):
+            for cut in self.cuts:
+                save_path = f'{ccd_path}/Cut{cut}of{self.n**2}'
+                if os.path.exists(f'{save_path}/catalogued.txt'):
+                    print(f'Cam {cam} CCD {ccd} Cut {cut} catalogues already made!')
+                    continue
 
-                            wcs = CutWCS(data_path=self.data_path,sector=self.sector,cam=cam,ccd=ccd,cut=cut,n=self.n)
+                print(f'Generating Catalogues {cut}')
 
-                            #try:
-                            print(f'Generating Catalogues {cut}')
-                            if os.path.exists(f'{save_path}/local_gaia_cat.csv'):
-                                print('--Gaia catalog already made, skipping.')
-                            else:      # its time to move external_save_cat to tessellate, this import takes ages!!             
-                                # cutPath = f'{save_path}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{self.n**2}.fits'
+                # -- the corrected WCS into the cut's TPF (replacing the cutter's linear FFI fit) -- #
+                data_processor.stamp_cut_wcs(cam=cam,ccd=ccd,n=self.n,cut=cut)
 
-                                if gaia_ccd is None:
-                                    gaia_ccd = pd.read_csv(f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/ccd_gaia_cat.csv')
+                wcs = CutWCS(data_path=self.data_path,sector=self.sector,cam=cam,ccd=ccd,cut=cut,n=self.n)
+                if gaia_ccd is None:
+                    gaia_ccd = pd.read_csv(f'{ccd_path}/ccd_gaia_cat.csv')
+                gaia_ccd['x'],gaia_ccd['y'] = wcs.all_world2pix(gaia_ccd.ra,gaia_ccd.dec,0)
+                gaia_cut = gaia_ccd[(gaia_ccd.x > -2)&
+                                    (gaia_ccd.x < cutRadPx*2+2)&
+                                    (gaia_ccd.y > -2)&
+                                    (gaia_ccd.y < cutRadPx*2+2)]
+                gaia_cut = gaia_cut.drop(columns=['x','y'])
+                gaia_cut.to_csv(f'{save_path}/local_gaia_cat.csv',index=False)
 
-                                # doneGaia = False
-                                # attempt = 1
-                                # while not doneGaia:
-                                    # try:
-                                gaia_ccd['x'],gaia_ccd['y'] = wcs.all_world2pix(gaia_ccd.ra,gaia_ccd.dec,0)
-                                gaia_cut = gaia_ccd[(gaia_ccd.x > -2)&
-                                                    (gaia_ccd.x < cutRadPx*2+2)&
-                                                    (gaia_ccd.y > -2)&
-                                                    (gaia_ccd.y < cutRadPx*2+2)]
-                                gaia_cut = gaia_cut.drop(columns=['x','y'])
-                                gaia_cut.to_csv(f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/local_gaia_cat.csv',index=False)
-                                    
-
-                                        # create_external_gaia_cat(centre=cutCentreCoords[cut-1],size=rad*2,wcs=wcs,save_path=save_path,maglim=19,verbose=self.verbose>1) # oversize radius by 2 arcmin in terms of tess pixels
-                                        # create_external_gaia_cat(tpf=cutPath,save_path=save_path,maglim=19,verbose=self.verbose>1) # oversize radius by 2 arcmin in terms of tess pixels
-                                    # doneGaia = True
-                                    # except Exception as e:
-                                    #     print(f"--GAIA Catalogue Attempt {attempt} failed with error: {e}")
-                                    #     sleep(120)
-                                    #     attempt += 1
-
-                            
-                            if table_exists(f'{save_path}/variable_catalog.csv'):
-                                print('--Variable catalog already made, skipping.')
-                            else:
-                                rad2 = rad*21/60**2
-                                doneVar = False
-                                attempt = 1
-                                while not doneVar:
-                                    try:
-                                        create_external_var_cat(center=cutCentreCoords[cut-1],
-                                                                size=rad2,save_path=save_path,verbose=self.verbose>1) # This one queries in degrees!!!!
-                                        doneVar = True
-                                    except Exception as e:
-                                        print(f"--Variable Catalogue Attempt {attempt} failed with error: {e}")
-                                        sleep(120)
-                                        attempt+=1
-
-                            completed.append(cut)
-
-                i += 1
-
-        return done
-
-    def make_cuts(self,overwrite=True):
-        """
-        Make cuts! 
-
-            Cube_time_sug : dictates how long the cube process should run for, cubing is restarted if need be.
-            Cut_time_sug : dictates how long the cut process should run for, cutting is restarted if need be.
-        """
-
-        _Save_space(f'{self.working_path}/cutting_scripts')
-
-        # # -- Delete old scripts -- #
-        # os.system(f'rm -f {self.working_path}/cutting_scripts/S{self.sector}C*')
-
-        if overwrite & (self.overwrite is not None) & (not self.direct_cuts):   # direct cuts: deleted in make_cube
-            if (self.overwrite == 'all') | ('cut' in self.overwrite):
-                delete_files('cuts',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts,part=self.part)
-
-        for cam in self.cam:
-            for ccd in self.ccd: 
-                print(_Print_buff(60,f'Making Cut(s) for Sector{self.sector} Cam{cam} Ccd{ccd}')) 
-                print('\n')
-                
-                for cut in self.cuts:
-                    go = False
-                    if self.part:
-                        cut_check1 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part1/Cut{cut}of{self.n**2}/cut.txt'
-                        cut_check2 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part2/Cut{cut}of{self.n**2}/cut.txt'
-                        if (os.path.exists(cut_check1)) & (os.path.exists(cut_check2)):
-                            print(f'Cam {cam} CCD {ccd} cut {cut} already made!')
-                            print('\n')
-                        else:
-                            go = True
-                    else:
-                        cut_check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/cut.txt'
-                        if os.path.exists(cut_check):
-                            print(f'Cam {cam} CCD {ccd} cut {cut} already made!')
-                            print('\n')
-                        else:
-                            go = True
-                    if go and self.direct_cuts:
-                        e = (f'Cam {cam} CCD {ccd} cut {cut} missing after direct cutting -- check the cubing job log, '
-                             'then rerun make_cube\n')
-                        raise ValueError(e)
-                    if go:
-                        # -- Create python file for cubing, cutting, reducing a cut-- # 
-                        print(f'Creating Cutting Python File for Sector{self.sector} Cam{cam} Ccd{ccd} Cut{cut}')
-                        python_text = f"\
-from tessellate import DataProcessor\n\
-\n\
-part = {self.part}\n\
-processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=2)\n\
-processor.make_cuts(cam={cam},ccd={ccd},n={self.n},cut={cut},part=part)\n\
-if not part:\n\
-    with open(f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/cut.txt', 'w') as file:\n\
-        file.write('Cut!')"   
-
-                        with open(f"{self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py", "w") as python_file:
-                            python_file.write(python_text)
-
-                        # -- Create bash file to submit job -- #
-                        #print('Creating Cutting Batch File')
-                        batch_text = f'\
-#!/bin/bash\n\
-#\n\
-#SBATCH --job-name=TESS_S{self.sector}_Cam{cam}_Ccd{ccd}_Cut{cut}_Cutting\n\
-#SBATCH --output={self.job_output_path}/tessellate_cutting_logs/%A_%x_job_output.txt\n\
-#SBATCH --error={self.job_output_path}/tessellate_cutting_logs/%A_%x_errors.txt\n\
-#\n\
-#SBATCH --ntasks=1\n\
-#SBATCH --time={self.cut_time}\n\
-#SBATCH --cpus-per-task={self.cut_cpu}\n\
-#SBATCH --mem-per-cpu={self.cut_mem}G\n\
-#SBATCH --account=oz335\n\
-\n\
-export PYTHONUNBUFFERED=1\n\
-{sys.executable} {self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py'
-
-                        with open(f"{self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh", "w") as batch_file:
-                            batch_file.write(batch_text)
-
-                        #print('Submitting Cutting Batch File')
-                        os.system(f'sbatch {self.working_path}/cutting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.sh')
-                        print('\n')
-
-                if self.part:
-                    for i in range(2):
-                        done = self._get_catalogues(cam=cam,ccd=ccd,base_path=f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part{i+1}')
-                        if not done:
-                            break
+                if table_exists(f'{save_path}/variable_catalog.csv'):
+                    print('--Variable catalog already made, skipping.')
                 else:
-                    done = self._get_catalogues(cam=cam,ccd=ccd,base_path=f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}')
-                
-                print('\n')
-                if not done:
-                    print('Restarting Cutting')
-                    print('\n')
-                    self.make_cuts(overwrite=False)
+                    rad2 = rad*21/60**2
+                    doneVar = False
+                    attempt = 1
+                    while not doneVar:
+                        try:
+                            create_external_var_cat(center=cutCentreCoords[cut-1],
+                                                    size=rad2,save_path=save_path,verbose=self.verbose>1) # This one queries in degrees!!!!
+                            doneVar = True
+                        except Exception as e:
+                            print(f"--Variable Catalogue Attempt {attempt} failed with error: {e}")
+                            sleep(120)
+                            attempt+=1
+
+                with open(f'{save_path}/catalogued.txt', 'w') as file:
+                    file.write('Catalogued!')
+
+            print('\n')
 
     def predict_asteroids(self,overwrite=True):
         """
@@ -2629,7 +2104,7 @@ export PYTHONUNBUFFERED=1\n\
 
         if overwrite & (self.overwrite is not None):
             if (self.overwrite == 'all') | ('asteroids' in self.overwrite):
-                delete_files('asteroids',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts,part=self.part)
+                delete_files('asteroids',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts)
 
         # One job per CCD (DataProcessor.predict_asteroids_ccd): it predicts the whole CCD once and
         # writes every cut's ephemeris in the per-cut format -- 15.6x less CPU than a job per cut on
@@ -2645,13 +2120,8 @@ export PYTHONUNBUFFERED=1\n\
                 todo = []
                 for cut in self.cuts:
                     prediction_status[(cam, ccd, cut)] = {'status': None, 'job_id': None, 'job_time': None}
-                    if self.part:
-                        asteroids_check1 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part1/Cut{cut}of{self.n**2}/asteroids.txt'
-                        asteroids_check2 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part2/Cut{cut}of{self.n**2}/asteroids.txt'
-                        done = (os.path.exists(asteroids_check1)) & (os.path.exists(asteroids_check2))
-                    else:
-                        asteroids_check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/asteroids.txt'
-                        done = os.path.exists(asteroids_check)
+                    asteroids_check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/asteroids.txt'
+                    done = os.path.exists(asteroids_check)
                     if done:
                         prediction_status[(cam, ccd, cut)]['status'] = 'COMPLETED'
                     else:
@@ -2675,9 +2145,8 @@ export PYTHONUNBUFFERED=1\n\
         python_text = f"\
 from tessellate import DataProcessor\n\
 \n\
-part = {self.part}\n\
 processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=2)\n\
-processor.predict_asteroids_ccd(cam={cam},ccd={ccd},n={self.n},cuts={list(cuts)},part=part)"
+processor.predict_asteroids_ccd(cam={cam},ccd={ccd},n={self.n},cuts={list(cuts)})"
 
         with open(f"{self.working_path}/asteroid_prediction_scripts/S{self.sector}C{cam}C{ccd}_script.py", "w") as python_file:
             python_file.write(python_text)
@@ -2718,13 +2187,11 @@ export PYTHONUNBUFFERED=1\n\
 from tessellate import DataProcessor\n\
 import os\n\
 \n\
-part={self.part}\n\
 processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=2)\n\
-processor.reduce(cam={cam},ccd={ccd},n={self.n},cut={cut},part=part,injection={self.injection},injection_dir='{self._inj_dir}')\n\
-if not part:\n\
-    if os.path.exists('{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/{self._inj_dir}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{self.n**2}_Shifts.npy'):\n\
-        with open(f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/{self._inj_dir}/reduced.txt', 'w') as file:\n\
-            file.write('Reduced!')"   
+processor.reduce(cam={cam},ccd={ccd},n={self.n},cut={cut},injection={self.injection},injection_dir='{self._inj_dir}')\n\
+if os.path.exists('{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/{self._inj_dir}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{self.n**2}_Shifts.npy'):\n\
+    with open(f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/{self._inj_dir}/reduced.txt', 'w') as file:\n\
+        file.write('Reduced!')"   
             # file.write('Reduced with TESSreduce version {tr.__version__}.')"
         with open(f"{self.working_path}/reduction_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py", "w") as python_file:
             python_file.write(python_text)
@@ -2778,7 +2245,7 @@ export PYTHONUNBUFFERED=1\n\
 
         if (overwrite) & (self.overwrite is not None):
             if (self.overwrite == 'all') | ('reduce' in self.overwrite):
-                delete_files('reductions',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts,part=self.part)
+                delete_files('reductions',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts)
 
         for cam in self.cam:
             for ccd in self.ccd: 
@@ -2786,44 +2253,21 @@ export PYTHONUNBUFFERED=1\n\
                 print('\n')
                 for cut in self.cuts:
                     reduction_status[(cam, ccd, cut)] = {'status': None, 'job_id': None, 'job_time': None}
-                    if self.part:
-                        cut_check1 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part1/Cut{cut}of{self.n**2}/local_gaia_cat.csv'
-                        cut_check2 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part2/Cut{cut}of{self.n**2}/local_gaia_cat.csv'
-                        if not os.path.exists(cut_check1):
-                            e = f'No Source Catalogue Detected for Reduction of Cut {cut} Part 1!\n'
-                            raise ValueError(e)
-                        elif not os.path.exists(cut_check2):
-                            e = f'No Source Catalogue Detected for Reduction of Cut {cut} Part 2!\n'
-                            raise ValueError(e)
-                        
-                        reduced_check1 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part1/Cut{cut}of{self.n**2}/{self._inj_dir}/reduced.txt'
-                        reduced_check2 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part2/Cut{cut}of{self.n**2}/{self._inj_dir}/reduced.txt'
-                        if (os.path.exists(reduced_check1))&(os.path.exists(reduced_check2)):
-                            print(f'Cam {cam} CCD {ccd} Cut {cut} already reduced!')
-                            print('\n')
-                            reduction_status[(cam, ccd, cut)]['status'] = 'COMPLETED'
-                        else:
-                            job_id = self._cut_reduce(cam=cam,ccd=ccd,cut=cut)
-                            reduction_status[(cam, ccd, cut)]['status'] = 'INCOMPLETE'
-                            reduction_status[(cam, ccd, cut)]['job_id'] = job_id
-                            reduction_status[(cam, ccd, cut)]['job_time'] = self.reduce_time
-                        
-                    else:
-                        cut_check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/local_gaia_cat.csv'
-                        if not os.path.exists(cut_check):
-                            e = f'No Source Catalogue Detected for Reduction of Cut {cut}!\n'
-                            raise ValueError(e)
+                    cut_check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/local_gaia_cat.csv'
+                    if not os.path.exists(cut_check):
+                        e = f'No Source Catalogue Detected for Reduction of Cut {cut} -- run make_catalogues first!\n'
+                        raise ValueError(e)
                     
-                        reduced_check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/{self._inj_dir}/reduced.txt'
-                        if os.path.exists(reduced_check):
-                            print(f'Cam {cam} CCD {ccd} Cut {cut} already reduced!')
-                            print('\n')
-                            reduction_status[(cam, ccd, cut)]['status'] = 'COMPLETED'
-                        else:
-                            job_id = self._cut_reduce(cam=cam,ccd=ccd,cut=cut)
-                            reduction_status[(cam, ccd, cut)]['status'] = 'INCOMPLETE'
-                            reduction_status[(cam, ccd, cut)]['job_id'] = job_id
-                            reduction_status[(cam, ccd, cut)]['job_time'] = self.reduce_time
+                    reduced_check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/{self._inj_dir}/reduced.txt'
+                    if os.path.exists(reduced_check):
+                        print(f'Cam {cam} CCD {ccd} Cut {cut} already reduced!')
+                        print('\n')
+                        reduction_status[(cam, ccd, cut)]['status'] = 'COMPLETED'
+                    else:
+                        job_id = self._cut_reduce(cam=cam,ccd=ccd,cut=cut)
+                        reduction_status[(cam, ccd, cut)]['status'] = 'INCOMPLETE'
+                        reduction_status[(cam, ccd, cut)]['job_id'] = job_id
+                        reduction_status[(cam, ccd, cut)]['job_time'] = self.reduce_time
                     
         return reduction_status
 
@@ -2849,7 +2293,7 @@ export PYTHONUNBUFFERED=1\n\
 
         if overwrite & (self.overwrite is not None):
             if (self.overwrite == 'all') | ('lightcurves' in self.overwrite):
-                delete_files('asteroid_lightcurves',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts,part=self.part)
+                delete_files('asteroid_lightcurves',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts)
 
         lightcurve_status = {}   # (cam, ccd) -> cuts still to build
         for cam in self.cam:
@@ -2859,13 +2303,8 @@ export PYTHONUNBUFFERED=1\n\
 
                 todo = []
                 for cut in self.cuts:
-                    if self.part:
-                        check1 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part1/Cut{cut}of{self.n**2}/asteroid_lightcurves.txt'
-                        check2 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part2/Cut{cut}of{self.n**2}/asteroid_lightcurves.txt'
-                        done = (os.path.exists(check1)) & (os.path.exists(check2))
-                    else:
-                        check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/asteroid_lightcurves.txt'
-                        done = os.path.exists(check)
+                    check = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/asteroid_lightcurves.txt'
+                    done = os.path.exists(check)
                     if not done:
                         todo.append(cut)
 
@@ -3129,9 +2568,8 @@ export PYTHONUNBUFFERED=1\n\
 from tessellate import DataProcessor\n\
 \n\
 if __name__ == '__main__':\n\
-    part = {self.part}\n\
     processor = DataProcessor(sector={self.sector},data_path='{self.data_path}',verbose=2)\n\
-    processor.asteroid_lightcurves_ccd(cam={cam},ccd={ccd},n={self.n},cuts={list(cuts)},part=part)"
+    processor.asteroid_lightcurves_ccd(cam={cam},ccd={ccd},n={self.n},cuts={list(cuts)})"
 
         with open(f"{self.working_path}/asteroid_lightcurves_scripts/S{self.sector}C{cam}C{ccd}_script.py", "w") as python_file:
             python_file.write(python_text)
@@ -3311,7 +2749,7 @@ export PYTHONUNBUFFERED=1\n\
     #     if overwrite and (self.overwrite is not None):
     #         if (self.overwrite == 'all') or ('calibrate' in self.overwrite):
     #             delete_files('calibrations', self.data_path, self.sector,
-    #                          self.n, self.cam, self.ccd, self.cuts, part=self.part)
+    #                          self.n, self.cam, self.ccd, self.cuts)
 
     #     for cam in self.cam:
     #         for ccd in self.ccd:
@@ -3348,7 +2786,7 @@ export PYTHONUNBUFFERED=1\n\
         if overwrite and (self.overwrite is not None):
             if (self.overwrite == 'all') or ('calibrate' in self.overwrite):
                 delete_files('calibrations', self.data_path, self.sector,
-                            self.n, self.cam, self.ccd, self.cuts, part=self.part)
+                            self.n, self.cam, self.ccd, self.cuts)
 
         calibrating_status = {}
         for cam in self.cam:
@@ -3433,23 +2871,10 @@ export PYTHONUNBUFFERED=1\n\
         print(f'Creating Transient Search File for Sector{self.sector} Cam{cam} Ccd{ccd} Cut{cut}')
         python_text = f"\
 from tessellate import Detector\n\
-from tessellate.tools import table_exists\n\
-\n\
-part = {self.part}\n\
 \n\
 redo = {self.search_redo!r}\n\
-if part:\n\
-    path1 = '{self.data_path}/{self.sector}/Cam{cam}/Ccd{ccd}/Part1/Cut{cut}of{self.n**2}/{self._inj_dir}/detected_events.csv'\n\
-    path2 = '{self.data_path}/{self.sector}/Cam{cam}/Ccd{ccd}/Part2/Cut{cut}of{self.n**2}/{self._inj_dir}/detected_events.csv'\n\
-    if redo is not None or not table_exists(path1):\n\
-        detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n},injection={self.injection},part=1)\n\
-        detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.search_time_bins},min_snr={self.search_snr},redo=redo)\n\
-    if redo is not None or not table_exists(path2):\n\
-        detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n},injection={self.injection},part=2)\n\
-        detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.search_time_bins},min_snr={self.search_snr},redo=redo)\n\
-else:\n\
-    detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n},injection={self.injection},injection_dir='{self._inj_dir}')\n\
-    detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.search_time_bins},min_snr={self.search_snr},redo=redo)"   
+detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n},injection={self.injection},injection_dir='{self._inj_dir}')\n\
+detector.transient_search(cut={cut},mode='{self.detect_mode}',time_bins={self.search_time_bins},min_snr={self.search_snr},redo=redo)"   
                     
         with open(f"{self.working_path}/detection_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py", "w") as python_file:
             python_file.write(python_text)
@@ -3491,17 +2916,11 @@ export PYTHONUNBUFFERED=1\n\
 
         if overwrite & (self.overwrite is not None):
             if (self.overwrite == 'all') | ('search' in self.overwrite):
-                delete_files('search',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts,part=self.part)
+                delete_files('search',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts)
 
         def _already_searched(cam, ccd, cut):
-            if self.part:
-                save_path1 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part1/Cut{cut}of{self.n**2}/{self._inj_dir}'
-                save_path2 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part2/Cut{cut}of{self.n**2}/{self._inj_dir}'
-                return (self.search_redo is None and table_exists(f'{save_path1}/detected_objects.csv') and
-                        table_exists(f'{save_path2}/detected_objects.csv'))
-            else:
-                save_path = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/{self._inj_dir}'
-                return self.search_redo is None and table_exists(f'{save_path}/detected_objects.csv')
+            save_path = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/{self._inj_dir}'
+            return self.search_redo is None and table_exists(f'{save_path}/detected_objects.csv')
 
         # ---- default behaviour: no reduction_status given, act immediately ----
         if reduction_status is False:
@@ -3511,42 +2930,19 @@ export PYTHONUNBUFFERED=1\n\
                     print('\n')
                     for cut in self.cuts:
 
-                        if self.part:
-                            save_path1 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part1/Cut{cut}of{self.n**2}/{self._inj_dir}'
-                            save_path2 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part2/Cut{cut}of{self.n**2}/{self._inj_dir}'
-                            if (self.search_redo is None) & (table_exists(f'{save_path1}/detected_objects.csv')) & (table_exists(f'{save_path2}/detected_objects.csv')):
-                                print(f'Cam {cam} CCD {ccd} Cut {cut} already searched!')
+                        save_path = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/{self._inj_dir}'
+                        if self.search_redo is None and table_exists(f'{save_path}/detected_objects.csv'):
+                            print(f'Cam {cam} CCD {ccd} Cut {cut} already searched!')
+                            print('\n')
+                        elif not os.path.exists(f'{save_path}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{self.n**2}_Ref.npy'):
+                            if calibrating:
+                                print(f'No Reduction Files Detected for Search of Cam {cam} Ccd {ccd} Cut {cut}! Skipping!')
                                 print('\n')
-                            elif (os.path.exists(f'{save_path1}/reduced.txt')) & (os.path.exists(f'{save_path2}/reduced.txt')):
-                                self._cut_transient_search(cam,ccd,cut)
-                            elif not os.path.exists(f'{save_path1}/reduced.txt'):
-                                if calibrating:
-                                    print(f'No Reduction Files Detected for Search of Cut {cut} Part 1! Skipping!')
-                                    print('\n')
-                                else:
-                                    e = f'No Reduced File Detected for Search of Cut {cut} Part 1!\n'
-                                    raise ValueError(e)
                             else:
-                                if calibrating:
-                                    print(f'No Reduction Files Detected for Search of Cut {cut} Part 2! Skipping!')
-                                    print('\n')
-                                else:
-                                    e = f'No Reduced File Detected for Search of Cut {cut} Part 2!\n'
-                                    raise ValueError(e)
+                                e = f'No Reduction Files Detected for Search of Cam {cam} Ccd {ccd} Cut {cut}!\n'
+                                raise ValueError(e)
                         else:
-                            save_path = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}/{self._inj_dir}'
-                            if self.search_redo is None and table_exists(f'{save_path}/detected_objects.csv'):
-                                print(f'Cam {cam} CCD {ccd} Cut {cut} already searched!')
-                                print('\n')
-                            elif not os.path.exists(f'{save_path}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{self.n**2}_Ref.npy'):
-                                if calibrating:
-                                    print(f'No Reduction Files Detected for Search of Cam {cam} Ccd {ccd} Cut {cut}! Skipping!')
-                                    print('\n')
-                                else:
-                                    e = f'No Reduction Files Detected for Search of Cam {cam} Ccd {ccd} Cut {cut}!\n'
-                                    raise ValueError(e)
-                            else:
-                                self._cut_transient_search(cam,ccd,cut)
+                            self._cut_transient_search(cam,ccd,cut)
             return
 
         # ---- reduction_status given: wait on reduction jobs like calibrate() does ----
@@ -3632,7 +3028,7 @@ export PYTHONUNBUFFERED=1\n\
 
     #     if overwrite & (self.overwrite is not None):
     #         if (self.overwrite == 'all') | ('search' in self.overwrite):
-    #             delete_files('search',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts,part=self.part)
+    #             delete_files('search',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts)
 
     #     cutting_status = {}
     #     for cam in self.cam:
@@ -3734,17 +3130,9 @@ export PYTHONUNBUFFERED=1\n\
         python_text = f"\
 from tessellate import Detector\n\
 \n\
-part = {self.part}\n\
-if part:\n\
-    detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n},part=1)\n\
-    detector.plot_ALL(cut={cut},lower=3)\n\
-    detector.lc_ALL(cut={cut},lower=3)\n\
-    detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n},part=2)\n\
-    detector.lc_ALL(cut={cut},lower=3)\n\
-else:\n\
-    detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n})\n\
-    detector.plot_ALL(cut={cut},lower=3)\n\
-    detector.lc_ALL(cut={cut},lower=3)"   
+detector = Detector(sector={self.sector},data_path='{self.data_path}',cam={cam},ccd={ccd},n={self.n})\n\
+detector.plot_ALL(cut={cut},lower=3)\n\
+detector.lc_ALL(cut={cut},lower=3)"   
                     
         with open(f"{self.working_path}/plotting_scripts/S{self.sector}C{cam}C{ccd}C{cut}_script.py", "w") as python_file:
             python_file.write(python_text)
@@ -3787,7 +3175,7 @@ export PYTHONUNBUFFERED=1\n\
         
         if overwrite & (self.overwrite is not None):
             if (self.overwrite == 'all') | ('plot' in self.overwrite):
-                delete_files('plot',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts,part=self.part)
+                delete_files('plot',self.data_path,self.sector,self.n,self.cam,self.ccd,self.cuts)
 
         for cam in self.cam:
             for ccd in self.ccd:
@@ -3795,32 +3183,17 @@ export PYTHONUNBUFFERED=1\n\
                 print('\n')
                 if not searching:
                     for cut in self.cuts:
-                        if self.part:
-                            save_path1 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part1/Cut{cut}of{self.n**2}'
-                            save_path2 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part2/Cut{cut}of{self.n**2}'
-                            if (os.path.exists(f'{save_path1}/lcs.zip')) & (os.path.exists(f'{save_path2}/lcs.zip')):
-                                print(f'Cam {cam} CCD {ccd} Cut {cut} plots already made!')
-                                print('\n')
-                            elif (table_exists(f'{save_path1}/detected_objects.csv'))&(table_exists(f'{save_path2}/detected_objects.csv')):
-                                self._cut_transient_plot(cam,ccd,cut)
-                            elif not table_exists(f'{save_path1}/detected_objects.csv'):
-                                e = f'No Event File Detected for Plotting of Cut {cut} Part 1!\n'
-                                raise ValueError(e)
-                            else:
-                                e = f'No Event File Detected for Plotting of Cut {cut} Part 2!\n'
-                                raise ValueError(e)
+                        save_path = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}'
+                        if os.path.exists(f'{save_path}/lcs.zip'):
+                            print(f'Cam {cam} CCD {ccd} Cut {cut} plots already made!')
+                            print('\n')
+                        elif table_exists(f'{save_path}/detected_objects.csv'):
+                            self._cut_transient_plot(cam,ccd,cut)
                         else:
-                            save_path = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}'
-                            if os.path.exists(f'{save_path}/lcs.zip'):
-                                print(f'Cam {cam} CCD {ccd} Cut {cut} plots already made!')
-                                print('\n')
-                            elif table_exists(f'{save_path}/detected_objects.csv'):
-                                self._cut_transient_plot(cam,ccd,cut)
-                            else:
-                                e = f'No Event File Detected for Plotting of Cut {cut}!\n'
-                                print(e)
-                                #raise ValueError(e)
-                            
+                            e = f'No Event File Detected for Plotting of Cut {cut}!\n'
+                            print(e)
+                            #raise ValueError(e)
+                        
                         
                 else:
                     completed = []
@@ -3851,23 +3224,13 @@ export PYTHONUNBUFFERED=1\n\
                                 sleep(120)
                             for cut in self.cuts:
                                 if cut not in completed:
-                                    if self.part:
-                                        save_path1 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part1/Cut{cut}of{self.n**2}'
-                                        save_path2 = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Part2/Cut{cut}of{self.n**2}'
-                                        if (os.path.exists(f'{save_path1}/lcs.zip')) & (os.path.exists(f'{save_path2}/lcs.zip')):
-                                            print(f'Cam {cam} CCD {ccd} Cut {cut} plots already made!')
-                                            print('\n')
-                                        elif (table_exists(f'{save_path1}/detected_events.csv'))&(table_exists(f'{save_path2}/detected_events.csv')):
-                                            self._cut_transient_plot(cam,ccd,cut)
-                                            completed.append(cut)
-                                    else:
-                                        save_path = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}'
-                                        if os.path.exists(f'{save_path}/lcs.zip'):
-                                            completed.append(cut)
-                                            print(f'Cam {cam} CCD {ccd} Cut {cut} already plotted!')
-                                            print('\n')
-                                        elif table_exists(f'{save_path}/detected_events.csv'):
-                                            self._cut_transient_plot(cam,ccd,cut)
-                                            completed.append(cut)
+                                    save_path = f'{self.data_path}/Sector{self.sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{self.n**2}'
+                                    if os.path.exists(f'{save_path}/lcs.zip'):
+                                        completed.append(cut)
+                                        print(f'Cam {cam} CCD {ccd} Cut {cut} already plotted!')
+                                        print('\n')
+                                    elif table_exists(f'{save_path}/detected_events.csv'):
+                                        self._cut_transient_plot(cam,ccd,cut)
+                                        completed.append(cut)
                             i+=1
 

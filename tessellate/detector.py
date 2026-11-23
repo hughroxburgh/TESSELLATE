@@ -1322,7 +1322,7 @@ def _Crossbin_match(events, distance=1, asteroid_distance=2):
 class Detector():
 
     def __init__(self,sector,cam,ccd,data_path='/fred/oz335/TESSdata',n=8,
-                 match_variables=True,mode='both',part=None,injection=False,injection_dir='source_injection',
+                 match_variables=True,mode='both',injection=False,injection_dir='source_injection',
                  cpu=multiprocessing.cpu_count()):
         
         """
@@ -1352,15 +1352,7 @@ class Detector():
         self.injection = injection
         self._inj_path = injection_dir if injection else '.'
 
-        if part is None:
-            self.path = f'{self.data_path}/Sector{self.sector}/Cam{self.cam}/Ccd{self.ccd}'
-        elif part == 1:
-            self.path = f'{self.data_path}/Sector{self.sector}/Cam{self.cam}/Ccd{self.ccd}/Part1'
-        elif part == 2:
-            self.path = f'{self.data_path}/Sector{self.sector}/Cam{self.cam}/Ccd{self.ccd}/Part2'
-        else:
-            e = 'Invalid Part Parameter!'
-            raise AttributeError(e)
+        self.path = f'{self.data_path}/Sector{self.sector}/Cam{self.cam}/Ccd{self.ccd}'
 
 
         

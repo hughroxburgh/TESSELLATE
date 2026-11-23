@@ -226,226 +226,103 @@ def _Check_job_status(job_id):
     return 'UNKNOWN'
 
 
-def _remove_ffis(data_path,sector,n,cams,ccds,cuts,part):
+def _remove_ffis(data_path,sector,n,cams,ccds,cuts):
 
-    home_path = os.getcwd()
     for cam in cams:
         for ccd in ccds:
             os.system(f'rm -r -f {data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/image_files')
 
-    os.chdir(home_path)
-
-def _remove_cubes(data_path,sector,n,cams,ccds,cuts,part):
-
-    home_path = os.getcwd()
-    for cam in cams:
-        for ccd in ccds:
-            if part:
-                for i in range(1,3):
-                    try:
-                        os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Part{i}')
-                        os.system(f'rm -f sector{sector}_cam{cam}_ccd{ccd}_cube.fits')
-                        os.system(f'rm -f sector{sector}_cam{cam}_ccd{ccd}_wcs.fits')
-                        os.system(f'rm -f cubed.txt')
-                    except:
-                        pass
-            else:
-                try:
-                    os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}')
-                    os.system(f'rm -f sector{sector}_cam{cam}_ccd{ccd}_cube.fits')
-                    os.system(f'rm -f sector{sector}_cam{cam}_ccd{ccd}_wcs.fits')
-                    os.system(f'rm -f cubed.txt')
-                except:
-                    pass
-
-    os.chdir(home_path)
-
-def _remove_cuts(data_path,sector,n,cams,ccds,cuts,part):
-
-    for cam in cams:
-        for ccd in ccds:
-            for cut in cuts:
-                if part:
-                    for i in range(1,3):
-                        os.system(f'rm -r -f {data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Part{i}/Cut{cut}of{n**2}')
-                else:
-                    os.system(f'rm -r -f {data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
-
-def _remove_asteroids(data_path,sector,n,cams,ccds,cuts,part):
+def _in_cut_folders(data_path,sector,n,cams,ccds,cuts,commands):
+    """Run shell commands inside each existing cut folder."""
 
     home_path = os.getcwd()
     for cam in cams:
         for ccd in ccds:
             for cut in cuts:
-                if part:
-                    for i in range(1,3):
-                        try:
-                            os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Part{i}/Cut{cut}of{n**2}')
-                            os.system(f'rm -f asteroids/*_Asteroids.parquet')
-                            os.system(f'rm -f asteroids/*_AsteroidTrails.png')
-                            os.system(f'rm -f asteroids.txt')
-                        except:
-                            pass
-                else:
-                    try:
-                        os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
-                        os.system(f'rm -f asteroids/*_Asteroids.parquet')
-                        os.system(f'rm -f asteroids/*_AsteroidTrails.png')
-                        os.system(f'rm -f asteroids.txt')
-                    except:
-                        pass
-
+                folder = f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}'
+                if os.path.isdir(folder):
+                    os.chdir(folder)
+                    for command in commands:
+                        os.system(command)
     os.chdir(home_path)
 
-def _remove_reductions(data_path,sector,n,cams,ccds,cuts,part):
+def _remove_cuts(data_path,sector,n,cams,ccds,cuts):
 
-    home_path = os.getcwd()
     for cam in cams:
         for ccd in ccds:
             for cut in cuts:
-                if part:
-                    for i in range(1,3):
-                        try:
-                            os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Part{i}/Cut{cut}of{n**2}')
-                            os.system(f'rm -f *.npy')
-                            os.system(f'rm -f *_OrbitRefs.npz')
-                            os.system(f'rm -f reduced.txt')
-                            os.system(f'rm -f detected_events.csv detected_events.parquet')
-                            os.system(f'rm -f detected_sources.csv detected_sources.parquet')
-                            os.system(f'rm -f detected_objects.csv detected_objects.parquet')
-                            os.system(f'rm -f single_isolated_detections.csv single_isolated_detections.parquet')
-                            os.system('rm -f figs.zip')
-                            os.system('rm -f lcs.zip')  
-                        except:
-                            pass
-                else:
-                    try:
-                        os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
-                        os.system(f'rm -f *.npy')
-                        os.system(f'rm -f *_OrbitRefs.npz')
-                        os.system(f'rm -f reduced.txt')
-                        os.system(f'rm -f detected_events.csv detected_events.parquet')
-                        os.system(f'rm -f detected_sources.csv detected_sources.parquet')
-                        os.system(f'rm -f detected_objects.csv detected_objects.parquet')
-                        os.system(f'rm -f single_isolated_detections.csv single_isolated_detections.parquet')
-                        os.system('rm -f figs.zip')
-                        os.system('rm -f lcs.zip')  
-                    except:
-                        pass   
+                os.system(f'rm -r -f {data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
 
-    os.chdir(home_path)
+def _remove_catalogues(data_path,sector,n,cams,ccds,cuts):
 
-def _remove_asteroid_lightcurves(data_path,sector,n,cams,ccds,cuts,part):
+    _in_cut_folders(data_path,sector,n,cams,ccds,cuts,
+                    ['rm -f local_gaia_cat.csv',
+                     'rm -f variable_catalog.csv variable_catalog.parquet',
+                     'rm -f catalogued.txt'])
+
+def _remove_asteroids(data_path,sector,n,cams,ccds,cuts):
+
+    _in_cut_folders(data_path,sector,n,cams,ccds,cuts,
+                    ['rm -f asteroids/*_Asteroids.parquet',
+                     'rm -f asteroids/*_AsteroidTrails.png',
+                     'rm -f asteroids.txt'])
+
+def _remove_reductions(data_path,sector,n,cams,ccds,cuts):
+
+    _in_cut_folders(data_path,sector,n,cams,ccds,cuts,
+                    ['rm -f *.npy',
+                     'rm -f *_OrbitRefs.npz',
+                     'rm -f reduced.txt',
+                     'rm -f detected_events.csv detected_events.parquet',
+                     'rm -f detected_sources.csv detected_sources.parquet',
+                     'rm -f detected_objects.csv detected_objects.parquet',
+                     'rm -f single_isolated_detections.csv single_isolated_detections.parquet',
+                     'rm -f figs.zip',
+                     'rm -f lcs.zip'])
+
+def _remove_asteroid_lightcurves(data_path,sector,n,cams,ccds,cuts):
     from .asteroid_store import remove_staging
 
-    home_path = os.getcwd()
+    _in_cut_folders(data_path,sector,n,cams,ccds,cuts,
+                    ['rm -f asteroids/*_AsteroidAperturePhotometry.parquet',
+                     'rm -f asteroids/*_AsteroidPSFPhotometry.parquet',
+                     'rm -f asteroids/*_AsteroidStackSummary.parquet',
+                     'rm -f asteroids/*_AsteroidStackedPhotometry.parquet',
+                     'rm -f asteroids/*_AsteroidCutOffset.parquet',
+                     'rm -f asteroids/*_AsteroidOffsetDiagnostics.parquet',
+                     'rm -f asteroid_lightcurves.txt'])
     for cam in cams:
         for ccd in ccds:
             for cut in cuts:
-                if part:
-                    for i in range(1,3):
-                        try:
-                            os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Part{i}/Cut{cut}of{n**2}')
-                            os.system(f'rm -f asteroids/*_AsteroidAperturePhotometry.parquet')
-                            os.system(f'rm -f asteroids/*_AsteroidPSFPhotometry.parquet')
-                            os.system(f'rm -f asteroids/*_AsteroidStackSummary.parquet')
-                            os.system(f'rm -f asteroids/*_AsteroidStackedPhotometry.parquet')
-                            os.system(f'rm -f asteroids/*_AsteroidCutOffset.parquet')
-                            os.system(f'rm -f asteroids/*_AsteroidOffsetDiagnostics.parquet')
-                            os.system(f'rm -f asteroid_lightcurves.txt')
-                            remove_staging(data_path,sector,cam,ccd,cut,i)
-                        except:
-                            pass
-                else:
-                    try:
-                        os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
-                        os.system(f'rm -f asteroids/*_AsteroidAperturePhotometry.parquet')
-                        os.system(f'rm -f asteroids/*_AsteroidPSFPhotometry.parquet')
-                        os.system(f'rm -f asteroids/*_AsteroidStackSummary.parquet')
-                        os.system(f'rm -f asteroids/*_AsteroidStackedPhotometry.parquet')
-                        os.system(f'rm -f asteroids/*_AsteroidCutOffset.parquet')
-                        os.system(f'rm -f asteroids/*_AsteroidOffsetDiagnostics.parquet')
-                        os.system(f'rm -f asteroid_lightcurves.txt')
-                        remove_staging(data_path,sector,cam,ccd,cut,0)
-                    except:
-                        pass
+                remove_staging(data_path,sector,cam,ccd,cut)
 
-    os.chdir(home_path)
+def _remove_calibrations(data_path,sector,n,cams,ccds,cuts):
 
-def _remove_calibrations(data_path, sector, n, cams, ccds, cuts, part):
+    # calibration products live in the calibration/ subdir; the rest are products once written in the cut dir
+    _in_cut_folders(data_path,sector,n,cams,ccds,cuts,
+                    ['rm -rf calibration',
+                     'rm -f calibrated.txt',
+                     'rm -f psf_calibration_*.csv',
+                     'rm -f psf_calibration_*.pdf',
+                     'rm -f detection_limits_*.csv'])
 
-    home_path = os.getcwd()
-    for cam in cams:
-        for ccd in ccds:
-            for cut in cuts:
-                try:
-                    os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
-                    # Calibration products now live in the calibration/ subdir
-                    os.system('rm -rf calibration')
-                    # Legacy: products previously written directly in the cut dir
-                    os.system('rm -f calibrated.txt')
-                    os.system('rm -f psf_calibration_*.csv')
-                    os.system('rm -f psf_calibration_*.pdf')
-                    os.system('rm -f detection_limits_*.csv')
-                except:
-                    pass
-    os.chdir(home_path)
+def _remove_search(data_path,sector,n,cams,ccds,cuts):
 
-def _remove_search(data_path,sector,n,cams,ccds,cuts,part):
+    _in_cut_folders(data_path,sector,n,cams,ccds,cuts,
+                    ['rm -f detected_events.csv detected_events.parquet',
+                     'rm -f detected_sources.csv detected_sources.parquet',
+                     'rm -f detected_objects.csv detected_objects.parquet',
+                     'rm -f single_isolated_detections.csv single_isolated_detections.parquet',
+                     'rm -f figs.zip',
+                     'rm -f lcs.zip'])
 
-    home_path = os.getcwd()
-    for cam in cams:
-        for ccd in ccds:
-            for cut in cuts:
-                if part:
-                    for i in range(1,3):
-                        try:
-                            os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Part{i}/Cut{cut}of{n**2}')
-                            os.system(f'rm -f detected_events.csv detected_events.parquet')
-                            os.system(f'rm -f detected_sources.csv detected_sources.parquet')
-                            os.system(f'rm -f detected_objects.csv detected_objects.parquet')
-                            os.system(f'rm -f single_isolated_detections.csv single_isolated_detections.parquet')
-                            os.system('rm -f figs.zip')
-                            os.system('rm -f lcs.zip') 
-                        except:
-                            pass
-                else:
-                    try:
-                        os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
-                        os.system(f'rm -f detected_events.csv detected_events.parquet')
-                        os.system(f'rm -f detected_sources.csv detected_sources.parquet')
-                        os.system(f'rm -f detected_objects.csv detected_objects.parquet')
-                        os.system(f'rm -f single_isolated_detections.csv single_isolated_detections.parquet')
-                        os.system('rm -f figs.zip')
-                        os.system('rm -f lcs.zip')  
-                    except:
-                        pass 
-    os.chdir(home_path)
-    
-def _remove_plots(data_path,sector,n,cams,ccds,cuts,part):
+def _remove_plots(data_path,sector,n,cams,ccds,cuts):
 
-    home_path = os.getcwd()
-    for cam in cams:
-        for ccd in ccds:
-            for cut in cuts:
-                if part:
-                    for i in range(1,3):
-                        try:
-                            os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Part{i}/Cut{cut}of{n**2}')
-                            os.system('rm -r -f figs.zip')
-                            os.system('rm -r -f lcs.zip')
-                        except:
-                            pass
-                else:
-                    try:
-                        os.chdir(f'{data_path}/Sector{sector}/Cam{cam}/Ccd{ccd}/Cut{cut}of{n**2}')
-                        os.system('rm -r -f figs.zip')
-                        os.system('rm -r -f lcs.zip')
-                    except:
-                        pass 
-    os.chdir(home_path)
+    _in_cut_folders(data_path,sector,n,cams,ccds,cuts,
+                    ['rm -r -f figs.zip',
+                     'rm -r -f lcs.zip'])
 
-def delete_files(filetype,data_path,sector,n=4,cams='all',ccds='all',cuts='all',part=False):
+def delete_files(filetype,data_path,sector,n=4,cams='all',ccds='all',cuts='all'):
 
     if cams == 'all':
         cams = [1,2,3,4]
@@ -461,8 +338,8 @@ def delete_files(filetype,data_path,sector,n=4,cams='all',ccds='all',cuts='all',
         cuts = [cuts]
         
     possibleFiles = {'ffis':_remove_ffis,
-                        'cubes':_remove_cubes,
                         'cuts':_remove_cuts,
+                        'catalogues':_remove_catalogues,
                         'asteroids':_remove_asteroids,
                         'reductions':_remove_reductions,
                         'asteroid_lightcurves':_remove_asteroid_lightcurves,
@@ -472,9 +349,9 @@ def delete_files(filetype,data_path,sector,n=4,cams='all',ccds='all',cuts='all',
 
     if filetype.lower() in possibleFiles.keys():
         function = possibleFiles[filetype.lower()]
-        function(data_path,sector,n,cams,ccds,cuts,part)
+        function(data_path,sector,n,cams,ccds,cuts)
     else:
-        e = 'Invalid filetype! Valid types: "ffis" , "cubes" , "cuts" , "asteroids" , "reductions" , "asteroid_lightcurves" , "calibrations" , "search", "plot". '
+        e = f'Invalid filetype! Valid types: {", ".join(possibleFiles)}.'
         raise AttributeError(e)
     
     

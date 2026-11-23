@@ -744,7 +744,7 @@ class SourceInjector():
 
         run = Tessellate(data_path=self.data_path,working_path=self.working_path,job_output_path=self.job_output_path,
                             sector=self.sector,cam=self.cam,ccd=self.ccd,n=self.n,cuts=list(cuts),
-                            download=False,make_cube=False,fix_wcs=False,make_cuts=False,calibrate=False,
+                            download=False,make_cuts=False,fix_wcs=False,make_catalogues=False,calibrate=False,
                             reduce=True,search=True,injection=True,plot=False,delete=False,injection_dir=self.injection_dir,
                             reset_logs=False,overwrite=False,ask_config=False,save_config=False,use_suggestions=True)
 

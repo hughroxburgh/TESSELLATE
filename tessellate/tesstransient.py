@@ -744,7 +744,7 @@ class TessTransient():
         run = Tessellate(data_path=self.data_path,working_path=self.working_path,job_output_path=self.job_output_path,
                         sector=self.sector,cam=cam,ccd=ccd,n=self.n,cuts=cuts,
                         download=self.download,download_number='all',
-                        make_cube=True,fix_wcs=True,make_cuts=True,
+                        make_cuts=True,fix_wcs=True,make_catalogues=True,
                         predict_asteroids=False,reduce=True,asteroid_lightcurves=False,
                         calibrate=True,search=True,plot=False,delete=False,
                         reset_logs=False,overwrite=False,ask_config=False,save_config=False,use_suggestions=True)

@@ -201,32 +201,6 @@ def _cut_properties(wcsItem,n,overlap):
 
         return cutCorners,cutCentrePx,cutCentreCoords,rad
 
-def _parallel_cuts(sector,cam,ccd,cut,n,cube_path,file_path,coords,size,verbose):
-
-    from astrocut import CutoutFactory
-
-    name = f'sector{sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}.fits'
-    if os.path.exists(f'{file_path}/Cut{cut}of{n**2}/{name}'):
-        print(f'Cam {cam} CCD {ccd} cut {cut} already made!')
-    else:
-        if verbose > 0:
-            print(f'Cutting Cam {cam} CCD {ccd} cut {cut} (of {n**2})')
-        
-        my_cutter = CutoutFactory() # astrocut class
-        _Save_space(f'{file_path}/Cut{cut}of{n**2}')
-
-        # -- Cut -- #
-        cut_file = my_cutter.cube_cut(cube_path, 
-                                        f"{coords[0]} {coords[1]}", 
-                                        (size,size), 
-                                        output_path = f'{file_path}/Cut{cut}of{n**2}',
-                                        target_pixel_file = name,
-                                        verbose=(verbose>1)) 
-
-        if verbose > 0:
-            print(f'Cam {cam} CCD {ccd} cut {cut} complete.')
-            print('\n')
-
 # ---------------------------------------------------------------------------
 # Direct cuts: TPFs written straight from the FFIs, no cube
 # ---------------------------------------------------------------------------
@@ -235,7 +209,7 @@ FRAME_STAT_BLOCKS = 8   # TessFixer ranks reference frames on the medians of an 
 
 
 def _ffi_time(file):
-    """Start time (days) from an FFI's tess{YYYYDDDHHMMSS} file name -- for ordering and the part split only."""
+    """Start time (days) from an FFI's tess{YYYYDDDHHMMSS} file name -- for checking the frame order."""
     import re
     import datetime
     stamp = re.search(r'tess(\d{13})', os.path.basename(file)).group(1)
@@ -408,10 +382,11 @@ def _create_direct_tpf(path, ffi_hdrs, wcsItem, wcs_ffi, x0, y0, size, nrows, na
     return len(head)
 
 
-def _direct_cut_chunk(files, frames, rows, parts, targets, corners, size, name_len):
+def _direct_cut_chunk(files, frames, targets, corners, size, name_len):
     """
     Read a run of FFIs once each and write their cut images as rows of the target TPFs (os.pwrite at fixed
-    offsets, so workers never touch the same bytes). targets[part] = [(path, data_start), ...] matching corners.
+    offsets, so workers never touch the same bytes). targets = [(path, data_start), ...] matching corners;
+    frame i is row i of every TPF.
     Returns each frame's block medians and header times/quality, for the frame-stats file.
     """
     from astropy.io import fits
@@ -423,10 +398,9 @@ def _direct_cut_chunk(files, frames, rows, parts, targets, corners, size, name_l
     out = dict(frames=np.asarray(frames), medians=np.full((len(files), FRAME_STAT_BLOCKS**2), np.nan, np.float32),
                dquality=np.zeros(len(files), np.int32), tstart=np.zeros(len(files)), tstop=np.zeros(len(files)))
     try:
-        for p, target in enumerate(targets):
-            for k, (path, _) in enumerate(target):
-                fds[(p, k)] = os.open(path, os.O_WRONLY)
-        for i, (file, frame, row, p) in enumerate(zip(files, frames, rows, parts)):
+        for k, (path, _) in enumerate(targets):
+            fds[k] = os.open(path, os.O_WRONLY)
+        for i, (file, frame) in enumerate(zip(files, frames)):
             try:
                 with fits.open(file, memmap=False) as h:
                     hdr = h[1].header
@@ -443,7 +417,7 @@ def _direct_cut_chunk(files, frames, rows, parts, targets, corners, size, name_l
             for k, (x0, y0) in enumerate(corners):
                 rec['FLUX'][0] = flux[y0:y0+size, x0:x0+size]
                 rec['FLUX_ERR'][0] = err[y0:y0+size, x0:x0+size]
-                os.pwrite(fds[(p, k)], rec.tobytes(), targets[p][k][1] + row * row_dtype.itemsize)
+                os.pwrite(fds[k], rec.tobytes(), targets[k][1] + frame * row_dtype.itemsize)
             # -- same blocks and order as TessFixer.reference_candidates -- #
             out['medians'][i] = [np.nanmedian(flux[block*a:block*(a+1), 44+block*b:44+block*(b+1)])
                                  for a in range(FRAME_STAT_BLOCKS) for b in range(FRAME_STAT_BLOCKS)]
@@ -595,239 +569,9 @@ class DataProcessor():
                 
         return cutCorners, cutCentrePx, cutCentreCoords, cutSize
     
-    def _make_part_cube(self,cam,ccd,input_files):
-
-        from astrocut import CubeFactory
-        from astropy.time import Time
-        import datetime
-
-        # -- Generate Cube Path -- #
-        broad_path = f'{self.path}/Cam{cam}/Ccd{ccd}'
-        
-        dates = []
-        for f in input_files:
-            year = f[56:60]
-            daynum = f[60:63]
-            hour = f[63:65]
-            minute = f[65:67]
-            sec = f[67:69]
-            date = datetime.datetime.strptime(year + "-" + daynum, "%Y-%j")
-            month = date.month
-            day = date.day
-            imagetime = '{}-{}-{}T{}:{}:{}'.format(year,month,day,hour,minute,sec)
-            imagetime = Time(imagetime, format='isot', scale='utc').mjd
-            dates.append(imagetime)
-
-        sortedDates = np.array(sorted(dates))
-        differences = np.diff(sortedDates)
-        idx = np.where(differences == np.nanmax(differences))[0][0]+1
-
-        cube1_files = []
-        cube2_files = []
-        for f in input_files:
-            year = f[56:60]
-            daynum = f[60:63]
-            hour = f[63:65]
-            minute = f[65:67]
-            sec = f[67:69]
-            date = datetime.datetime.strptime(year + "-" + daynum, "%Y-%j")
-            month = date.month
-            day = date.day
-            imagetime = '{}-{}-{}T{}:{}:{}'.format(year,month,day,hour,minute,sec)
-            imagetime = Time(imagetime, format='isot', scale='utc').mjd
-            if imagetime in sortedDates[:idx]:
-                cube1_files.append(f)
-            elif imagetime in sortedDates[idx:]:
-                cube2_files.append(f)  
-        cubes = [cube1_files,cube2_files]
-
-        for i in range(2):
-            cube_name = f'sector{self.sector}_cam{cam}_ccd{ccd}_cube.fits'
-            if not os.path.exists(f'{broad_path}/Part{i+1}'):
-                os.mkdir(f'{broad_path}/Part{i+1}')
-            cube_path = f'{broad_path}/Part{i+1}/{cube_name}'
-
-            if self.verbose > 0:
-                print(_Print_buff(50,f'Cubing Sector {self.sector} Cam {cam} CCD {ccd} Part {i+1}'))
-
-            # -- Make Cube -- #
-            cube_maker = CubeFactory()
-            cube_file = cube_maker.make_cube(cubes[i],cube_file=cube_path,verbose=self.verbose>1,max_memory=500)
-            print('\n')
-
-
-    def make_cube(self,cam,ccd,part=False):
+    def make_cuts(self,cam,ccd,n,cuts=None,wcs_ffi=None,n_workers=None,chunk=32):
         """
-        Make cube for this cam,ccd.
-        
-        ------
-        Inputs
-        ------
-        cam : int
-            desired camera 
-        ccd : int
-            desired ccd
-
-        -------
-        Options
-        -------
-        delete_files : bool  
-            deletes all FITS files once cube is made
-        cubing_message : str
-            custom printout message for self.verbose > 0
-
-        -------
-        Creates
-        -------
-        Data cube fits file in path.
-
-        """
-
-        from astrocut import CubeFactory
-        from glob import glob
-
-
-        # -- Generate Cube Path -- #
-        broad_path = f'{self.path}/Cam{cam}/Ccd{ccd}'
-        file_path = f'{broad_path}/image_files'
-
-        # if os.path.exists(cube_path):
-        #     print(f'Cam {cam} CCD {ccd} cube already exists!')
-        #     return
-
-        input_files = glob(f'{file_path}/*ffic.fits')  # list of fits files in path
-        if len(input_files) < 1:
-            print('No files to cube!')
-            return  
-        
-        deleted = _Remove_emptys(input_files)  # remove empty downloaded fits files
-        if self.verbose > 1:
-            print(f'Deleted {deleted} corrupted file/s.')
-                    
-        input_files = glob(f'{file_path}/*ffic.fits')  # regather list of good fits files
-        if len(input_files) < 1:
-            print('No files to cube!')
-            return    
-
-        if self.verbose > 1:
-            print(f'Number of files to cube = {len(input_files)}')
-            size = len(input_files) * 0.0355
-            print(f'Estimated cube size = {size:.2f} GB')
-
-        if part:
-            self._make_part_cube(cam,ccd,input_files)
-        else:
-            cube_name = f'sector{self.sector}_cam{cam}_ccd{ccd}_cube.fits'
-            cube_path = f'{broad_path}/{cube_name}'
-
-            # -- Allows for a custom cubing message (kinda dumb) -- #
-            if self.verbose > 0:
-                print(_Print_buff(50,f'Cubing Sector {self.sector} Cam {cam} CCD {ccd}'))
-            
-            # -- Make Cube -- #
-            cube_maker = CubeFactory()
-            cube_file = cube_maker.make_cube(input_files,cube_file=cube_path,verbose=self.verbose>1,max_memory=500)
-
-    def _make_part_cuts(self,cam,ccd,n,cut,file_path,cutCentreCoords, cutSize):
-
-        from astrocut import CutoutFactory
-
-        for i in range(2):
-
-            # -- Generate Cube Path -- #
-            cube_name = f'sector{self.sector}_cam{cam}_ccd{ccd}_cube.fits'
-            cube_path = f'{file_path}/Part{i+1}/{cube_name}'
-        
-            name = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}.fits'
-            if self.verbose > 0:
-                print(f'Cutting Cam {cam} CCD {ccd} Cut {cut} (of {n**2}) Part {i+1}')
-        
-            my_cutter = CutoutFactory() # astrocut class
-            coords = cutCentreCoords[cut-1]
-
-            _Save_space(f'{file_path}/Part{i+1}/Cut{cut}of{n**2}')
-                        
-            # -- Cut -- #
-            self.cut_file = my_cutter.cube_cut(cube_path, 
-                                                f"{coords[0]} {coords[1]}", 
-                                                (cutSize*2,cutSize*2), 
-                                                output_path = f'{file_path}/Part{i+1}/Cut{cut}of{n**2}',
-                                                target_pixel_file = name,
-                                                verbose=(self.verbose>1)) 
-
-            if self.verbose > 0:
-                print(f'Cam {cam} CCD {ccd} Cut {cut} Part {i+1} complete.')
-                print('\n')
-
-            with open(f'{file_path}/Part{i+1}/Cut{cut}of{n**2}/cut.txt', 'w') as file:
-                file.write('Cut!')
-    
-    def make_cuts(self,cam,ccd,n,cut,part=False):
-        """
-        Make cut(s) for this CCD.
-        
-        ------
-        Inputs
-        ------
-        cam : int
-            desired camera
-        ccd : int
-            desired ccd
-
-        ------
-        Creates
-        ------
-        Save files for cut(s) in path.
-
-        """
-
-        from astrocut import CutoutFactory
-
-        try:
-            _, cutCentrePx, _, cutSize = self.find_cuts(cam=cam,ccd=ccd,n=n,plot=False)
-        except:
-            print('Something wrong with finding cuts!')
-            return
-        
-        file_path = f'{self.path}/Cam{cam}/Ccd{ccd}'
-        if not os.path.exists(file_path):
-            print('No data to cut!')
-            return
-        
-        if part:
-            self._make_part_cuts(cam,ccd,n,cut,file_path,cutCentrePx,cutSize)
-        else:   
-            # -- Generate Cube Path -- #
-            cube_name = f'sector{self.sector}_cam{cam}_ccd{ccd}_cube.fits'
-            cube_path = f'{file_path}/{cube_name}'
-            
-            name = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}.fits'
-            # if os.path.exists(f'{file_path}/Cut{cut}of{n**2}/{name}'):
-            #     print(f'Cam {cam} CCD {ccd} cut {cut} already made!')
-            # else:
-            if self.verbose > 0:
-                print(f'Cutting Cam {cam} CCD {ccd} cut {cut} (of {n**2})')
-            
-            my_cutter = CutoutFactory() # astrocut class
-            px = cutCentrePx[cut-1]
-
-            _Save_space(f'{file_path}/Cut{cut}of{n**2}')
-                            
-            # -- Cut -- #
-            self.cut_file = my_cutter.cube_cut(cube_path, 
-                                                xy_pos=(px[0],px[1]), 
-                                                cutout_size=(cutSize*2,cutSize*2), 
-                                                output_path = f'{file_path}/Cut{cut}of{n**2}',
-                                                target_pixel_file = name,
-                                                verbose=(self.verbose>1)) 
-
-            if self.verbose > 0:
-                print(f'Cam {cam} CCD {ccd} cut {cut} complete.')
-                print('\n')
-
-    def make_direct_cuts(self,cam,ccd,n,cuts=None,part=False,wcs_ffi=None,n_workers=None,chunk=32):
-        """
-        Make cut TPFs for this CCD straight from its FFIs, replacing make_cube + make_cuts.
+        Make cut TPFs for this CCD straight from its FFIs.
 
         Each FFI is read once and its cuts written as one row of each cut's TPF, so memory stays at a few FFIs
         per worker and no cube is ever written. Also saves the per-frame block medians and quality flags
@@ -848,8 +592,6 @@ class DataProcessor():
         -------
         cuts : list of int
             cut numbers to write (default all n**2). Cuts whose cut.txt already exists are skipped.
-        part : bool
-            if True, split at the largest time gap into Part1/Part2 TPFs (as _make_part_cube)
         wcs_ffi : str
             file name of the FFI whose WCS the cuts' WCS is fitted to (default: the first FFI with a good WCS).
             Set it to an astrocut cut's WCS_FFI to reproduce that cut's WCS exactly.
@@ -861,7 +603,7 @@ class DataProcessor():
         -------
         Creates
         -------
-        [Part{i}/]Cut{cut}of{n**2}/sector*_cut*.fits and cut.txt for each cut; sector*_frame_stats.npz.
+        Cut{cut}of{n**2}/sector*_cut*.fits and cut.txt for each cut; sector*_frame_stats.npz.
 
         """
 
@@ -895,19 +637,6 @@ class DataProcessor():
             raise ValueError(f'FFI file names in {file_path} are not in strictly increasing time order')
         n_frames = len(files)
 
-        # -- Parts: split after the largest gap -- #
-        if part:
-            split = int(np.argmax(np.diff(times))) + 1
-            part_of = (np.arange(n_frames) >= split).astype(int)
-            part_dirs = [f'{broad_path}/Part1', f'{broad_path}/Part2']
-            part_starts = [0, split]
-        else:
-            part_of = np.zeros(n_frames, int)
-            part_dirs = [broad_path]
-            part_starts = [0]
-        row_of = np.arange(n_frames) - np.array(part_starts)[part_of]
-        part_rows = np.bincount(part_of, minlength=len(part_dirs))
-
         # -- Cut geometry, as make_cuts -- #
         warnings.simplefilter('ignore', FITSFixedWarning)     # astropy's 'datfix' note on every FFI header
         cutCorners, _, _, cutSize = self.find_cuts(cam=cam,ccd=ccd,n=n,plot=False,verbose=0)
@@ -926,8 +655,7 @@ class DataProcessor():
             raise ValueError(f'No FFI in {file_path} has a usable WCS')
         size = int(2 * cutSize)
         cuts = list(range(1, n**2 + 1)) if cuts is None else [int(c) for c in cuts]
-        todo = [c for c in cuts
-                if not all(os.path.exists(f'{d}/Cut{c}of{n**2}/cut.txt') for d in part_dirs)]
+        todo = [c for c in cuts if not os.path.exists(f'{broad_path}/Cut{c}of{n**2}/cut.txt')]
         stats_path = _frame_stats_path(broad_path, self.sector, cam, ccd)
         if not todo and os.path.exists(stats_path):
             print(f'Cam {cam} CCD {ccd} cuts {cuts} already made!')
@@ -939,32 +667,24 @@ class DataProcessor():
         need = len(todo) * n_frames * row_bytes
         free = shutil.disk_usage(broad_path).free
         if self.verbose > 0:
-            print(_Print_buff(50,f'Direct Cutting Sector {self.sector} Cam {cam} CCD {ccd}'))
+            print(_Print_buff(50,f'Cutting Sector {self.sector} Cam {cam} CCD {ccd}'))
             print(f'WCS from {wcs_ffi}')
-            print(f'{n_frames} FFIs -> {len(todo)} cuts of {size}x{size} px'
-                  + (f' in 2 parts ({part_rows[0]} + {part_rows[1]} frames)' if part else '')
-                  + f', {need/1e9:.1f} GB to write ({free/1e9:.0f} GB free)')
+            print(f'{n_frames} FFIs -> {len(todo)} cuts of {size}x{size} px, '
+                  f'{need/1e9:.1f} GB to write ({free/1e9:.0f} GB free)')
         if need > free:
             raise OSError(f'Not enough disk for the cuts: need {need/1e9:.1f} GB, {free/1e9:.1f} GB free')
 
         # -- Headers + empty tables, for the workers to fill row by row -- #
         with fits.open(files[0]) as h:
-            first0 = h[0].header.copy()
-        ffi_hdrs = []
-        for p in range(len(part_dirs)):
-            ffi_hdrs.append((first0, fits.getheader(files[part_starts[p]], 1),
-                             fits.getheader(files[part_starts[p] + part_rows[p] - 1], 1)))
+            ffi_hdrs = (h[0].header.copy(), h[1].header.copy(), fits.getheader(files[-1], 1))
         targets = []
-        for p, d in enumerate(part_dirs):
-            target = []
-            for c, (x0, y0) in zip(todo, corners):
-                folder = f'{d}/Cut{c}of{n**2}'
-                _Save_space(folder)
-                path = f'{folder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{c}_of{n**2}.fits'
-                start = _create_direct_tpf(path, ffi_hdrs[p], wcsItem, wcs_ffi, x0, y0, size, int(part_rows[p]), name_len,
-                                           self.sector, cam, ccd, c, n)
-                target.append((path, start))
-            targets.append(target)
+        for c, (x0, y0) in zip(todo, corners):
+            folder = f'{broad_path}/Cut{c}of{n**2}'
+            _Save_space(folder)
+            path = f'{folder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{c}_of{n**2}.fits'
+            start = _create_direct_tpf(path, ffi_hdrs, wcsItem, wcs_ffi, x0, y0, size, n_frames, name_len,
+                                       self.sector, cam, ccd, c, n)
+            targets.append((path, start))
 
         # -- One pass over the FFIs -- #
         n_workers = _available_cpus() if n_workers is None else n_workers
@@ -976,8 +696,8 @@ class DataProcessor():
         done = np.zeros(n_frames, bool)
         ts = t()
         results = Parallel(n_jobs=n_workers, return_as='generator')(
-            delayed(_direct_cut_chunk)([files[i] for i in idx], idx, row_of[idx], part_of[idx],
-                                       targets, corners, size, name_len) for idx in tasks)
+            delayed(_direct_cut_chunk)([files[i] for i in idx], idx, targets, corners, size, name_len)
+            for idx in tasks)
         with tqdm(total=n_frames, desc=f'Cam {cam} CCD {ccd} FFIs', unit='ffi', disable=self.verbose < 1) as bar:
             for res in results:
                 f = res['frames']
@@ -989,16 +709,15 @@ class DataProcessor():
 
         np.savez(stats_path, medians=medians, dquality=dquality, tstart=tstart, tstop=tstop,
                  files=np.array([os.path.basename(f) for f in files]), blocks=FRAME_STAT_BLOCKS)
-        for d in part_dirs:
-            for c in todo:
-                with open(f'{d}/Cut{c}of{n**2}/cut.txt', 'w') as file:
-                    file.write('Cut!')
+        for c in todo:
+            with open(f'{broad_path}/Cut{c}of{n**2}/cut.txt', 'w') as file:
+                file.write('Cut!')
 
         if self.verbose > 0:
-            print(f'Cam {cam} CCD {ccd} direct cuts complete ({(t()-ts)/60:.1f} min, {n_workers} workers).')
+            print(f'Cam {cam} CCD {ccd} cuts complete ({(t()-ts)/60:.1f} min, {n_workers} workers).')
             print('\n')
 
-    def stamp_cut_wcs(self,cam,ccd,n,cut,part=False):
+    def stamp_cut_wcs(self,cam,ccd,n,cut):
         """
         Write TessFixer's corrected WCS (as CutWCS gives it for this cut) into a direct cut's TPF, replacing the
         linear FFI fit, so tessreduce and lightkurve (tpf.wcs) place sources with the corrected WCS.
@@ -1015,12 +734,6 @@ class DataProcessor():
             n**2 cuts on the CCD
         cut : int
             cut number
-
-        -------
-        Options
-        -------
-        part : bool or int
-            True stamps both Part1 and Part2 TPFs, 1 or 2 just that part
         """
 
         from astropy.io import fits
@@ -1032,26 +745,19 @@ class DataProcessor():
             return
         cut_wcs = CutWCS(self.data_path,self.sector,cam,ccd,cut,n)
         name = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}.fits'
-        if part is True:
-            folders = [f'{file_path}/Part{i}/Cut{cut}of{n**2}' for i in (1, 2)]
-        elif part:
-            folders = [f'{file_path}/Part{int(part)}/Cut{cut}of{n**2}']
-        else:
-            folders = [f'{file_path}/Cut{cut}of{n**2}']
-        for folder in folders:
-            path = f'{folder}/{name}'
-            hdr = fits.getheader(path, 2)
-            size = hdr['NAXIS1']
-            extra = {k: (hdr[k], hdr.comments[k]) for k in ('WCS_FFI',) if k in hdr}
-            extra['WCS_SRC'] = ('TessFixer', 'wcs/ref/corrected.fits + cut offset')
-            extra['WCS_DX'] = (float(cut_wcs.dx), '[pix] CutWCS source offset x')
-            extra['WCS_DY'] = (float(cut_wcs.dy), '[pix] CutWCS source offset y')
-            _stamp_tpf_wcs(path, _cutwcs_header(cut_wcs, size), extra)
-            if self.verbose > 0:
-                print(f'Cam {cam} CCD {ccd} cut {cut}: corrected WCS written to {name} '
-                      f'(offset {cut_wcs.dx:.2f}, {cut_wcs.dy:.2f} px)')
+        path = f'{file_path}/Cut{cut}of{n**2}/{name}'
+        hdr = fits.getheader(path, 2)
+        size = hdr['NAXIS1']
+        extra = {k: (hdr[k], hdr.comments[k]) for k in ('WCS_FFI',) if k in hdr}
+        extra['WCS_SRC'] = ('TessFixer', 'wcs/ref/corrected.fits + cut offset')
+        extra['WCS_DX'] = (float(cut_wcs.dx), '[pix] CutWCS source offset x')
+        extra['WCS_DY'] = (float(cut_wcs.dy), '[pix] CutWCS source offset y')
+        _stamp_tpf_wcs(path, _cutwcs_header(cut_wcs, size), extra)
+        if self.verbose > 0:
+            print(f'Cam {cam} CCD {ccd} cut {cut}: corrected WCS written to {name} '
+                  f'(offset {cut_wcs.dx:.2f}, {cut_wcs.dy:.2f} px)')
 
-    def predict_asteroids(self,cam,ccd,n,cut,part=False,plot_trails=False):
+    def predict_asteroids(self,cam,ccd,n,cut,plot_trails=False):
         """
         Predicts every catalogued minor planet (from MPCORB) crossing this
         cut's footprint at any point during its observing window, using
@@ -1104,42 +810,40 @@ class DataProcessor():
         # side), or objects crossing near the corners get silently missed
         radius_deg = cutSize * np.sqrt(2) * 21.0 / 3600.0
 
-        for i in range(2 if part else 1):
-            part_label = f' Part {i+1}' if part else ''
-            cutFolder = f'{file_path}/Part{i+1}/Cut{cut}of{n**2}' if part else f'{file_path}/Cut{cut}of{n**2}'
-            base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
-            times_path = f'{cutFolder}/{base}_Times.npy'
+        cutFolder = f'{file_path}/Cut{cut}of{n**2}'
+        base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
+        times_path = f'{cutFolder}/{base}_Times.npy'
 
-            # the frame times saved by the reduction -- no cut data is loaded
-            if os.path.exists(times_path):
-                mjd = np.load(times_path)
-            else:
-                print(f'No saved frame times found to predict asteroids for '
-                      f'(Cam {cam} Ccd {ccd} Cut {cut}{part_label})!')
-                continue
+        # the frame times saved by the reduction -- no cut data is loaded
+        if os.path.exists(times_path):
+            mjd = np.load(times_path)
+        else:
+            print(f'No saved frame times found to predict asteroids for '
+                  f'(Cam {cam} Ccd {ccd} Cut {cut})!')
+            return
 
-            if self.verbose > 0:
-                print(f'Predicting Asteroids for Cam {cam} CCD {ccd} Cut {cut} (of {n**2}){part_label}')
+        if self.verbose > 0:
+            print(f'Predicting Asteroids for Cam {cam} CCD {ccd} Cut {cut} (of {n**2})')
 
-            try:
-                # allow_download=False: this runs as a SLURM job on a compute node with no
-                # internet access, so missing/uncovered kernel data must fail fast here rather
-                # than have a worker process try (and fail) to reach MAST mid-integration
-                ephemeris = predict_asteroids_for_footprint(
-                    ra_center, dec_center, radius_deg,
-                    mjd.min(), mjd.max(), mjd, wcsItem,
-                    data_dir=f'{self.data_path}/mpc', allow_download=False)
-            except RuntimeError as e:
-                print(f'Cannot predict asteroids for Cam {cam} Ccd {ccd} Cut {cut}{part_label}: {e}')
-                continue
+        try:
+            # allow_download=False: this runs as a SLURM job on a compute node with no
+            # internet access, so missing/uncovered kernel data must fail fast here rather
+            # than have a worker process try (and fail) to reach MAST mid-integration
+            ephemeris = predict_asteroids_for_footprint(
+                ra_center, dec_center, radius_deg,
+                mjd.min(), mjd.max(), mjd, wcsItem,
+                data_dir=f'{self.data_path}/mpc', allow_download=False)
+        except RuntimeError as e:
+            print(f'Cannot predict asteroids for Cam {cam} Ccd {ccd} Cut {cut}: {e}')
+            return
 
-            self._write_cut_asteroids(ephemeris, cutFolder, base, cut_corner, cutSize, plot_trails)
+        self._write_cut_asteroids(ephemeris, cutFolder, base, cut_corner, cutSize, plot_trails)
 
-            if self.verbose > 0:
-                n_tracks = ephemeris['designation'].nunique() if len(ephemeris) else 0
-                print(f'Cam {cam} CCD {ccd} Cut {cut}{part_label} asteroid prediction complete '
-                      f'({n_tracks} tracks found).')
-                print('\n')
+        if self.verbose > 0:
+            n_tracks = ephemeris['designation'].nunique() if len(ephemeris) else 0
+            print(f'Cam {cam} CCD {ccd} Cut {cut} asteroid prediction complete '
+                  f'({n_tracks} tracks found).')
+            print('\n')
 
     def _write_cut_asteroids(self, ephemeris, cutFolder, base, cut_corner, cutSize, plot_trails=False):
         """Write one cut's asteroid ephemeris, asteroids.txt marker and, if plot_trails, the trail plot
@@ -1167,7 +871,7 @@ class DataProcessor():
         with open(f'{cutFolder}/asteroids.txt', 'w') as file:
             file.write('Predicted!')
 
-    def predict_asteroids_ccd(self,cam,ccd,n,cuts=None,part=False,plot_trails=False):
+    def predict_asteroids_ccd(self,cam,ccd,n,cuts=None,plot_trails=False):
         """
         Asteroid prediction for a whole CCD at once, written out per cut in exactly the per-cut
         format (predict_asteroids). One catalogue pass and one ASSIST integration per object over
@@ -1191,7 +895,6 @@ class DataProcessor():
             n**2 cuts have been made
         cuts : list of int, optional
             cuts to write (default all n**2); the prediction covers the whole CCD regardless
-        part : bool
         """
         import pandas as pd
         from astropy.io import fits
@@ -1223,94 +926,50 @@ class DataProcessor():
         ccd_dec = np.degrees(np.arcsin(mid[2]))
         ccd_radius = float(np.degrees(np.arccos(np.clip(uv @ mid, -1, 1))).max() + radius_deg)
 
-        for i in range(2 if part else 1):
-            part_label = f' Part {i+1}' if part else ''
-            cut_mjds = {}
-            for cut in cuts:
-                cutFolder = f'{file_path}/Part{i+1}/Cut{cut}of{n**2}' if part else f'{file_path}/Cut{cut}of{n**2}'
-                base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
-                times_path = f'{cutFolder}/{base}_Times.npy'
-                # the frame times saved by the reduction -- no cut data is loaded
-                if os.path.exists(times_path):
-                    cut_mjds[cut] = np.load(times_path)
-                else:
-                    print(f'No saved frame times found to predict asteroids for '
-                          f'(Cam {cam} Ccd {ccd} Cut {cut}{part_label})!')
-            if not cut_mjds:
-                continue
-            mjd = np.unique(np.concatenate(list(cut_mjds.values())))
-
-            if self.verbose > 0:
-                print(f'Predicting Asteroids for Cam {cam} CCD {ccd}{part_label} ({len(cut_mjds)} cuts, '
-                      f'{len(mjd)} frames, footprint radius {ccd_radius:.2f} deg)')
-            try:
-                # allow_download=False: SLURM compute nodes have no internet access (see predict_asteroids)
-                ephemeris = predict_asteroids_for_footprint(
-                    ccd_ra, ccd_dec, ccd_radius, mjd.min(), mjd.max(), mjd, wcsItem,
-                    data_dir=f'{self.data_path}/mpc', allow_download=False)
-            except RuntimeError as e:
-                print(f'Cannot predict asteroids for Cam {cam} Ccd {ccd}{part_label}: {e}')
-                continue
-
-            # split into cuts and write them in parallel workers (_write_cuts_parallel)
-            n_tracks = ephemeris['designation'].nunique() if len(ephemeris) else 0
-            ccd_eph = _ccd_ephemeris_for_cuts(ephemeris, mjd, cutSize)
-            del ephemeris
-            jobs = []
-            for cut, cmjd in cut_mjds.items():
-                cutFolder = f'{file_path}/Part{i+1}/Cut{cut}of{n**2}' if part else f'{file_path}/Cut{cut}of{n**2}'
-                base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
-                jobs.append((cutCorners[cut-1], cmjd, cutFolder, base, plot_trails))
-            _write_cuts_parallel(self, ccd_eph, jobs)
-            del ccd_eph
-            if self.verbose > 0:
-                print(f'Cam {cam} CCD {ccd}{part_label} asteroid prediction complete '
-                      f'({n_tracks} tracks over the CCD, written to {len(cut_mjds)} cuts).')
-                print('\n')
-
-    def _reduce_part_cuts(self,cam,ccd,n,cut,filepath):
-
-        for i in range(2):
-            cutFolder = f'{filepath}/Part{i+1}/Cut{cut}of{n**2}'
-            cutName = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}.fits'
-            cutPath = f'{cutFolder}/{cutName}'
-            fluxName = f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_ReducedFlux.npy'
-            if os.path.exists(fluxName):
-                if self.verbose > 0:
-                    print(f'Cam {cam} Chip {ccd} Cut {cut} Part {i+1} already reduced!')
+        cut_mjds = {}
+        for cut in cuts:
+            cutFolder = f'{file_path}/Cut{cut}of{n**2}'
+            base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
+            times_path = f'{cutFolder}/{base}_Times.npy'
+            # the frame times saved by the reduction -- no cut data is loaded
+            if os.path.exists(times_path):
+                cut_mjds[cut] = np.load(times_path)
             else:
-                ts = t()
-                if self.verbose > 0:
-                    print(f'--Reduction Cam {cam} Chip {ccd} Cut {cut} (of {n**2}) Part {i+1} --')
+                print(f'No saved frame times found to predict asteroids for '
+                      f'(Cam {cam} Ccd {ccd} Cut {cut})!')
+        if not cut_mjds:
+            return
+        mjd = np.unique(np.concatenate(list(cut_mjds.values())))
 
-                # -- Defining so can be deleted if failed -- #
-                tessreduce = 0
+        if self.verbose > 0:
+            print(f'Predicting Asteroids for Cam {cam} CCD {ccd} ({len(cut_mjds)} cuts, '
+                  f'{len(mjd)} frames, footprint radius {ccd_radius:.2f} deg)')
+        try:
+            # allow_download=False: SLURM compute nodes have no internet access (see predict_asteroids)
+            ephemeris = predict_asteroids_for_footprint(
+                ccd_ra, ccd_dec, ccd_radius, mjd.min(), mjd.max(), mjd, wcsItem,
+                data_dir=f'{self.data_path}/mpc', allow_download=False)
+        except RuntimeError as e:
+            print(f'Cannot predict asteroids for Cam {cam} Ccd {ccd}: {e}')
+            return
 
-                # -- reduce -- #
-                tessreduce = tr.tessreduce(tpf=cutPath,sector=self.sector,reduce=True,corr_correction=True,
-                                            calibrate=False,catalogue_path=f'{cutFolder}/local_gaia_cat.csv',
-                                            prf_path='/fred/oz335/_local_TESS_PRFs',backend='multiprocessing',verbose=2)
-                
-                if self.verbose > 0:
-                    print(f'--Reduction Part {i+1} Complete (Time: {((t()-ts)/60):.2f} mins)--')
-                    print('\n')
-                #tw = t()   # write timeStart
-                
-                # -- Saves information out as Numpy Arrays -- #
-                np.save(f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_Times.npy',tessreduce.lc[0])
-                save_compact_array(f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_ReducedFlux.npy',tessreduce.flux)
-                save_compact_array(f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_Background.npy',tessreduce.bkg)
-                np.save(f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_Ref.npy',tessreduce.ref)
-                np.save(f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_Mask.npy',tessreduce.mask)
-                np.save(f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_Shifts.npy',tessreduce.shift)
+        # split into cuts and write them in parallel workers (_write_cuts_parallel)
+        n_tracks = ephemeris['designation'].nunique() if len(ephemeris) else 0
+        ccd_eph = _ccd_ephemeris_for_cuts(ephemeris, mjd, cutSize)
+        del ephemeris
+        jobs = []
+        for cut, cmjd in cut_mjds.items():
+            cutFolder = f'{file_path}/Cut{cut}of{n**2}'
+            base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
+            jobs.append((cutCorners[cut-1], cmjd, cutFolder, base, plot_trails))
+        _write_cuts_parallel(self, ccd_eph, jobs)
+        del ccd_eph
+        if self.verbose > 0:
+            print(f'Cam {cam} CCD {ccd} asteroid prediction complete '
+                  f'({n_tracks} tracks over the CCD, written to {len(cut_mjds)} cuts).')
+            print('\n')
 
-                del (tessreduce)
-
-                with open(f'{cutFolder}/reduced.txt', 'w') as file:
-                    file.write(f'Reduced with TESSreduce version {tr.__version__}.')
-
-
-    def reduce(self,cam,ccd,n,cut,part=False,injection=False,injection_dir='source_injection'):
+    def reduce(self,cam,ccd,n,cut,injection=False,injection_dir='source_injection'):
         """
         Reduces a cut on a ccd using TESSreduce. bkg correlation 
         correction and final calibration are disabled due to time constraints.
@@ -1323,7 +982,7 @@ class DataProcessor():
         ccd : int
             desired ccd
         n : int
-            n**2 part cuts
+            n**2 cuts
 
         -------
         Creates
@@ -1338,89 +997,86 @@ class DataProcessor():
         filepath = f'{self.path}/Cam{cam}/Ccd{ccd}'
         injection_dir = injection_dir if injection else '.'
 
-        if part:
-            self._reduce_part_cuts(cam,ccd,n,cut,filepath)
+        cutFolder = f'{filepath}/Cut{cut}of{n**2}'
+        cutBase = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}' 
+
+        if injection:
+            cutPath = None
+            save_path = f'{cutFolder}/{injection_dir}/{cutBase}'
+            flux = np.load(f'{save_path}_RawFlux.npy')
+            mjd = np.load(f'{cutFolder}/{cutBase}_Times.npy')
+            shifts = np.load(f'{cutFolder}/{cutBase}_Shifts.npy')
+            wcs = CutWCS(self.data_path,self.sector,cam,ccd,cut,n)
         else:
-            cutFolder = f'{filepath}/Cut{cut}of{n**2}'
-            cutBase = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}' 
+            cutPath = f'{cutFolder}/{cutBase}.fits'
+            save_path = f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
+            flux = None
+            mjd = None
+            shifts = None
+            wcs = None
 
-            if injection:
-                cutPath = None
-                save_path = f'{cutFolder}/{injection_dir}/{cutBase}'
-                flux = np.load(f'{save_path}_RawFlux.npy')
-                mjd = np.load(f'{cutFolder}/{cutBase}_Times.npy')
-                shifts = np.load(f'{cutFolder}/{cutBase}_Shifts.npy')
-                wcs = CutWCS(self.data_path,self.sector,cam,ccd,cut,n)
-            else:
-                cutPath = f'{cutFolder}/{cutBase}.fits'
-                save_path = f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
-                flux = None
-                mjd = None
-                shifts = None
-                wcs = None
+        cut_corners,_,_,_ = self.find_cuts(cam,ccd,n,plot=False)
 
-            cut_corners,_,_,_ = self.find_cuts(cam,ccd,n,plot=False)
+        with open(f'{self.path}/Cam{cam}/Ccd{ccd}/wcs/ref/reference.txt') as reffile:
+            ref_ind = int(reffile.readlines()[0].split(': ')[-1])
 
-            with open(f'{self.path}/Cam{cam}/Ccd{ccd}/wcs/ref/reference.txt') as reffile:
-                ref_ind = int(reffile.readlines()[0].split(': ')[-1])
+        # fluxName = f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_ReducedFlux.npy'
 
-            # fluxName = f'{cutFolder}/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_ReducedFlux.npy'
-
-            # if os.path.exists(fluxName):
-            #     if self.verbose > 0:
-            #         print(f'Cam {cam} Chip {ccd} cut {cut} already reduced!')
-            # else:
-            ts = t()
-            if self.verbose > 0:
-                print(f'--Reduction Cam {cam} Chip {ccd} Cut {cut} (of {n**2})--')
-                
-
-
-            # -- Defining so can be deleted if failed -- #
-            tessreduce = 0
-
-            # -- reduce -- #
-            tessreduce = tr.tessreduce(tpf=cutPath,sector=self.sector,camera=cam,ccd=ccd,
-                                       flux=flux,mjd=mjd,shifts=shifts,wcs=wcs,
-                                        reduce=True,corr_correction=True,
-                                        calibrate=False,catalogue_path=f'{cutFolder}/local_gaia_cat.csv',col_offset=int(cut_corners[cut-1][0]),#-44,
-                                        prf_path='/fred/oz335/_local_TESS_PRFs',vector_path='/fred/oz335/_local_TESS_vectors',
-                                        ref_ind=ref_ind,quality_bitmask='hard',shift_method='sep_core',smooth_motion=False,
-                                        orbit_ref=True,create_lc=False,timing=True,backend='multiprocessing',verbose=2)
-
-            # # -- reduce -- #
-            # tessreduce = tr.tessreduce(tpf=cutPath,flux=fluxPath,time=timePath,ref=refPath,
-            #                            sector=self.sector,reduce=True,corr_correction=True,
-            #                             calibrate=False,catalogue_path=f'{cutFolder}/local_gaia_cat.csv',col_offset=int(cut_corners[cut-1][0]),#-44,
-            #                             prf_path='/fred/oz335/_local_TESS_PRFs',vector_path='/fred/oz335/_local_TESS_vectors',
-            #                             ref_ind=ref_ind,quality_bitmask='hard',shift_method='sep_core',smooth_motion=False,
-            #                             orbit_ref=True,create_lc=False,timing=True,backend='multiprocessing',verbose=2)
+        # if os.path.exists(fluxName):
+        #     if self.verbose > 0:
+        #         print(f'Cam {cam} Chip {ccd} cut {cut} already reduced!')
+        # else:
+        ts = t()
+        if self.verbose > 0:
+            print(f'--Reduction Cam {cam} Chip {ccd} Cut {cut} (of {n**2})--')
             
-            if self.verbose > 0:
-                print(f'--Reduction Complete (Time: {((t()-ts)/60):.2f} mins)--')
-                print('\n')
-            #tw = t()   # write timeStart
-            
-            # -- Refuse to save an all-NaN reduction (e.g. a NaN reference), so the cut isn't marked reduced -- #
-            bad = [name for name in ('ref','flux','bkg') if not np.isfinite(getattr(tessreduce,name)).any()]
-            if bad:
-                e = f'Reduction of Cam {cam} Ccd {ccd} Cut {cut} failed: {", ".join(bad)} all NaN. Nothing saved.'
-                raise RuntimeError(e)
 
-            # -- Saves information out as Numpy Arrays -- #
-            np.save(f'{save_path}_Times.npy',tessreduce.mjd)
-            np.save(f'{save_path}_ReducedFlux.npy',tessreduce.flux.astype(np.float32))
-            np.save(f'{save_path}_Background.npy',tessreduce.bkg)
-            np.save(f'{save_path}_Ref.npy',tessreduce.ref)
-            np.save(f'{save_path}_Mask.npy',tessreduce.mask)
-            np.save(f'{save_path}_Shifts.npy',tessreduce.shift)
-            np.save(f'{save_path}_OrbitSegments.npy',tessreduce.orbit_segments)
-            np.savez(f'{save_path}_OrbitRefs.npz',
-                     **{str(k): v for k, v in tessreduce.orbit_refs.items()})
 
-            del (tessreduce)
+        # -- Defining so can be deleted if failed -- #
+        tessreduce = 0
 
-    def asteroid_lightcurves(self,cam,ccd,n,cut,part=False,mark_done=True,n_workers=None):
+        # -- reduce -- #
+        tessreduce = tr.tessreduce(tpf=cutPath,sector=self.sector,camera=cam,ccd=ccd,
+                                   flux=flux,mjd=mjd,shifts=shifts,wcs=wcs,
+                                    reduce=True,corr_correction=True,
+                                    calibrate=False,catalogue_path=f'{cutFolder}/local_gaia_cat.csv',col_offset=int(cut_corners[cut-1][0]),#-44,
+                                    prf_path='/fred/oz335/_local_TESS_PRFs',vector_path='/fred/oz335/_local_TESS_vectors',
+                                    ref_ind=ref_ind,quality_bitmask='hard',shift_method='sep_core',smooth_motion=False,
+                                    orbit_ref=True,create_lc=False,timing=True,backend='multiprocessing',verbose=2)
+
+        # # -- reduce -- #
+        # tessreduce = tr.tessreduce(tpf=cutPath,flux=fluxPath,time=timePath,ref=refPath,
+        #                            sector=self.sector,reduce=True,corr_correction=True,
+        #                             calibrate=False,catalogue_path=f'{cutFolder}/local_gaia_cat.csv',col_offset=int(cut_corners[cut-1][0]),#-44,
+        #                             prf_path='/fred/oz335/_local_TESS_PRFs',vector_path='/fred/oz335/_local_TESS_vectors',
+        #                             ref_ind=ref_ind,quality_bitmask='hard',shift_method='sep_core',smooth_motion=False,
+        #                             orbit_ref=True,create_lc=False,timing=True,backend='multiprocessing',verbose=2)
+        
+        if self.verbose > 0:
+            print(f'--Reduction Complete (Time: {((t()-ts)/60):.2f} mins)--')
+            print('\n')
+        #tw = t()   # write timeStart
+        
+        # -- Refuse to save an all-NaN reduction (e.g. a NaN reference), so the cut isn't marked reduced -- #
+        bad = [name for name in ('ref','flux','bkg') if not np.isfinite(getattr(tessreduce,name)).any()]
+        if bad:
+            e = f'Reduction of Cam {cam} Ccd {ccd} Cut {cut} failed: {", ".join(bad)} all NaN. Nothing saved.'
+            raise RuntimeError(e)
+
+        # -- Saves information out as Numpy Arrays -- #
+        np.save(f'{save_path}_Times.npy',tessreduce.mjd)
+        np.save(f'{save_path}_ReducedFlux.npy',tessreduce.flux.astype(np.float32))
+        np.save(f'{save_path}_Background.npy',tessreduce.bkg)
+        np.save(f'{save_path}_Ref.npy',tessreduce.ref)
+        np.save(f'{save_path}_Mask.npy',tessreduce.mask)
+        np.save(f'{save_path}_Shifts.npy',tessreduce.shift)
+        np.save(f'{save_path}_OrbitSegments.npy',tessreduce.orbit_segments)
+        np.savez(f'{save_path}_OrbitRefs.npz',
+                 **{str(k): v for k, v in tessreduce.orbit_refs.items()})
+
+        del (tessreduce)
+
+    def asteroid_lightcurves(self,cam,ccd,n,cut,mark_done=True,n_workers=None):
         """
         Forced aperture + PSF photometry, pixel-phase detrending, star-
         contamination flagging, and shift-and-stack for every asteroid
@@ -1480,109 +1136,106 @@ class DataProcessor():
         with fits.open(wcs_path) as f:
             wcsItem = WCS(f[1].header)
 
-        for i in range(2 if part else 1):
-            part_label = f' Part {i+1}' if part else ''
-            cutFolder = f'{file_path}/Part{i+1}/Cut{cut}of{n**2}' if part else f'{file_path}/Cut{cut}of{n**2}'
-            base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
+        cutFolder = f'{file_path}/Cut{cut}of{n**2}'
+        base = f'sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}'
 
-            asteroids_path = f'{cutFolder}/asteroids/{base}_Asteroids.csv'
-            if not table_exists(asteroids_path):
-                print(f'No asteroid predictions found for Cam {cam} Ccd {ccd} Cut {cut}{part_label} '
-                      '-- run predict_asteroids first!')
-                continue
+        asteroids_path = f'{cutFolder}/asteroids/{base}_Asteroids.csv'
+        if not table_exists(asteroids_path):
+            print(f'No asteroid predictions found for Cam {cam} Ccd {ccd} Cut {cut} '
+                  '-- run predict_asteroids first!')
+            return
 
-            flux_path = f'{cutFolder}/{base}_ReducedFlux.npy'
-            times_path = f'{cutFolder}/{base}_Times.npy'
-            if not (os.path.exists(flux_path) and os.path.exists(times_path)):
-                print(f'No reduced data found for Cam {cam} Ccd {ccd} Cut {cut}{part_label} -- run reduce first!')
-                continue
+        flux_path = f'{cutFolder}/{base}_ReducedFlux.npy'
+        times_path = f'{cutFolder}/{base}_Times.npy'
+        if not (os.path.exists(flux_path) and os.path.exists(times_path)):
+            print(f'No reduced data found for Cam {cam} Ccd {ccd} Cut {cut} -- run reduce first!')
+            return
 
-            if self.verbose > 0:
-                print(f'Building Asteroid Lightcurves for Cam {cam} CCD {ccd} Cut {cut} (of {n**2}){part_label}')
+        if self.verbose > 0:
+            print(f'Building Asteroid Lightcurves for Cam {cam} CCD {ccd} Cut {cut} (of {n**2})')
 
-            ephemeris = load_table(asteroids_path)
-            if len(ephemeris) == 0:
-                print(f'No asteroids predicted for Cam {cam} Ccd {ccd} Cut {cut}{part_label}.')
-                # staged empty, so a rerun still replaces whatever this cut held in the store
-                asteroid_store.write_empty_staging(self.data_path, self.sector, cam, ccd, cut, i + 1 if part else 0)
-                if mark_done:
-                    with open(f'{cutFolder}/asteroid_lightcurves.txt', 'w') as file:
-                        file.write('No asteroids to process.')
-                continue
-
-            cube = np.load(flux_path)
-            reduced_mjd = np.load(times_path)
-            ephemeris = match_ephemeris_to_reduced_frames(ephemeris, reduced_mjd)
-
-            gaia_cat_path = f'{cutFolder}/local_gaia_cat.csv'
-            if os.path.exists(gaia_cat_path):
-                gaia_cat = pd.read_csv(gaia_cat_path)
-                stars = local_gaia_cat_to_stars(gaia_cat, wcsItem, cut_corner[0], cut_corner[1])
-            else:
-                stars = pd.DataFrame(columns=['x','y','mag'])
-
-            # this cut's own AB zeropoint, if calibrate() has already run for it -- lets
-            # pool_offset_from_stacks convert each track's fitted flux to a real magnitude
-            # for a direct sanity check against the ephemeris's own predicted mag_expected.
-            # None (uncalibrated) is a normal, handled case, not an error; the store fills it
-            # at merge if calibrate() finishes first.
-            zp, e_zp = asteroid_store.read_zeropoint(cutFolder)
-            zp_ab = zp if np.isfinite(zp) else None
-
-            # Step 1: find the predicted-vs-measured position offset, straight off the raw
-            # predicted ephemeris -- measure_stack_centroid_offset works from raw cube stamps
-            # and its own joint position+flux fit's significance (not a forced-photometry
-            # SNR), so no photometry needs to run before the offset is known.
-            offset_x, offset_y, n_offset_tracks, offset_diagnostics = pool_offset_from_stacks(
-                ephemeris, cube, self.sector, cam, ccd, cut_corner[0], cut_corner[1], zp_ab=zp_ab,
-                n_workers=n_workers)
-
-            # both the aperture and the (non-centroiding, fixed-position) PSF fit assume the
-            # given x,y IS the source, so a real predicted-vs-actual offset left uncorrected
-            # silently loses flux on every measurement. The offset is per object (its own
-            # ephemeris error): each track's own stack fit where it is significant, else the
-            # cut's pooled offset, else none (track_offsets)
-            per_track = track_offsets(ephemeris['designation'], offset_diagnostics, offset_x, offset_y)
-            photometry_ephemeris = ephemeris.copy()
-            photometry_ephemeris['x'] += photometry_ephemeris['designation'].map(per_track['offset_x']).to_numpy()
-            photometry_ephemeris['y'] += photometry_ephemeris['designation'].map(per_track['offset_y']).to_numpy()
-
-            # Step 2: forced photometry, exactly once, at the position from step 1.
-            # Aperture photometry is currently disabled -- not part of the pipeline for now
-            # (forced_aperture_photometry itself is untouched in asteroid_photometry.py, just
-            # not called here).
-            psf_df = forced_psf_photometry(cube, photometry_ephemeris, self.sector, cam, ccd,
-                                             cut_corner[0], cut_corner[1])
-            psf_df = detrend_pixel_phase(psf_df)
-
-            # Step 3: contamination flags, on the one photometry result actually being saved
-            psf_df = flag_star_contamination(psf_df, stars, flux_col='flux_detrended')
-            stack_summary_df = stack_summary(psf_df)
-
-            # staged for the sector's designation-sorted store (asteroid_store.merge_sector), not
-            # saved in the cut folder; the stacked photometry is derived, so it is not stored
-            part_index = i + 1 if part else 0
-            asteroid_store.write_staging(
-                self.data_path,
-                asteroid_store.photometry_table(psf_df, ephemeris, self.sector, cam, ccd, cut, part_index,
-                                                shape=cube.shape[1:], zp_ab=zp, e_zp_ab=e_zp),
-                asteroid_store.tracks_table(ephemeris, psf_df, stack_summary_df, offset_diagnostics, offset_x, offset_y,
-                                            n_offset_tracks, self.sector, cam, ccd, cut, part_index, per_track=per_track,
-                                            zp_ab=zp, e_zp_ab=e_zp),
-                self.sector, cam, ccd, cut, part_index)
-
+        ephemeris = load_table(asteroids_path)
+        if len(ephemeris) == 0:
+            print(f'No asteroids predicted for Cam {cam} Ccd {ccd} Cut {cut}.')
+            # staged empty, so a rerun still replaces whatever this cut held in the store
+            asteroid_store.write_empty_staging(self.data_path, self.sector, cam, ccd, cut)
             if mark_done:
                 with open(f'{cutFolder}/asteroid_lightcurves.txt', 'w') as file:
-                    file.write('Done!')
+                    file.write('No asteroids to process.')
+            return
 
-            if self.verbose > 0:
-                n_tracks = ephemeris['designation'].nunique()
-                n_robust = int(((~stack_summary_df['stacking_needed']) |
-                                 (stack_summary_df['achieved_sig'] >= STACK_SIG_TARGET)).sum())
-                print(f'Cam {cam} CCD {ccd} Cut {cut}{part_label} asteroid lightcurves complete '
-                      f'({n_tracks} tracks, {n_robust} robustly detected).')
-                print('\n')
-    def asteroid_lightcurves_ccd(self,cam,ccd,n,cuts=None,part=False,mark_done=True,n_workers=None):
+        cube = np.load(flux_path)
+        reduced_mjd = np.load(times_path)
+        ephemeris = match_ephemeris_to_reduced_frames(ephemeris, reduced_mjd)
+
+        gaia_cat_path = f'{cutFolder}/local_gaia_cat.csv'
+        if os.path.exists(gaia_cat_path):
+            gaia_cat = pd.read_csv(gaia_cat_path)
+            stars = local_gaia_cat_to_stars(gaia_cat, wcsItem, cut_corner[0], cut_corner[1])
+        else:
+            stars = pd.DataFrame(columns=['x','y','mag'])
+
+        # this cut's own AB zeropoint, if calibrate() has already run for it -- lets
+        # pool_offset_from_stacks convert each track's fitted flux to a real magnitude
+        # for a direct sanity check against the ephemeris's own predicted mag_expected.
+        # None (uncalibrated) is a normal, handled case, not an error; the store fills it
+        # at merge if calibrate() finishes first.
+        zp, e_zp = asteroid_store.read_zeropoint(cutFolder)
+        zp_ab = zp if np.isfinite(zp) else None
+
+        # Step 1: find the predicted-vs-measured position offset, straight off the raw
+        # predicted ephemeris -- measure_stack_centroid_offset works from raw cube stamps
+        # and its own joint position+flux fit's significance (not a forced-photometry
+        # SNR), so no photometry needs to run before the offset is known.
+        offset_x, offset_y, n_offset_tracks, offset_diagnostics = pool_offset_from_stacks(
+            ephemeris, cube, self.sector, cam, ccd, cut_corner[0], cut_corner[1], zp_ab=zp_ab,
+            n_workers=n_workers)
+
+        # both the aperture and the (non-centroiding, fixed-position) PSF fit assume the
+        # given x,y IS the source, so a real predicted-vs-actual offset left uncorrected
+        # silently loses flux on every measurement. The offset is per object (its own
+        # ephemeris error): each track's own stack fit where it is significant, else the
+        # cut's pooled offset, else none (track_offsets)
+        per_track = track_offsets(ephemeris['designation'], offset_diagnostics, offset_x, offset_y)
+        photometry_ephemeris = ephemeris.copy()
+        photometry_ephemeris['x'] += photometry_ephemeris['designation'].map(per_track['offset_x']).to_numpy()
+        photometry_ephemeris['y'] += photometry_ephemeris['designation'].map(per_track['offset_y']).to_numpy()
+
+        # Step 2: forced photometry, exactly once, at the position from step 1.
+        # Aperture photometry is currently disabled -- not part of the pipeline for now
+        # (forced_aperture_photometry itself is untouched in asteroid_photometry.py, just
+        # not called here).
+        psf_df = forced_psf_photometry(cube, photometry_ephemeris, self.sector, cam, ccd,
+                                         cut_corner[0], cut_corner[1])
+        psf_df = detrend_pixel_phase(psf_df)
+
+        # Step 3: contamination flags, on the one photometry result actually being saved
+        psf_df = flag_star_contamination(psf_df, stars, flux_col='flux_detrended')
+        stack_summary_df = stack_summary(psf_df)
+
+        # staged for the sector's designation-sorted store (asteroid_store.merge_sector), not
+        # saved in the cut folder; the stacked photometry is derived, so it is not stored
+        asteroid_store.write_staging(
+            self.data_path,
+            asteroid_store.photometry_table(psf_df, ephemeris, self.sector, cam, ccd, cut,
+                                            shape=cube.shape[1:], zp_ab=zp, e_zp_ab=e_zp),
+            asteroid_store.tracks_table(ephemeris, psf_df, stack_summary_df, offset_diagnostics, offset_x, offset_y,
+                                        n_offset_tracks, self.sector, cam, ccd, cut, per_track=per_track,
+                                        zp_ab=zp, e_zp_ab=e_zp),
+            self.sector, cam, ccd, cut)
+
+        if mark_done:
+            with open(f'{cutFolder}/asteroid_lightcurves.txt', 'w') as file:
+                file.write('Done!')
+
+        if self.verbose > 0:
+            n_tracks = ephemeris['designation'].nunique()
+            n_robust = int(((~stack_summary_df['stacking_needed']) |
+                             (stack_summary_df['achieved_sig'] >= STACK_SIG_TARGET)).sum())
+            print(f'Cam {cam} CCD {ccd} Cut {cut} asteroid lightcurves complete '
+                  f'({n_tracks} tracks, {n_robust} robustly detected).')
+            print('\n')
+    def asteroid_lightcurves_ccd(self,cam,ccd,n,cuts=None,mark_done=True,n_workers=None):
         """
         asteroid_lightcurves() for every requested cut of one CCD, in one job, several cuts at a
         time: one cut per core (n_workers, default the job's CPUs), each single-threaded with its
@@ -1606,22 +1259,20 @@ class DataProcessor():
         file_path = f'{self.path}/Cam{cam}/Ccd{ccd}'
         todo = []
         for cut in cuts:
-            folders = [f'{file_path}/Part{i}/Cut{cut}of{n**2}' for i in (1, 2)] if part else [f'{file_path}/Cut{cut}of{n**2}']
-            if mark_done and all(os.path.exists(f'{f}/asteroid_lightcurves.txt') for f in folders):
+            folder = f'{file_path}/Cut{cut}of{n**2}'
+            if mark_done and os.path.exists(f'{folder}/asteroid_lightcurves.txt'):
                 continue
-            if not mark_done and all(asteroid_store.is_staged(self.data_path, self.sector, cam, ccd, cut, p)
-                                     for p in ((1, 2) if part else (0,))):
+            if not mark_done and asteroid_store.is_staged(self.data_path, self.sector, cam, ccd, cut):
                 continue
-            size = sum(os.path.getsize(p) for f in folders
-                       for p in [f'{f}/asteroids/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_Asteroids.parquet']
-                       if os.path.exists(p))
+            pred = f'{folder}/asteroids/sector{self.sector}_cam{cam}_ccd{ccd}_cut{cut}_of{n**2}_Asteroids.parquet'
+            size = os.path.getsize(pred) if os.path.exists(pred) else 0
             todo.append((size, cut))
         todo = [cut for _, cut in sorted(todo, reverse=True)]
         n_workers = max(1, min(len(todo), n_workers or _available_cpu_count()))
 
         failed = []
         if n_workers == 1:
-            results = (_lightcurves_cut_worker(self.sector, self.data_path, self.verbose, cam, ccd, n, cut, part, mark_done)
+            results = (_lightcurves_cut_worker(self.sector, self.data_path, self.verbose, cam, ccd, n, cut, mark_done)
                        for cut in todo)
         else:
             for env in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
@@ -1630,7 +1281,7 @@ class DataProcessor():
             os.environ["MKL_THREADING_LAYER"] = "SEQUENTIAL"
             pool = ProcessPoolExecutor(max_workers=n_workers, mp_context=multiprocessing.get_context("spawn"))
             futures = [pool.submit(_lightcurves_cut_worker, self.sector, self.data_path, self.verbose, cam, ccd, n, cut,
-                                   part, mark_done) for cut in todo]
+                                   mark_done) for cut in todo]
             results = (f.result() for f in as_completed(futures))
         try:
             for cut, seconds, error in results:
@@ -1647,14 +1298,14 @@ class DataProcessor():
             raise RuntimeError(f'Asteroid lightcurves failed for Cam {cam} CCD {ccd} cuts {sorted(failed)}')
 
 
-def _lightcurves_cut_worker(sector, data_path, verbose, cam, ccd, n, cut, part, mark_done):
+def _lightcurves_cut_worker(sector, data_path, verbose, cam, ccd, n, cut, mark_done):
     """One cut's asteroid_lightcurves in a worker process (offset fits serial: the cut has one core).
     Returns (cut, seconds, error traceback or None)."""
     import traceback
     ts = t()
     try:
         DataProcessor(sector=sector, data_path=data_path, verbose=verbose).asteroid_lightcurves(
-            cam=cam, ccd=ccd, n=n, cut=cut, part=part, mark_done=mark_done, n_workers=1)
+            cam=cam, ccd=ccd, n=n, cut=cut, mark_done=mark_done, n_workers=1)
         return cut, t() - ts, None
     except Exception:
         return cut, t() - ts, traceback.format_exc()

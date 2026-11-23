@@ -713,10 +713,11 @@ class Tessellate():
             predict_asteroids_cpu_sug = '16'
             predict_asteroids_mem_req = 160
 
-            # whole sector in one cut TPF: about half the 4-orbit peak (243 GiB, below), with margin
+            # whole sector in one cut TPF: memory scales with frames, so about half the 4-orbit peak
+            # (243 GiB at 18,318 good frames, below) -- ~120 GiB -- plus ~30% margin
             reduce_time_sug = '3:00:00'
             reduce_cpu_sug = '32'
-            reduce_mem_req = 200
+            reduce_mem_req = 160
 
             # scaled from the secondary tier's post-full-run-revision values (see there for why)
             asteroid_lightcurves_time_sug = '45:00'

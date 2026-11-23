@@ -238,8 +238,10 @@ def Calculate_WCS(save_folder,order=6):
     print('Fitting wcs polynomial')
     while not converged:
         
-        coeff_Sci2IdlX = polyfit0(matches.t['u'], matches.t['xprime'], matches.t['yprime'],order=poly_degree, rotation_fit_x=True,fit_coeffs0=True)
-        coeff_Sci2IdlY = polyfit0(matches.t['v'], matches.t['xprime'], matches.t['yprime'],order=poly_degree, rotation_fit_y=True,fit_coeffs0=True)
+        # -- fit only the stars the sigma clipping has kept so far (it used to fit all of them every iteration) -- #
+        fit = matches.t.loc[ixs4fit]
+        coeff_Sci2IdlX = polyfit0(fit['u'], fit['xprime'], fit['yprime'],order=poly_degree, rotation_fit_x=True,fit_coeffs0=True)
+        coeff_Sci2IdlY = polyfit0(fit['v'], fit['xprime'], fit['yprime'],order=poly_degree, rotation_fit_y=True,fit_coeffs0=True)
 
         #sys.exit(0)
 

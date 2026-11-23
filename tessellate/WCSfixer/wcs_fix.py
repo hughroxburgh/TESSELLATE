@@ -173,7 +173,10 @@ def make_coeff_table(coeff_Sci2IdlX,coeff_Sci2IdlY,coeff_Idl2SciX,coeff_Idl2SciY
 def Calculate_WCS(save_folder,order=6):
 
     wcs_path = f'{save_folder}/corrected.fits'
+    # -- Drop failed star fits: polyfit0's pandas sums skip NaN, but NaN**0 = 1, so a NaN-xPSF star still enters
+    # -- the constant-term equations -- one such star gave S98 Cam1 Ccd1 a 0.66 px ring-shaped WCS error
     ccd_sources = pd.read_csv(f'{save_folder}/ccd_sourcefits.csv')
+    ccd_sources = ccd_sources.dropna(subset=['xPSF','yPSF','ra','dec']).reset_index(drop=True)
 
     imtable = pdastroclass()
     ix = imtable.newrow({'basename':f'tess_image'}) 

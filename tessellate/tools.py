@@ -646,7 +646,22 @@ def _screen_size():
         return 1920, 1080
 
 
-def manual_sort(events_path, image_dir=None, sort_dir=None, screen_size=None):
+def _Banner(img, text, colour=(120, 60, 0)):
+    """A copy of img with text in a coloured bar across the top (for manual_sort's check mode)."""
+    import cv2
+    font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 1.2, 2
+    (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+    bar = th + 24
+    out = np.vstack([np.zeros((bar, img.shape[1], 3), dtype=img.dtype), img])
+    out[:bar] = colour
+    cv2.putText(out, text, (max((img.shape[1] - tw) // 2, 5), th + 12), font, scale, (255, 255, 255), thick)
+    return out
+
+
+CHECK_CLASSES = ['Junk', 'CosmicRay', 'Asteroid', 'Flare', 'Variable', 'Unsure']
+
+
+def manual_sort(events_path, image_dir=None, sort_dir=None, screen_size=None, check_column=None):
     """
     Sort events by eye into categories named when it starts (e.g. 'Real' and
     'Not real'), one keypress per event, in an OpenCV window like
@@ -666,6 +681,11 @@ def manual_sort(events_path, image_dir=None, sort_dir=None, screen_size=None):
     rows -- the layout ml_classifier.load_manual_labels reads. If sort_dir
     already holds a sort, you're asked whether to continue it, reset it, or
     start a new one alongside it (sort_dir_2, sort_dir_3, ...).
+
+    check_column : e.g. 'classification' -- check a proposed label instead of sorting from scratch. Each
+        image shows the event's value in that column; y = agree (sorted into it), n = disagree, then 1-9
+        picks the right category (Backspace goes back to y/n). Events proposed as something that isn't a
+        category, or as 'Unsure', go straight to 1-9. A new check sort uses CHECK_CLASSES as its categories.
 
     Keys: 1-9 sort, Enter skip, Backspace undo, Esc or q quit.
     """
@@ -711,6 +731,12 @@ def manual_sort(events_path, image_dir=None, sort_dir=None, screen_size=None):
             classes = []
 
     order_file = os.path.join(sort_dir, 'categories.txt')
+    if not classes and check_column is not None:
+        classes = list(CHECK_CLASSES)
+        os.makedirs(sort_dir, exist_ok=True)
+        with open(order_file, 'w') as f:
+            f.write('\n'.join(classes) + '\n')
+        print(f'Checking {check_column!r}; categories {classes}')
     if not classes:
         print('Enter category names one at a time (up to 9); press Enter on an empty line to finish.')
         while len(classes) < 9:
@@ -758,7 +784,8 @@ def manual_sort(events_path, image_dir=None, sort_dir=None, screen_size=None):
           ' (detected; pass screen_size=(w, h) if the windows don\'t fit)'))
 
     # Two columns (categories | navigation) so the window stays short enough for a VNC screen
-    col1 = ['  CONTROLS  '] + [f'{k + 1} : {c}' for k, c in enumerate(classes)]
+    col1 = ['  CONTROLS  '] + (['y : agree', 'n : disagree, then'] if check_column else []) + \
+           [f'{k + 1} : {c}' for k, c in enumerate(classes)]
     col2 = ['  NAVIGATION  ', 'Enter  :  Skip', 'Bkspc  :  Undo', 'Esc/q  :  Quit']
     font, fscale, thickness, pad = cv2.FONT_HERSHEY_SIMPLEX, 0.65, 1, 14
     sizes1 = [cv2.getTextSize(line, font, fscale, thickness)[0] for line in col1]
@@ -793,14 +820,23 @@ def manual_sort(events_path, image_dir=None, sort_dir=None, screen_size=None):
             i += 1
             continue
         # fit the width and the height left above the controls box (plus room for window title bars)
-        avail_h = screen_h - height - 120
+        avail_h = screen_h - height - 120 - (60 if check_column is not None else 0)   # room for the banner
         scale = min(0.95 * screen_w / img.shape[1], avail_h / img.shape[0], 1.0)
         if scale < 1:
             img = cv2.resize(img, (int(img.shape[1] * scale), int(img.shape[0] * scale)),
                              interpolation=cv2.INTER_AREA)
-        cv2.imshow('Image Sorter', img)
+        proposed = None
+        if check_column is not None:
+            proposed = str(events.iloc[idx][check_column])
+            checkable = proposed in classes and proposed != 'Unsure'
+            choosing = not checkable                    # nothing to agree with: straight to 1-9
+            shown = _Banner(img, f'{proposed}?   y / n' if not choosing else f'{proposed}: pick 1-{len(classes)}')
+        else:
+            choosing = True
+            shown = img
+        cv2.imshow('Image Sorter', shown)
         cv2.moveWindow('Image Sorter', 0, 0)
-        print(f'[{i + 1}/{len(todo)}] {fname}')
+        print(f'[{i + 1}/{len(todo)}] {fname}' + (f'   proposed: {proposed}' if proposed else ''))
 
         # wait for a recognised key; anything else is ignored
         while True:
@@ -812,6 +848,16 @@ def manual_sort(events_path, image_dir=None, sort_dir=None, screen_size=None):
             if key in (27, ord('q')):
                 stop = True
                 break
+
+            if check_column is not None and not choosing and key == ord('n'):
+                choosing = True
+                cv2.imshow('Image Sorter', _Banner(img, f'not {proposed}: pick 1-{len(classes)}', (0, 0, 200)))
+                continue
+
+            if check_column is not None and choosing and checkable and key in (8, 127):
+                choosing = False                          # back to y / n for this event
+                cv2.imshow('Image Sorter', _Banner(img, f'{proposed}?   y / n'))
+                continue
 
             if key in (8, 127):
                 if not history:
@@ -837,8 +883,13 @@ def manual_sort(events_path, image_dir=None, sort_dir=None, screen_size=None):
                 i += 1
                 break
 
-            if ord('1') <= key < ord('1') + len(classes):
-                c = classes[key - ord('1')]
+            pick = None
+            if check_column is not None and not choosing and key == ord('y'):
+                pick = proposed
+            elif choosing and ord('1') <= key < ord('1') + len(classes):
+                pick = classes[key - ord('1')]
+            if pick is not None:
+                c = pick
                 shutil.copy2(image_of[fname], os.path.join(sort_dir, c, fname))
                 groups[c] = pd.concat([groups[c], events.iloc[[idx]]], ignore_index=True)
                 groups[c].to_csv(group_csv[c], index=False)

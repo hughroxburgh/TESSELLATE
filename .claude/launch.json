@@ -40,6 +40,14 @@
       "name": "tss-sites",
       "url": "http://localhost:8790",
       "port": 8790
+    },
+    {
+      "name": "sort-app-local",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "/Users/hughroxburgh/Desktop/BetterCode/TESSELLATE/development/scratch/run_sort_app_local.py"
+      ],
+      "port": 8795
     }
   ]
 }

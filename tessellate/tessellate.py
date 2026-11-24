@@ -605,7 +605,7 @@ class Tessellate():
 
         primary_mission = range(1,27)       # ~1200 FFIs , 30 min cadence
         secondary_mission = range(27,56)    # ~3600 FFIs , 10 min cadence
-        tertiary_mission = range(56,100)    # ~12000 FFIs , 200 sec cadence (~24000 in a 4-orbit sector)
+        tertiary_mission = range(56,1000)   # ~12000 FFIs , 200 sec cadence (~24000 in a 4-orbit sector)
 
         # cutting (DataProcessor.make_cuts, one job per CCD) reads each FFI once and holds a few per worker:
         # disk-bound and light on memory. Sector 98 Cam1 Ccd1 (24,162 FFIs, 64 cuts): 16 workers, ~15 min.
@@ -701,7 +701,7 @@ class Tessellate():
             plot_mem_req = 64
 
         elif self.sector in tertiary_mission:
-            cut_time_sug = '1:00:00'
+            cut_time_sug = '30:00'          # 4-orbit S98 Cam1 Ccd1 measured ~15 min; normal sectors ~half
 
             # not itself benchmarked on a tertiary-mission sector. Scaled from the secondary
             # tier's real 3min/7:11 worst case by frame count -- ~12000 vs ~3600 FFIs/sector
@@ -729,10 +729,12 @@ class Tessellate():
             calibrate_cpu_sug = '8'
             calibrate_mem_req = 32
 
-            # not yet benchmarked at 200 sec cadence: 10G per CPU, and every bin from one frame to 12 hr
-            search_time_sug = '6:00:00'
+            # Measured on the 4-orbit Sector 98 Cam1 Ccd1 Cut10 (~24000 frames, bins 200sec..12hr): 49 min, 66 GB peak
+            # on 32 CPUs (source finding scales with frames; ML stage ~9 min). A normal sector has half the frames:
+            # ~2x headroom on half the measurement
+            search_time_sug = '1:00:00'
             search_cpu_sug = '32'
-            search_mem_req = 320
+            search_mem_req = 64
             search_time_bins = '200sec,10min,30min,2hr,12hr'
 
             plot_time_sug = '10:00'
@@ -756,7 +758,8 @@ class Tessellate():
 
                 calibrate_mem_req = 64
 
-                search_time_sug = '12:00:00'
+                search_time_sug = '2:00:00'       # measured 49 min, 66 GB peak (Cut10): ~2x headroom
+                search_mem_req = 128
 
         suggestions = [[cut_time_sug,cut_mem_sug,cut_mem_req],
                        [reduce_time_sug,reduce_cpu_sug,reduce_mem_req],
@@ -794,14 +797,14 @@ class Tessellate():
             while not done:
                 try:
                     sector = int(sector)
-                    if 0 < sector < 100:
+                    if 0 < sector < 1000:
                         self.sector = sector
                         done = True
                     else:
                         sector = input('      Invalid choice! Sector = ')
                 except:
                     sector = input('      Invalid choice! Sector = ')
-        elif 0 < self.sector < 100:
+        elif 0 < self.sector < 1000:
             print(f'   - Sector = {self.sector}')
         else:
             e = f'Invalid Sector Input of {self.sector}\n'

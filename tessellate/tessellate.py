@@ -702,6 +702,8 @@ class Tessellate():
 
         elif self.sector in tertiary_mission:
             cut_time_sug = '30:00'          # 4-orbit S98 Cam1 Ccd1 measured ~15 min; normal sectors ~half
+            # S109 Cam1 Ccd1 (normal sector): 8.6 min, 2.6 GB peak, only ~5 of 16 cores busy (disk-bound): 8 workers
+            cut_mem_req = 16
 
             # not itself benchmarked on a tertiary-mission sector. Scaled from the secondary
             # tier's real 3min/7:11 worst case by frame count -- ~12000 vs ~3600 FFIs/sector
@@ -713,26 +715,26 @@ class Tessellate():
             predict_asteroids_cpu_sug = '16'
             predict_asteroids_mem_req = 160
 
-            # whole sector in one cut TPF: memory scales with good frames. The 4-orbit peak (243 GiB, below) was
-            # with 24% of cadences masked; a normal sector masking fewer can have well over half those frames
-            reduce_time_sug = '3:00:00'
-            reduce_cpu_sug = '32'
-            reduce_mem_req = 200
+            # Measured on S109 Cam1 Ccd1, all 64 cuts (normal sector, 32 CPUs): median 30 min, peak 117 GB. Slow jobs
+            # were disk-bound, not CPU-bound (64 starting at once, 4-5 cores busy; Cut9 timed out at 90 min, then
+            # took 26 min alone with 13 busy). At most ~16 cores were ever busy, so 16; 2 h covers a contended wave
+            reduce_time_sug = '2:00:00'
+            reduce_cpu_sug = '16'
+            reduce_mem_req = 160
 
             # scaled from the secondary tier's post-full-run-revision values (see there for why)
             asteroid_lightcurves_time_sug = '45:00'
             asteroid_lightcurves_cpu_sug = '16'
             asteroid_lightcurves_mem_req = 64
 
-            # detection limits load the whole reduced cube (~2.5 GB, ~5 GB in a 4-orbit sector)
-            calibrate_time_sug = '30:00'
+            # detection limits load the whole reduced cube. S109 Cam1 Ccd1: median 3 min, max 6, peak 13.7 GB
+            calibrate_time_sug = '15:00'
             calibrate_cpu_sug = '8'
-            calibrate_mem_req = 32
+            calibrate_mem_req = 24
 
-            # Measured on the 4-orbit Sector 98 Cam1 Ccd1 Cut10 (~24000 frames, bins 200sec..12hr): 49 min, 66 GB peak
-            # on 32 CPUs (source finding scales with frames; ML stage ~9 min). A normal sector has half the frames:
-            # ~2x headroom on half the measurement
-            search_time_sug = '1:00:00'
+            # S109 Cam1 Ccd1, all 64 cuts (bins 200sec..12hr, 32 CPUs, ~25 busy): median 31.5 min, max 35, peak
+            # 34.5 GB. 64 GB and 1.5 h left for denser fields (more sources / events). The 4-orbit S98 Cut10: 49 min, 66 GB
+            search_time_sug = '1:30:00'
             search_cpu_sug = '32'
             search_mem_req = 64
             search_time_bins = '200sec,10min,30min,2hr,12hr'
@@ -746,6 +748,7 @@ class Tessellate():
                 # cutting ~15 min (16 CPUs); reduce of Cut10 peaked at 243 GiB in 40 min (32 CPUs; killed at 200G).
                 # The rest scale with frame count from the 200 sec values above, so are unbenchmarked guesses.
                 print('   (four-orbit sector: suggestions scaled for ~24000 frames)')
+                cut_mem_req = 32                # 16 workers, as measured (~15 min)
                 predict_asteroids_time_sug = '3:00:00'
                 predict_asteroids_mem_req = 320
 
@@ -756,6 +759,7 @@ class Tessellate():
                 asteroid_lightcurves_time_sug = '1:30:00'
                 asteroid_lightcurves_mem_req = 128
 
+                calibrate_time_sug = '30:00'       # S109 max 6 min at half the frames
                 calibrate_mem_req = 64
 
                 search_time_sug = '2:00:00'       # measured 49 min, 66 GB peak (Cut10): ~2x headroom

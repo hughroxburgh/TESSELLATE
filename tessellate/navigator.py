@@ -1150,6 +1150,152 @@ class Navigator():
 
         return flux[:,ymin:ymax+1,xmin:xmax+1]
 
+    def frame_gif(self,objid=None,eventid=None,x=None,y=None,cut=None,image_size=11,frame_interval=10,
+                  vmin=0,vmax=10,save_path=None,frame_start=None,frame_end=None,frame_buffer=100,frame_bin=None,
+                  lc=True,interval=100,cmap='viridis',dpi=100):
+        """
+        Make a GIF of the region around an event, an object or a pixel, with its light curve alongside and a marker
+        moving along it to show where each frame sits.
+
+        Where (one of):
+            objid + eventid : centred on the event; frames from frame_buffer before its start to frame_buffer after
+                              its end, every frame_interval-th frame plus every frame of the event itself, so the
+                              event is never skipped. The event's span is shaded on the light curve.
+            objid           : centred on the object; the whole cut.
+            x, y            : centred on that cut pixel; the whole cut.
+        image_size : cutout width/height in pixels.
+        frame_interval : show every frame_interval-th frame (in frame_bin units).
+        vmin, vmax : colour limits of the images, in TESS counts.
+        save_path : a .gif file name, or a folder (file named S{sector}C{cam}C{ccd}C{cut}_O{objid}E{eventid}.gif /
+            _x{x}y{y}.gif). None = the current folder.
+        frame_start, frame_end : first / last frame to show (in frame_bin units), overriding the defaults above
+            (an event's buffered window, or the whole cut). The event's own frames are still all shown if inside.
+        frame_buffer : frames either side of an event (event mode only; ignored where frame_start/end are given).
+        frame_bin : frames to average; None = the event's / object's own frame_bin (1 for x, y).
+        lc : show the light curve (3x3 sum at the centre pixel) next to the images.
+        interval : milliseconds per GIF frame.
+
+        Returns the path of the saved GIF.
+        """
+
+        import matplotlib.animation as animation
+
+        # -- Gather data -- #
+        if cut is None:
+            cut = self.cut
+        if cut is None:
+            raise ValueError('Please specify a cut!')
+        elif cut != self.cut:
+            self.gather_data(cut)
+            self.gather_results(cut)
+
+        # -- Where, which frame bin, and which frames -- #
+        event = None
+        if x is not None and y is not None:
+            xc, yc = float(x), float(y)
+            fb = 1
+            name = f'x{RoundToInt(xc)}y{RoundToInt(yc)}'
+        elif objid is not None and eventid is not None:
+            event = self.events[(self.events.objid==objid)&(self.events.eventid==eventid)].iloc[0]
+            xc, yc = float(event.xcentroid), float(event.ycentroid)
+            fb = int(event.frame_bin)
+            name = f'O{objid}E{eventid}'
+        elif objid is not None:
+            obj = self.objects[self.objects.objid==objid].iloc[0]
+            xc, yc = float(obj.xcentroid), float(obj.ycentroid)
+            fb = int(obj.frame_bin)
+            name = f'O{objid}'
+        else:
+            raise ValueError('Give objid (+ eventid), or x and y')
+        if frame_bin is None:
+            frame_bin = fb
+
+        # -- Cutout (cropped before binning, so only the stamp is binned) -- #
+        xi, yi = RoundToInt(xc), RoundToInt(yc)
+        xmin = max(xi-image_size//2,0)
+        xmax = min(xi+image_size//2,self.flux.shape[2]-1)
+        ymin = max(yi-image_size//2,0)
+        ymax = min(yi+image_size//2,self.flux.shape[1]-1)
+        stamp = self.flux[:,ymin:ymax+1,xmin:xmax+1]
+        time, stamp = (Frame_Bin(self.sector,self.cam,self.time,stamp,frame_bin) if frame_bin > 1
+                       else (self.time,stamp))
+        n_frames = len(time)
+
+        if event is not None:
+            scale = event.frame_bin/frame_bin                        # event frames are in its own frame_bin
+            ev_start = RoundToInt(event.frame_start*scale)
+            ev_end = max(RoundToInt(event.frame_end*scale),ev_start)
+            w_start = ev_start-frame_buffer if frame_start is None else int(frame_start)
+            w_end = ev_end+frame_buffer if frame_end is None else int(frame_end)
+        else:
+            ev_start = ev_end = None
+            w_start = 0 if frame_start is None else int(frame_start)
+            w_end = n_frames-1 if frame_end is None else int(frame_end)
+        w_start, w_end = max(w_start,0), min(w_end,n_frames-1)
+        if w_end < w_start:
+            raise ValueError(f'Empty frame range {w_start}-{w_end} (the cut has {n_frames} frames at frame_bin {frame_bin})')
+        frames = np.arange(w_start,w_end+1,frame_interval)
+        if ev_start is not None:                                     # every frame of the event inside the window
+            frames = np.union1d(frames,np.arange(max(ev_start,w_start),min(ev_end,w_end)+1))
+        frames = frames.astype(int)
+        if not len(frames):
+            raise ValueError('No frames to show')
+
+        # -- Figure: images (+ light curve) -- #
+        if lc:
+            fig, (ax, axl) = plt.subplots(1,2,figsize=(10,4),gridspec_kw={'width_ratios':[1,1.8]})
+        else:
+            fig, ax = plt.subplots(figsize=(4.5,4))
+        extent = (xmin-0.5,xmax+0.5,ymin-0.5,ymax+0.5)               # cut pixel coordinates on the axes
+        im = ax.imshow(stamp[frames[0]],origin='lower',cmap=cmap,vmin=vmin,vmax=vmax,extent=extent)
+        ax.plot(xc,yc,'o',ms=14,mfc='none',mec='r',mew=1)
+        ax.set_xlabel('x (cut pixels)')
+        ax.set_ylabel('y (cut pixels)')
+        fig.colorbar(im,ax=ax,fraction=0.046,pad=0.04,label='TESS Counts')
+        title = ax.set_title('')
+
+        if lc:
+            t, f = Generate_LC(time,stamp,xi-xmin,yi-ymin)
+            w = slice(w_start,w_end+1)
+            axl.plot(t[w],f[w],'-',color='k',lw=0.6)
+            if ev_start is not None and ev_end >= w_start and ev_start <= w_end:
+                axl.axvspan(t[ev_start],t[ev_end],color='C1',alpha=0.25,lw=0,label='event')
+                axl.legend(loc='upper right',frameon=False)
+            vline = axl.axvline(t[frames[0]],color='r',lw=0.8,alpha=0.6)
+            dot, = axl.plot([t[frames[0]]],[f[frames[0]]],'o',color='r',ms=5)
+            axl.xaxis.set_major_locator(plt.MaxNLocator(5))
+            axl.set_xlabel('MJD')
+            axl.set_ylabel('TESS Counts (3x3 sum)')
+            bin_txt = f', frame_bin {frame_bin}' if frame_bin > 1 else ''
+            axl.set_title(f'S{self.sector} C{self.cam} C{self.ccd} cut {cut} {name}{bin_txt}')
+        fig.tight_layout()
+
+        def update(k):
+            i = frames[k]
+            im.set_array(stamp[i])
+            title.set_text(f'frame {i}  MJD {time[i]:.4f}')
+            if lc:
+                vline.set_xdata([t[i],t[i]])
+                dot.set_data([t[i]],[f[i]])
+                return im, title, vline, dot
+            return im, title
+
+        ani = animation.FuncAnimation(fig,update,frames=len(frames),interval=interval,blit=False)
+
+        # -- Save -- #
+        fname = f'S{self.sector}C{self.cam}C{self.ccd}C{cut}_{name}.gif'
+        if save_path is None:
+            out = os.path.join(os.getcwd(),fname)
+        elif str(save_path).lower().endswith('.gif'):
+            out = str(save_path)
+        else:
+            os.makedirs(save_path,exist_ok=True)
+            out = os.path.join(save_path,fname)
+        ani.save(out,writer='pillow',dpi=dpi)
+        plt.close(fig)
+        print(f'Saved {len(frames)}-frame GIF to {out}')
+        return out
+
 
 
 

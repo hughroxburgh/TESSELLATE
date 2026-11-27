@@ -2,7 +2,7 @@ import os
 import numpy as np
 from time import time as t
 
-from .tools import _Save_space, _Remove_emptys, _Extract_fits, _Print_buff, save_compact_array, save_table, load_table, table_exists
+from .tools import _Save_space, _Share_folder, _Remove_emptys, _Extract_fits, _Print_buff, save_compact_array, save_table, load_table, table_exists
     
 # def _get_wcs(path,wcs_path_check,verbose=1):
 #     """
@@ -452,6 +452,7 @@ class DataProcessor():
         else:
             _Save_space(f'{self.data_path}/Sector{self.sector}')
             self.path = f'{self.data_path}/Sector{self.sector}'
+            _Share_folder(self.path, group_from=self.data_path)     # project group + setgid for collaborators
 
     def download(self,cam,ccd,number='all',time=None,single=None):
         """

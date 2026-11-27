@@ -121,6 +121,35 @@ def _Save_space(Save,delete=False):
         else:
             pass
 
+def _Share_folder(path, group_from=None):
+    """
+    Make a shared data folder (e.g. TESSdata/Sector{N}) hand everything made under it to the project group:
+    its group is set to group_from's (the data root, e.g. /fred/oz335/TESSdata -> oz335) and it gets the
+    setgid bit, so new files and subfolders take that group instead of the creator's primary group (on OzSTAR
+    everyone's is 'Swinburne'), and group read/write. Only the folder's owner can change it; for anyone else
+    this warns if the folder isn't shared yet (its owner should fix it) and otherwise does nothing.
+    """
+    import stat
+    import warnings
+
+    try:
+        st = os.stat(path)
+        gid = os.stat(group_from).st_gid if group_from else st.st_gid
+        want = stat.S_ISGID | stat.S_IRWXG
+        if st.st_gid == gid and (st.st_mode & want) == want:
+            return
+        if st.st_uid != os.getuid():
+            warnings.warn(f'{path} is not shared with its project group (owner uid {st.st_uid}): others may not be '
+                          f'able to write in it. Its owner can run: chgrp -R <group> {path}; chmod -R g+rwX '
+                          f'{path}; find {path} -type d -exec chmod g+s {{}} +')
+            return
+        if st.st_gid != gid:
+            os.chown(path, -1, gid)
+        os.chmod(path, stat.S_IMODE(os.stat(path).st_mode) | want)
+    except OSError as e:
+        warnings.warn(f'could not share {path} with its project group: {e}')
+
+
 def _Remove_emptys(files):
     """
     Deletes corrupt fits files before creating cube

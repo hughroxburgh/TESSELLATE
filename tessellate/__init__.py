@@ -7,6 +7,11 @@ import os as _os
 # Must be set before numpy loads, hence here.
 _os.environ.setdefault("KMP_AFFINITY", "none")
 
+# Shared data: everything a tessellate process writes (and the SLURM jobs it submits, which inherit this) is
+# group read/write -- files 664, folders 775 with the usual umask 022 -- so collaborators in the project group can
+# redo each other's cuts. The group itself comes from the data folders (tools._Share_folder: setgid).
+_os.umask(_os.umask(0) & ~0o060)
+
 def __getattr__(name):
     if name == "Detector":
         from .detector import Detector

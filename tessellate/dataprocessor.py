@@ -1036,13 +1036,20 @@ class DataProcessor():
         tessreduce = 0
 
         # -- reduce -- #
+        # The cut's CCD position is set here, as a real TPF's column/row (1-based, FFI column incl. the 44
+        # underscan columns), with col_offset=0. Our cuts carry no position keywords (tpf.column = 0), and
+        # tessreduce dev (since 535008d6, 2026-10-29) then recovers the position from tesswcs itself, so passing
+        # the corner as col_offset as well counted it twice: no strap mask, straps never QE-corrected (S110).
         tessreduce = tr.tessreduce(tpf=cutPath,sector=self.sector,camera=cam,ccd=ccd,
                                    flux=flux,mjd=mjd,shifts=shifts,wcs=wcs,
-                                    reduce=True,corr_correction=True,
-                                    calibrate=False,catalogue_path=f'{cutFolder}/local_gaia_cat.csv',col_offset=int(cut_corners[cut-1][0]),#-44,
+                                    reduce=False,corr_correction=True,
+                                    calibrate=False,catalogue_path=f'{cutFolder}/local_gaia_cat.csv',col_offset=0,
                                     prf_path='/fred/oz335/_local_TESS_PRFs',vector_path='/fred/oz335/_local_TESS_vectors',
                                     ref_ind=ref_ind,quality_bitmask='hard',shift_method='sep_core',smooth_motion=False,
                                     orbit_ref=True,create_lc=False,timing=True,backend='multiprocessing',verbose=2)
+        tessreduce.column = int(cut_corners[cut-1][0]) + 1
+        tessreduce.row = int(cut_corners[cut-1][1]) + 1
+        tessreduce.reduce()
 
         # # -- reduce -- #
         # tessreduce = tr.tessreduce(tpf=cutPath,flux=fluxPath,time=timePath,ref=refPath,

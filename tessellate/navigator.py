@@ -1282,8 +1282,9 @@ class Navigator():
         canvas.draw()                                                # everything that doesn't move
         background = canvas.copy_from_bbox(fig.bbox)
 
+        from tqdm import tqdm
         images, palette = [], None
-        for i in frames:
+        for i in tqdm(frames,desc='GIF frames',unit='frame',leave=False):
             im.set_array(stamp[i])
             title.set_text(f'frame {i}  MJD {time[i]:.4f}')
             if lc:

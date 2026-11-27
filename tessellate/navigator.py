@@ -1150,7 +1150,7 @@ class Navigator():
 
         return flux[:,ymin:ymax+1,xmin:xmax+1]
 
-    def frame_gif(self,objid=None,eventid=None,x=None,y=None,cut=None,image_size=11,frame_interval=10,
+    def make_gif(self,objid=None,eventid=None,x=None,y=None,cut=None,image_size=11,frame_interval=10,
                   vmin=0,vmax=10,save_path=None,frame_start=None,frame_end=None,frame_buffer=100,frame_bin=None,
                   lc=True,interval=100,cmap='viridis',dpi=100):
         """
@@ -1178,7 +1178,10 @@ class Navigator():
         Returns the path of the saved GIF.
         """
 
-        import matplotlib.animation as animation
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.ticker import MaxNLocator
+        from PIL import Image
 
         # -- Gather data -- #
         if cut is None:
@@ -1241,46 +1244,58 @@ class Navigator():
         if not len(frames):
             raise ValueError('No frames to show')
 
-        # -- Figure: images (+ light curve) -- #
+        # -- Figure: images (+ light curve). Drawn once; per frame only the image, marker, title and the light
+        # -- curve's cursor are redrawn on top of a saved background (blitting), straight into the GIF frames -- #
+        fig = Figure(figsize=(10,4) if lc else (4.5,4),dpi=dpi)
+        canvas = FigureCanvasAgg(fig)
         if lc:
-            fig, (ax, axl) = plt.subplots(1,2,figsize=(10,4),gridspec_kw={'width_ratios':[1,1.8]})
+            ax, axl = fig.subplots(1,2,gridspec_kw={'width_ratios':[1,1.8]})
         else:
-            fig, ax = plt.subplots(figsize=(4.5,4))
+            ax = fig.subplots()
         extent = (xmin-0.5,xmax+0.5,ymin-0.5,ymax+0.5)               # cut pixel coordinates on the axes
-        im = ax.imshow(stamp[frames[0]],origin='lower',cmap=cmap,vmin=vmin,vmax=vmax,extent=extent)
-        ax.plot(xc,yc,'o',ms=14,mfc='none',mec='r',mew=1)
+        im = ax.imshow(stamp[frames[0]],origin='lower',cmap=cmap,vmin=vmin,vmax=vmax,extent=extent,animated=True)
+        circle, = ax.plot(xc,yc,'o',ms=14,mfc='none',mec='r',mew=1,animated=True)
         ax.set_xlabel('x (cut pixels)')
         ax.set_ylabel('y (cut pixels)')
         fig.colorbar(im,ax=ax,fraction=0.046,pad=0.04,label='TESS Counts')
-        title = ax.set_title('')
+        title = ax.set_title('frame 00000  MJD 00000.0000',animated=True)
+        moving = [im,circle,title]
 
         if lc:
-            t, f = Generate_LC(time,stamp,xi-xmin,yi-ymin)
+            sy = slice(yi-ymin-1,yi-ymin+2)
+            sx = slice(xi-xmin-1,xi-xmin+2)
+            t, f = time, np.nansum(stamp[:,max(sy.start,0):sy.stop,max(sx.start,0):sx.stop],axis=(1,2))
             w = slice(w_start,w_end+1)
             axl.plot(t[w],f[w],'-',color='k',lw=0.6)
             if ev_start is not None and ev_end >= w_start and ev_start <= w_end:
                 axl.axvspan(t[ev_start],t[ev_end],color='C1',alpha=0.25,lw=0,label='event')
                 axl.legend(loc='upper right',frameon=False)
-            vline = axl.axvline(t[frames[0]],color='r',lw=0.8,alpha=0.6)
-            dot, = axl.plot([t[frames[0]]],[f[frames[0]]],'o',color='r',ms=5)
-            axl.xaxis.set_major_locator(plt.MaxNLocator(5))
+            vline = axl.axvline(t[frames[0]],color='r',lw=0.8,alpha=0.6,animated=True)
+            dot, = axl.plot([t[frames[0]]],[f[frames[0]]],'o',color='r',ms=5,animated=True)
+            moving += [vline,dot]
+            axl.xaxis.set_major_locator(MaxNLocator(5))
             axl.set_xlabel('MJD')
             axl.set_ylabel('TESS Counts (3x3 sum)')
             bin_txt = f', frame_bin {frame_bin}' if frame_bin > 1 else ''
             axl.set_title(f'S{self.sector} C{self.cam} C{self.ccd} cut {cut} {name}{bin_txt}')
         fig.tight_layout()
+        canvas.draw()                                                # everything that doesn't move
+        background = canvas.copy_from_bbox(fig.bbox)
 
-        def update(k):
-            i = frames[k]
+        images, palette = [], None
+        for i in frames:
             im.set_array(stamp[i])
             title.set_text(f'frame {i}  MJD {time[i]:.4f}')
             if lc:
                 vline.set_xdata([t[i],t[i]])
                 dot.set_data([t[i]],[f[i]])
-                return im, title, vline, dot
-            return im, title
-
-        ani = animation.FuncAnimation(fig,update,frames=len(frames),interval=interval,blit=False)
+            canvas.restore_region(background)
+            for artist in moving:
+                fig.draw_artist(artist)
+            rgb = Image.fromarray(np.asarray(canvas.buffer_rgba())[:,:,:3])
+            if palette is None:                                      # one palette for all frames: fast, no flicker
+                palette = rgb.quantize(colors=256,method=Image.Quantize.MEDIANCUT)
+            images.append(rgb.quantize(palette=palette,dither=Image.Dither.NONE))
 
         # -- Save -- #
         fname = f'S{self.sector}C{self.cam}C{self.ccd}C{cut}_{name}.gif'
@@ -1291,8 +1306,7 @@ class Navigator():
         else:
             os.makedirs(save_path,exist_ok=True)
             out = os.path.join(save_path,fname)
-        ani.save(out,writer='pillow',dpi=dpi)
-        plt.close(fig)
+        images[0].save(out,save_all=True,append_images=images[1:],duration=interval,loop=0)
         print(f'Saved {len(frames)}-frame GIF to {out}')
         return out
 

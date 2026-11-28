@@ -1152,7 +1152,7 @@ class Navigator():
 
     def make_gif(self,objid=None,eventid=None,x=None,y=None,cut=None,image_size=11,frame_interval=10,
                   vmin=0,vmax=10,save_path=None,frame_start=None,frame_end=None,frame_buffer=100,frame_bin=None,
-                  lc=True,interval=100,cmap='viridis',dpi=100):
+                  lc=True,interval=100,duration=None,cmap='viridis',dpi=100):
         """
         Make a GIF of the region around an event, an object or a pixel, with its light curve alongside and a marker
         moving along it to show where each frame sits.
@@ -1173,7 +1173,10 @@ class Navigator():
         frame_buffer : frames either side of an event (event mode only; ignored where frame_start/end are given).
         frame_bin : frames to average; None = the event's / object's own frame_bin (1 for x, y).
         lc : show the light curve (3x3 sum at the centre pixel) next to the images.
-        interval : milliseconds per GIF frame.
+        interval : milliseconds per GIF frame (ignored if duration is given).
+        duration : total run time of the GIF in seconds; overrides interval. GIF timing is in 10 ms steps and
+            viewers slow frames shorter than 20 ms right down, so if the frames won't fit at 20 ms each they are
+            thinned evenly (printed) to fit.
 
         Returns the path of the saved GIF.
         """
@@ -1244,6 +1247,19 @@ class Navigator():
         if not len(frames):
             raise ValueError('No frames to show')
 
+        # -- Frame durations (ms): fixed interval, or spread over a total duration in the GIF's 10 ms steps -- #
+        if duration is None:
+            durations = interval
+        else:
+            total_cs = RoundToInt(float(duration)*100)               # centiseconds
+            max_frames = max(total_cs//2,1)                          # >= 20 ms per frame
+            if len(frames) > max_frames:
+                print(f'{len(frames)} frames do not fit in {duration} s at 20 ms each: showing {max_frames} '
+                      f'(evenly thinned; raise frame_interval or duration to choose yourself)')
+                frames = frames[np.unique(np.linspace(0,len(frames)-1,max_frames).round().astype(int))]
+            edges = np.round(np.linspace(0,total_cs,len(frames)+1)).astype(int)
+            durations = [int(d)*10 for d in np.diff(edges)]          # sums to the total exactly
+
         # -- Figure: images (+ light curve). Drawn once; per frame only the image, marker, title and the light
         # -- curve's cursor are redrawn on top of a saved background (blitting), straight into the GIF frames -- #
         fig = Figure(figsize=(10,4) if lc else (4.5,4),dpi=dpi)
@@ -1307,8 +1323,9 @@ class Navigator():
         else:
             os.makedirs(save_path,exist_ok=True)
             out = os.path.join(save_path,fname)
-        images[0].save(out,save_all=True,append_images=images[1:],duration=interval,loop=0)
-        print(f'Saved {len(frames)}-frame GIF to {out}')
+        images[0].save(out,save_all=True,append_images=images[1:],duration=durations,loop=0)
+        total_s = (sum(durations) if duration is not None else interval*len(frames))/1000
+        print(f'Saved {len(frames)}-frame GIF ({total_s:.2f} s) to {out}')
         return out
 
 
